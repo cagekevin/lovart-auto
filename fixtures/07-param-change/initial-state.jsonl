@@ -1,0 +1,1 @@
+{"id":"87061700e89e","prompt":"参数变更用例","line":1,"model":"nano-bn-2","aspectRatio":"3:4","imageSize":"2K","status":"done","attempts":1,"timeoutCount":0,"busyRetries":0,"readyAt":0,"artifacts":["https://cdn.invalid/old.png"],"files":["output/旧图.png"],"stateSince":"2026-10-01T06:53:08.156Z","updatedAt":"2026-10-01T06:53:08.156Z"}

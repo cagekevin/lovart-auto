@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- ⚠️ 这里**只声明"这个包叫什么、跑哪个可执行文件"**，不重复任何业务规则。
+	     业务参数唯一真源在 `src-tauri/tauri.conf.json`（窗口标题/尺寸）与 `.env`（密钥等）。
+	     本文件是 `.app` 外壳的样板，由 `scripts/make-app.sh` 拷进 `Contents/Info.plist`。 -->
+	<key>CFBundleDevelopmentRegion</key>
+	<string>zh_CN</string>
+	<key>CFBundleDisplayName</key>
+	<string>lovart</string>
+	<!-- 与 `src-tauri/Cargo.toml` 的 `[[bin]] name` 必须一致：Finder 双击就是跑这个 -->
+	<key>CFBundleExecutable</key>
+	<string>lovart-client</string>
+	<key>CFBundleIconFile</key>
+	<string>icon.icns</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.lovart.client</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>lovart</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.graphics-design</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>10.15</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
+</dict>
+</plist>

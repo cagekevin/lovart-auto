@@ -1,0 +1,14 @@
+{
+  "threadIdPrefix": "t",
+  "send": [
+    { "error": "rate limited", "httpStatus": 429 },
+    { "error": "rate limited", "httpStatus": 429 },
+    {}
+  ],
+  "polls": [{ "status": "running" }, { "status": "done" }],
+  "result": {
+    "items": [{ "artifacts": [{ "content": "https://cdn.invalid/a.png" }] }]
+  },
+  "maxAttempts": 1,
+  "maxBusyRetries": 5
+}

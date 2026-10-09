@@ -1,0 +1,24 @@
+# 依赖与构建产物
+node_modules/
+dist/
+src-tauri/target/
+# `tauri-build` 生成的权限清单与 schema（每次构建重算，不入库）
+src-tauri/gen/schemas/
+
+# 凭据
+.env
+
+# ── 运行产物：全部收在 var/ 下 ──────────────────────────────────────
+# 原先 state.jsonl / report.csv / refs-cache.json / run.log 散在**仓库根**，
+# 和源码、文档混在一起 ⇒ 根目录看起来"乱"，而且 .gitignore 还漏了几个。
+# 现在一个目录覆盖全部：`var/`。
+var/
+
+# 出图（体积大，不入库）
+output/
+
+# macOS 应用包（`make app` 的产物：13MB 二进制 + 图标，可复现 ⇒ 不入库）
+*.app/
+
+# macOS
+.DS_Store

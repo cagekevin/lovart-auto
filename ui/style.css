@@ -1,0 +1,1424 @@
+/* lovart —— UI 样式。
+ *
+ * ── 8 查纪律（本文件的写法全部为它服务）─────────────────────────────
+ * 查1 间距来源唯一：区块间距只由**父容器**给（`gap` / `padding`），
+ *     子项不再写同方向的值；**全文件 0 处负 margin**。
+ * 查2 线条各有职责：每条 border 都注释了「它分隔哪两样东西」，答不出的已删。
+ * 查3 对齐：控件高度只有 3 档（32 / 30 / 26），圆角只有 4 档，字号只有 6 档。
+ * 查4 令牌：颜色一律 `var(--*)`；`rgb()` 只出现在令牌定义处（单源）。
+ * 查5 不换行：按钮 / 标签 / 计数一律 `nowrap`。
+ * 查6 规格唯一：同一个控件全页只有一套规格（无第二份近似实现）。
+ * 查7 文案：正常行不说话（不显示耗时/徽章），异常行才带标签 + 说明。
+ * 查8 可点性：**没有 hover 才出现的控件**（删除键常显）。
+ *
+ * ⚠️ 全文件**零内联样式**：本文件不产生任何 `style="…"`，
+ *    `app.js` 也不写 `el.style.*` —— 显示/隐藏走 `hidden` 属性，选中态走 `classList`，
+ *    进度条是纯 CSS 动画（本来就没有真实进度可显示）。
+ */
+
+/* ══ 令牌 ══════════════════════════════════════════════════════════ */
+
+:root {
+  /* 圆角：4 档 */
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-pill: 999px;
+
+  /* 字号：6 档 */
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-md: 13px;
+  --fs-lg: 14px;
+  --fs-xl: 20px;
+  --fs-2xl: 24px;
+
+  /* 控件高度：3 档 */
+  --h-ctl: 32px;   /* 工具条控件（缩略图 / 下拉 / 分段） */
+
+  /* 垫图缩略图 —— **两处共用这一个值**（卡片 `.task-ref`、待发面板 `.queue-thumb.is-ref`）。
+   * 原先两边各写各的（96 / 72），且卡片那个比**结果图（72px 高）还大**，主次反了。
+   * 它只需要"看得清是哪张"，不需要抢戏。 */
+  --ref-thumb: 56px;
+  --h-btn: 30px;   /* 常规按钮 */
+  --h-btn-sm: 26px;/* 面板头里的小按钮 */
+
+  /* 间距：5 档 */
+  --sp-1: 6px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 22px;
+
+  /* 面板头 / 工作台栏宽 */
+  --head-h: 46px;
+  --board-w: 396px;
+}
+
+:root[data-theme="light"] {
+  --bg: #ffffff;
+  --bg-sunken: #fafafa;   /* 左栏底 */
+  --bg-sub: #f4f4f5;      /* 工具条底 / 控件底 */
+  --bg-hover: #ececee;
+
+  --line: #e7e7e9;        /* 主分隔线 */
+  --line-soft: #f1f1f3;   /* 次级分隔（行之间） */
+
+  --ink: #18181b;
+  --ink-2: #6f6f78;
+  --ink-3: #a6a6ae;
+
+  --run: #2563eb;
+  --ok: #15803d;
+  --warn: #b45309;
+  --bad: #b91c1c;
+
+  --run-bg: #eff4ff;
+  --warn-bg: #fdf6e8;
+  --bad-bg: #fdeeed;
+
+  --shadow: 0 1px 2px rgb(0 0 0 / 5%);
+  --shadow-dialog: 0 14px 44px rgb(0 0 0 / 24%);
+  --mask: rgb(12 12 14 / 40%);
+}
+
+/* ══ 基础 ══════════════════════════════════════════════════════════ */
+
+* { box-sizing: border-box; }
+
+/*
+ * ⚠️ **`hidden` 属性必须能压住一切 display**。
+ *
+ * 浏览器默认的 `[hidden]{display:none}` 来自 **UA 样式表**，而作者样式表里的
+ * `.viewer{display:flex}` / `.btn{display:inline-flex}` **优先级永远更高** ——
+ * 于是 `hidden` 形同虚设：那个全屏看图层会**一开始就盖住整个窗口，且关不掉**。
+ *
+ * 所以这里显式兜一条。`!important` 是这个场景的标准用法（normalize.css 同款），
+ * 不是偷懒：它保护的正是「属性语义 > 类样式」这条秩序。
+ */
+[hidden] { display: none !important; }
+
+html, body { height: 100%; }
+
+body {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--ink);
+  font: var(--fs-md) / 1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+button, input, select, textarea { font-family: inherit; }
+
+button { cursor: pointer; color: inherit; }
+
+/* SVG 图标统一描边（避免每处重写 stroke 值） */
+.svg-defs { display: none; }
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+
+/* ══ 顶栏 ══════════════════════════════════════════════════════════ */
+
+/* 查2：顶栏下边线 —— 分隔「应用身份」与「工作区」 */
+.topbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: var(--head-h);
+  padding: 0 var(--sp-4);
+  border-bottom: 1px solid var(--line);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-right: auto;
+}
+
+.brand-mark {
+  width: 20px;
+  height: 20px;
+  display: block;
+  border-radius: var(--r-sm);
+}
+
+.brand-name {
+  font-size: var(--fs-md);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+}
+
+/* ══ 两栏 ══════════════════════════════════════════════════════════ */
+
+.split {
+  flex: 1;
+  display: grid;
+  grid-template-columns: var(--board-w) 1fr;
+  min-height: 0;
+}
+
+/* 查2：左栏右边线 —— 分隔「任务中心」与「工作台」 */
+.panel {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.panel-board {
+  border-right: 1px solid var(--line);
+  background: var(--bg-sunken);
+}
+
+/* 查2：面板头下边线 —— 分隔「面板标题」与「面板内容」 */
+.panel-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: var(--head-h);
+  padding: 0 var(--sp-4);
+  border-bottom: 1px solid var(--line);
+}
+
+/* 两个面板的标题**同一规格** —— 曾经这里给左栏单独写了一个 13px 的覆盖，
+   同一个控件两套字号（查3）。 */
+.panel-title {
+  margin: 0;
+  font-size: var(--fs-md);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* 分隔用的中点：语义是「分隔符」，不是「计数」，所以不借 `.count` */
+.sep {
+  color: var(--ink-3);
+  user-select: none;
+}
+
+.count {
+  font-size: var(--fs-xs);
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+
+/* 查1：面板头的动作靠 margin-left:auto 贴右，不用额外 padding 撑 */
+.head-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+.panel-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: var(--sp-2) var(--sp-3) var(--sp-4);
+}
+
+/* 查2：面板脚上边线 —— 分隔「待发列表」与「发布动作」 */
+.panel-foot {
+  flex: none;
+  display: flex;
+  justify-content: flex-end;
+  padding: var(--sp-3) var(--sp-4);
+  border-top: 1px solid var(--line);
+}
+
+/* ══ 按钮（查6：全页唯一一套）══════════════════════════════════════ */
+
+.btn {
+  height: var(--h-btn);
+  padding: 0 var(--sp-3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  color: var(--ink);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+
+.btn:hover:not(:disabled) { background: var(--bg-sub); }
+
+.btn:disabled { opacity: 0.35; cursor: not-allowed; }
+
+.btn-sm {
+  height: var(--h-btn-sm);
+  padding: 0 10px;
+  font-size: var(--fs-xs);
+  border-radius: var(--r-sm);
+}
+
+.btn-primary {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--bg);
+  padding: 0 var(--sp-5);
+}
+
+.btn-primary:hover:not(:disabled) { opacity: 0.86; background: var(--ink); }
+
+.btn-quiet {
+  border-color: transparent;
+  background: transparent;
+  color: var(--ink-2);
+}
+
+.btn-quiet:hover:not(:disabled) { background: var(--bg-sub); color: var(--ink); }
+
+.btn-danger { color: var(--bad); }
+
+.btn-danger:hover:not(:disabled) { background: var(--bad); border-color: var(--bad); color: var(--bg); }
+
+.btn-stop { color: var(--bad); border-color: var(--bad); background: transparent; }
+
+.btn-stop:hover:not(:disabled) { background: var(--bad); color: var(--bg); }
+
+/* ══ 任务中心：处理中 ══════════════════════════════════════════════ */
+
+.group-title {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: var(--sp-3) var(--sp-1) var(--sp-2);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+
+.group-meta {
+  margin-left: auto;
+  font-weight: 400;
+  color: var(--ink-3);
+}
+
+.dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-pill);
+  background: var(--run);
+}
+
+.dot-idle { background: var(--ink-3); }
+
+.dot-ok { background: var(--ok); }
+
+.dot-warn { background: var(--warn); }
+
+.dot-bad { background: var(--bad); }
+
+/* 在跑的那一行「已跑多久」+ 不定量进度条。
+   （旧的 .run-card / .run-prompt / .run-line / .run-pct 已删 ——
+     它们属于被替换掉的「日志行」形态，留着就是死代码。） */
+/* 事实行 —— 这一条任务的**真实数据**（已持续多久 / 试了几次 / 产物文件名）。
+ *
+ * ⚠️ 规则是「**有就显示**」，**不按状态挑字段** —— 挑字段就是前端在做状态判断，
+ *    而状态判断只许有一份（`engine/state.rs` 的 `STATUS_TABLE`）。
+ *    这些数据本来就都在下发的记录里，原先**一个字都没显示**。
+ *
+ * 它取代了原来的 `.run-meta`（只显示一行"已跑多久"，且只在"在跑且有人跟"时挂）。 */
+.task-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-1) var(--sp-3);
+  margin-top: var(--sp-1);
+  font-size: var(--fs-xs);
+  color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 记录说有这个产物、盘上却没有 —— 必须看得出来（读不到 ≠ 没有） */
+.fact.is-missing { color: var(--bad); }
+
+/* 上游原文 —— 出问题时上游**到底说了什么**。
+ *
+ * ⚠️ 原先这里一个字都没有：失败时只看到一句人话（`abnormal.reason`），
+ *    看不到上游的原话。人话是给用户看的，这一句是**证据**。 */
+.task-raw {
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+}
+
+.task-raw > .raw-label {
+  cursor: pointer;
+  color: var(--ink-3);
+  list-style: none;
+}
+
+.task-raw > .raw-label::-webkit-details-marker { display: none; }
+.task-raw > .raw-label::before { content: "▸ "; }
+.task-raw[open] > .raw-label::before { content: "▾ "; }
+
+.raw-text {
+  display: block;
+  margin-top: var(--sp-1);
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--r-md);
+  background: var(--line-soft);
+  word-break: break-all;
+  color: var(--ink-2);
+}
+
+/* 卡片上的动作行 —— 今天只有「确认并继续」。
+ *
+ * ⚠️ 它是**花钱的那一下**，所以**常显在卡上、不藏 ⋯ 菜单**：
+ *    藏起来就等于"没有确认按钮"（2026-10-01 实测反馈）。
+ * 一个动作**只留一个入口**（菜单里那条已撤）。 */
+.task-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+}
+
+/* ══ 应用内提示条与确认框 ════════════════════════════════════════════
+ *
+ * ⚠️ 为什么不用 `window.alert` / `window.confirm`：**Tauri 的 webview 不实现它们** ——
+ *    `confirm()` 直接返回 `false`（所有"确认后才继续"的动作**静默取消**）、
+ *    `alert()` 静默无输出（错误提示一个都弹不出来 = **把失败吞了**）。
+ *    2026-10-01 实测：「消费积分继续」点了没反应，根因就是它。
+ * 所以提示与确认都由页面自己画（原生 DOM，零内联样式）。
+ */
+
+.toast {
+  position: fixed;
+  right: var(--sp-4);
+  bottom: var(--sp-4);
+  z-index: 90;
+  max-width: 420px;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  box-shadow: var(--shadow-dialog);
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  cursor: pointer;
+}
+
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgb(0 0 0 / 35%);
+}
+
+.modal-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  width: min(520px, calc(100vw - 2 * var(--sp-4)));
+  max-height: 70vh;
+  padding: var(--sp-4);
+  border-radius: var(--r-lg);
+  background: var(--bg);
+  box-shadow: var(--shadow-dialog);
+}
+
+.modal-title {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+}
+
+.modal-detail {
+  margin: 0;
+  overflow: auto;
+  padding: var(--sp-2);
+  border-radius: var(--r-md);
+  background: var(--line-soft);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+}
+
+/* ⚠️ 这里曾有两条进度条，都**删掉**了，别再照着谁加回来：
+ *
+ * ① `.bar`（`::after` + `@keyframes sweep`，CSS `infinite` 扫动）——
+ *    **它转的不是进度，是动画**：永远到不了头，任务停没停它都在转，
+ *    于是「一直在转」看着就像程序卡死。**装饰动画永远不该长得像进度。**
+ * ② `.batch-bar`（原生 `<progress>`，已完成 / 本批次总数）——
+ *    数字是真的，但那是**整批**的进度，不是用户在一条任务卡上要看的那个。
+ *
+ * ── 为什么单条不做进度条 ──────────────────────────────────────────
+ * 上游 `/chat/status` **只回 `status`**（2026-10-01 直连实测：
+ * `{"code":0,"message":"success","data":{"thread_id":"…","status":"running"}}`）
+ * —— 没有百分比、没有排队位次、没有子任务计数。
+ * ⇒ 「这一条生成到几成」**没有真值**。画一条按时间猜的、或走一步跳一下的条，
+ *    都是在「把不知道的数字写成肯定句」。
+ * 单条能给的都是**事实**（`.task-facts`）：现在在哪一步（`statusLabel`）、
+ * 这个状态已持续多久、试了几次、产物叫什么 —— 全是真值，一个猜的数字都没有。
+ */
+
+/* 排队中：一个可展开的计数条 */
+/* 查2：虚线 —— 它是「控件」不是「任务卡」，靠虚线区分（实线卡 = 在跑） */
+.waitbar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  padding: var(--sp-3);
+  border: 1px dashed var(--line);
+  border-radius: var(--r-lg);
+  background: transparent;
+  color: var(--ink-3);
+  font-size: var(--fs-sm);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.waitbar:hover { border-color: var(--ink-3); color: var(--ink-2); }
+
+.waitbar-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+
+.waitbar-text b { color: var(--ink-2); font-weight: 500; }
+
+.waitbar-hint { flex: none; }
+
+.chev {
+  flex: none;
+  width: 9px;
+  height: 9px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: transform 0.15s;
+}
+
+.is-open .chev { transform: rotate(90deg); }
+
+.queued-list, .done-list { padding-bottom: var(--sp-2); }
+
+/* 已完成组头 + 组级动作 */
+/* 查2：上边线 —— 分隔「处理中」与「已完成」两组（全文件只此一处画这条线） */
+.group-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
+  padding-right: var(--sp-1);
+  border-top: 1px solid var(--line);
+}
+
+.group-toggle {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: none;
+  text-align: left;
+}
+
+.group-toggle:hover { color: var(--ink); }
+
+.group-count {
+  margin-left: auto;
+  padding: 0 var(--sp-1);
+  border-radius: var(--r-pill);
+  background: var(--bg-sub);
+  font-weight: 400;
+  color: var(--ink-3);
+}
+
+/* ══ 任务卡（查6：排队中 / 已完成共用同一套）════════════════════════
+ *
+ * ⚠️ 这是**图片工具**，所以每条任务的主角是**那张图**，不是那行字。
+ * 参照实现（maomao 的 TaskCenter）：缩略图**整行宽 × 72px**、点击开大图，
+ * 文字只是图下面的说明。我上一版把它做成 32px 小方块 + 一行文字 ——
+ * 那是「日志行」，不是「任务卡」。
+ */
+
+.task-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-3);
+  margin-bottom: var(--sp-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--bg);
+}
+
+.task-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+
+.task-status {
+  flex: none;
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.task-model {
+  /* ⚠️ 原先这里是 `flex: none` ⇒ **不收缩**，长模型名（`gpt-image-2.5-flare-low`）
+   *    直接顶出卡片（2026-10-01 实测反馈）。
+   *    改成可收缩 + `min-width: 0` —— flex 项默认 `min-width: auto`，
+   *    不显式设成 0 就不会缩到内容宽度以下，省略号也就永远不会出现。 */
+  flex: 0 1 auto;
+  min-width: 0;
+  font-size: var(--fs-xs);
+  color: var(--ink-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.task-head .head-actions { margin-left: auto; }
+
+/* 图标按钮：查3 —— 与 .btn-sm 同高（26），不与按钮混用两套规格 */
+.icon-btn {
+  flex: none;
+  width: var(--h-btn-sm);
+  height: var(--h-btn-sm);
+  padding: 0;
+  border: none;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--ink-3);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.icon-btn:hover { background: var(--bg-hover); color: var(--ink); }
+
+.icon-btn svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+
+/* 提示词：两行截断（参照实现同款） */
+.task-prompt {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: var(--fs-sm);
+  line-height: 1.5;
+  color: var(--ink);
+}
+
+.task-time {
+  font-size: var(--fs-xs);
+  color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 顶排：**垫图在卡片左上角，文字列在右**。
+ *
+ * ⚠️ 垫图（参考图）是任务发出去以后**唯一能核对"我当时垫的是哪张"**的东西 ——
+ *    垫图选错，整张图就全错。所以它放到**左上角、给大**，并且**不加"垫图"两个字**：
+ *    结果图在下面整行宽、垫图在左上角是个方块，谁是谁一眼分得出来。
+ *    地址没丢：悬停缩略图有 tooltip，⋯ 菜单里有「复制垫图地址」。 */
+.task-top {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+}
+
+/* ⚠️ `min-width: 0` 是必须的：不加，长提示词会把这一行撑开，`line-clamp` 直接失效。 */
+.task-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+/* 多张垫图就往下叠（不横着排 —— 横排会把提示词挤成一列竖字）。 */
+.task-refs {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.task-ref {
+  /* ⚠️ **必须比结果图小**：结果图（`.task-thumb`，整行宽 72px 高）才是这张卡的主角，
+   *    垫图只是"核对当时垫的是哪张"。原先这里是 **96px** —— 比结果图还大，
+   *    主次反了（2026-10-01 实测反馈：「垫图怎么这么大」）。
+   *    尺寸收在 `--ref-thumb` 一处，待发面板的 `.queue-thumb.is-ref` 共用同一个值。 */
+  width: var(--ref-thumb);
+  height: var(--ref-thumb);
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--line-soft);
+  overflow: hidden;
+}
+
+.task-ref img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* 异常说明块（查7：异常才多说一句，且带底色好扫） */
+.task-error {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--r-md);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+}
+
+.task-error.is-warn { background: var(--warn-bg); color: var(--warn); }
+
+.task-error.is-bad { background: var(--bad-bg); color: var(--bad); }
+
+/* 缩略图：**整行宽**，点击开大图 —— 这是「怎么看图片」的入口 */
+.task-thumb {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 72px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg-sub);
+  overflow: hidden;
+}
+
+.task-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+
+.task-thumb .placeholder {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.task-thumb .icon {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: var(--ink-3);
+  stroke-width: 1.6;
+  opacity: 0.6;
+}
+
+/* 待发队列里的缩略图是**小方块**，和任务卡那种整行宽的不是一回事 ——
+   所以各有各的类。复用 `.task-thumb` 会把队列行撑成 72px 高。 */
+.queue-thumb {
+  flex: none;
+  width: var(--h-ctl);
+  height: var(--h-ctl);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--bg-sub);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.queue-thumb .icon {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: var(--ink-3);
+  stroke-width: 1.7;
+  opacity: 0.7;
+}
+
+/* 有垫图 ⇒ **左上角这块就是垫图本身，且给大**。
+ *
+ * ⚠️ 尺寸与"占位小方块"不同是**刻意的**：垫图选错，整张图就全错，
+ *    它是待发这一步唯一该核对的东西 —— 小到看不清就等于没有。
+ *    没有垫图（文生图）时保持小方块，不占地方。 */
+.queue-thumb.is-ref {
+  /* 与卡片上的 `.task-ref` **共用同一个值**（原先两处各写各的：96 / 72）。 */
+  width: var(--ref-thumb);
+  height: var(--ref-thumb);
+  padding: 0;
+  overflow: hidden;
+}
+
+.queue-thumb.is-ref img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* ══ ⋯ 菜单（查8：常显入口，不靠 hover）════════════════════════════ */
+
+.menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 30;
+  min-width: 150px;
+  width: max-content;
+  max-width: 260px;
+  padding: var(--sp-1);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  box-shadow: var(--shadow-dialog);
+}
+
+.menu-anchor { position: relative; }
+
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  padding: var(--sp-1) var(--sp-2);
+  border: none;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--ink);
+  font-size: var(--fs-sm);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.menu-item:hover { background: var(--bg-hover); }
+
+.menu-item.is-danger { color: var(--bad); }
+
+.menu-sep { height: 1px; margin: var(--sp-1) 0; background: var(--line); }
+
+/* ══ 看大图 ════════════════════════════════════════════════════════ */
+
+.viewer {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: rgb(0 0 0 / 85%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* 适应窗口：图片缩到能看全 */
+.viewer-stage {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  padding: var(--sp-5);
+}
+
+.viewer-img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+/* 实际大小：1:1 像素，靠容器原生滚动看细节（不用 transform，故零内联样式） */
+.viewer.is-actual .viewer-stage {
+  overflow: auto;
+  align-items: flex-start;
+  justify-content: flex-start;
+}
+
+.viewer.is-actual .viewer-img {
+  max-width: none;
+  max-height: none;
+  object-fit: none;
+}
+
+.viewer-dims {
+  position: absolute;
+  right: var(--sp-4);
+  bottom: var(--sp-4);
+  padding: 2px var(--sp-2);
+  border-radius: var(--r-sm);
+  background: rgb(0 0 0 / 70%);
+  color: #fff;
+  font-size: var(--fs-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.viewer-close {
+  position: absolute;
+  top: var(--sp-4);
+  right: var(--sp-4);
+  width: var(--h-ctl);
+  height: var(--h-ctl);
+  padding: 0;
+  border: none;
+  border-radius: var(--r-md);
+  background: rgb(0 0 0 / 60%);
+  color: #fff;
+  font-size: var(--fs-xl);
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.viewer-close:hover { background: rgb(0 0 0 / 80%); }
+
+.viewer-bar {
+  position: absolute;
+  left: 50%;
+  bottom: var(--sp-5);
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--r-pill);
+  background: rgb(0 0 0 / 55%);
+  backdrop-filter: blur(6px);
+}
+
+.viewer-btn {
+  padding: var(--sp-1) var(--sp-3);
+  border: none;
+  border-radius: var(--r-pill);
+  background: transparent;
+  color: #fff;
+  font-size: var(--fs-sm);
+  white-space: nowrap;
+}
+
+.viewer-btn:hover { background: rgb(255 255 255 / 15%); }
+
+.viewer-btn.is-on { background: rgb(255 255 255 / 22%); }
+
+.viewer-sep { width: 1px; height: 16px; background: rgb(255 255 255 / 25%); }
+
+/* 旧的 .tag / .tag-warn / .tag-bad 已删 —— 异常改用带底色的 `.task-error` 说明块，
+   那个小圆标签是上一版「日志行」的遗留，留着就是死代码。 */
+
+/* ══ 空态 / 失败态 ══════════════════════════════════════════════════ */
+
+.empty {
+  padding: var(--sp-5) var(--sp-3);
+  text-align: center;
+  font-size: var(--fs-sm);
+  color: var(--ink-3);
+  line-height: 1.9;
+}
+
+/* 查7：读盘失败**不许**渲染成空态 —— 保留提示 + 给重试动作 */
+.notice {
+  margin: var(--sp-2) 0;
+  padding: var(--sp-3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--bg);
+}
+
+.notice-text {
+  margin: 0 0 var(--sp-2);
+  font-size: var(--fs-sm);
+  color: var(--bad);
+}
+
+/* ══ 工作台：输入 + 参数 = 一个整体 ════════════════════════════════ */
+
+.composer {
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--bg);
+  overflow: hidden;
+}
+
+/* 查1：间距只由区块自己给 padding，不用负 margin 往父容器外撑。
+   ⚠️ 下边距**不能是 0**：textarea 是 `height: 96px`，最后一行文字能顶到底边，
+   没有这段 padding，打满的行会**贴住** `.composer-bar` 的 `border-top`。 */
+.composer-top { padding: var(--sp-3) var(--sp-4) var(--sp-3); }
+
+/* 查2：工具条上边线 —— 分隔「写什么」与「怎么生成」 */
+.composer-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  flex-wrap: wrap;
+  padding: var(--sp-3) var(--sp-4);
+  border-top: 1px solid var(--line);
+  background: var(--bg-sub);
+}
+
+/* ⚠️ `.field-label` 已删（2026-10-01）：操作区那两个 2 字标签（「提示词」「垫图」）
+   去掉了 —— 输入框的占位符、「+」按钮本身已经把话说完，再挂两个字只是噪音。
+   少一个可见标签就补一个无障碍名字（`aria-label`），不靠可见文字。 */
+
+/* 提示词输入 = **富文本**（contentEditable），不再是 textarea。
+ * 形态对齐 maomao 生图节点的 `PromptInput`：里面能放行内**芯片**（垫图引用）。
+ * `white-space: pre-wrap` 是必须的 —— 不写的话换行会被浏览器压成一个空格。 */
+.prompt-input {
+  /* 竖向自适应**不用 JS**：块级元素本来就随内容长高，给个上限就够
+   * （maomao 那边用 JS 写 `style.height` 是因为它还有拖拽定高的功能，这里没有）。 */
+  min-height: 96px;
+  max-height: 360px;
+  overflow-y: auto;
+  padding: 0;
+  outline: none;
+  background: transparent;
+  color: var(--ink);
+  font-size: var(--fs-lg);
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+  cursor: text;
+}
+
+/* 占位符：`contentEditable` 没有 placeholder ⇒ 绝对定位的兄弟节点顶上。
+ * 显隐由 app.js 按**序列化后的文本**决定（只剩一个空 `<br>` / 零宽空格时，
+ * `innerHTML` 非空但内容其实是空的 —— 那时占位符必须继续显示）。 */
+.prompt-placeholder {
+  position: absolute;
+  top: 0;
+  left: 0;
+  color: var(--ink-3);
+  font-size: var(--fs-lg);
+  line-height: 1.7;
+  pointer-events: none;
+}
+
+/* `@` 弹层的定位锚（弹层钉在输入框下沿，见 `.mention-menu`） */
+.composer-input { position: relative; }
+
+/* 行内芯片（垫图引用）—— 与 maomao 的 `.prompt-chip` 同形态：圆角胶囊 + 缩略图 + 名字。
+ * `contentEditable=false` 让浏览器把它当**一个整体**删（不会删掉半个 token）。 */
+.prompt-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 160px;
+  height: 22px;
+  margin: 0 1px;
+  padding: 0 6px 0 3px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  background: var(--bg-sub);
+  font-size: var(--fs-xs);
+  color: var(--ink-2);
+  vertical-align: baseline;
+  user-select: none;
+}
+
+.prompt-chip-thumb {
+  display: block;
+  width: 16px;
+  height: 16px;
+  border-radius: var(--r-sm);
+  object-fit: cover;
+}
+
+.prompt-chip-icon { color: var(--ink-3); }
+
+.prompt-chip-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* `@` 候选弹层 —— 坐标由 `ui/promptMention.js` 算好（**视口坐标**），
+ * 这里只声明"怎么摆"：`position: fixed` + 几个自定义属性。
+ *
+ * ⚠️ 为什么是 `fixed` 而不是 `absolute`：弹层 portal 到 `body`，
+ *    既不会被面板的 `overflow` 裁掉，也不会被别的层盖住；
+ *    代价是坐标必须是视口坐标 —— `computeMentionPlacement` 给的就是视口坐标。
+ * ⚠️ 默认**向上弹**：底边贴 `@` 所在行上方 4px（`--mention-bottom`）；
+ *    上方空间不够时 `promptMention` 会改成向下弹（改用 `--mention-top`）。
+ * ⚠️ 宽度固定 `MENTION_PANEL_W`（280）而不是随内容撑：垫图名字长短不一，
+ *    随内容变宽会让弹层在打字时左右跳。 */
+.mention-menu {
+  position: fixed;
+  left: var(--mention-x, 8px);
+  top: var(--mention-top, auto);
+  bottom: var(--mention-bottom, auto);
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  width: var(--mention-w, 280px);
+  max-height: var(--mention-max-h, 300px);
+  overflow-y: auto;
+  padding: var(--sp-1);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--bg);
+  box-shadow: var(--shadow-dialog);
+}
+
+.mention-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--r-sm);
+  color: var(--ink);
+  font-size: var(--fs-sm);
+  cursor: pointer;
+}
+
+.mention-item:hover,
+.mention-item.is-on { background: var(--bg-hover); }
+
+/* 缩略图 36px（与 maomao 的候选行同规格）：垫图是"看一眼就知道选哪张"的东西，
+ * 小到看不清就等于没给。 */
+.mention-thumb {
+  flex: none;
+  width: 36px;
+  height: 36px;
+  border-radius: var(--r-sm);
+  background: var(--line-soft);
+  overflow: hidden;
+}
+
+.mention-thumb img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.mention-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mention-empty {
+  padding: var(--sp-2);
+  font-size: var(--fs-xs);
+  color: var(--ink-3);
+}
+
+/* 工具条里的小字段：标签 + 控件，同一排 */
+.bar-field {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.bar-label {
+  font-size: var(--fs-xs);
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+
+/* 垫图 —— **可多张**（契约是 `string[]`，上传/指纹/缓存全程按数组走，无数量上限）。
+ *
+ * ⚠️ 位置在**提示词输入框上方、左对齐**，形态对齐 maomao 生图节点：
+ *    那边是 `ResourceStrip`（素材缩略图条）在 `PromptInput` 之上
+ *    （`src/components/image/nodes/ImageGenerate.tsx`）。垫图是**提交前唯一该核对**的东西，
+ *    它得先于提示词被看到，而不是缩在下面那排参数里当一个小控件。
+ *
+ * `flex-wrap` 是必须的：不写的话加到第三四张就会溢出。 */
+.refs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+}
+
+.ref {
+  position: relative;
+  flex: none;
+  width: 56px;
+  height: 56px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--bg);
+  overflow: hidden;
+}
+
+.ref img { width: 100%; height: 100%; object-fit: cover; display: block; }
+
+/* 查8：删除键**常显**，不做 hover 才冒出来 */
+.ref-remove {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  border: none;
+  border-radius: var(--r-sm) 0 0 0;
+  background: var(--ink);
+  color: var(--bg);
+  font-size: 10px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ref-remove:hover { background: var(--bad); }
+
+.ref-add {
+  flex: none;
+  width: 56px;
+  height: 56px;
+  padding: 0;
+  border: 1px dashed var(--line);
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--ink-3);
+  font-size: var(--fs-lg);
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ref-add:hover { border-color: var(--ink); color: var(--ink); }
+
+/* 下拉 */
+select {
+  height: var(--h-ctl);
+  min-width: 148px;
+  /* ⚠️ 上限是必须的：`<select>` 的宽度**由最宽的 `<option>` 决定**，
+     不给上限 ⇒ 将来加一个长名字的模型，就能把整条工具栏顶到换行。
+     （选项文案已在 `loadModels` 里收成"只显示本名"，这里是兜底。） */
+  max-width: 220px;
+  text-overflow: ellipsis;
+  padding: 0 var(--sp-5) 0 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background-color: var(--bg);
+  color: var(--ink);
+  font-size: var(--fs-sm);
+  outline: none;
+  appearance: none;
+  cursor: pointer;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='11' height='11' viewBox='0 0 12 12'><path d='M3 4.8L6 7.8 9 4.8' fill='none' stroke='%23a6a6ae' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+}
+
+select:focus { border-color: var(--ink); }
+
+/* 分段控件（比例 / 尺寸） */
+.seg {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: var(--r-md);
+  background: var(--bg);
+}
+
+.seg button {
+  height: calc(var(--h-ctl) - 4px);
+  padding: 0 10px;
+  border: none;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--ink-2);
+  font-size: var(--fs-sm);
+  white-space: nowrap;
+  line-height: 1;
+}
+
+.seg button:hover { color: var(--ink); }
+
+.seg button.is-on {
+  background: var(--bg-sub);
+  color: var(--ink);
+  font-weight: 500;
+  box-shadow: var(--shadow);
+}
+
+/* ══ 工作台：待发 ══════════════════════════════════════════════════ */
+
+.queue-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin-top: var(--sp-5);
+}
+
+.queue-title {
+  margin: 0;
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.note {
+  margin: var(--sp-2) 0 0;
+  font-size: var(--fs-xs);
+  color: var(--ink-3);
+  line-height: 1.6;
+}
+
+/* 查2：行下边线 —— 分隔相邻两条待发 */
+/* `flex-start`（不是 center）：**垫图要贴在左上角**，居中会跟着文字行一起往下沉。 */
+.queue-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-1);
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.queue-row .task-text { flex: 1; }
+
+/* 查8：删除键**常显** */
+.queue-remove {
+  flex: none;
+  width: var(--h-btn-sm);
+  height: var(--h-btn-sm);
+  padding: 0;
+  border: none;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--ink-3);
+  font-size: var(--fs-lg);
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.queue-remove:hover { background: var(--bg-hover); color: var(--bad); }
+
+/* ══ 弹窗 ══════════════════════════════════════════════════════════ */
+
+.mask {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  align-items: center;
+  justify-content: center;
+  background: var(--mask);
+}
+
+/* 查4：`hidden` 优先于 flex，避免用内联样式切换显示 */
+.mask:not([hidden]) { display: flex; }
+
+.dialog {
+  width: 388px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--bg);
+  box-shadow: var(--shadow-dialog);
+}
+
+.dialog-wide { width: 520px; }
+
+.dialog-title {
+  margin: 0;
+  padding: var(--sp-5) var(--sp-5) 0;
+  font-size: var(--fs-lg);
+  font-weight: 600;
+}
+
+.dialog-text {
+  margin: 0;
+  padding: var(--sp-2) var(--sp-5) var(--sp-4);
+  font-size: var(--fs-md);
+  color: var(--ink-2);
+  line-height: 1.7;
+}
+
+.dialog-body { padding: var(--sp-3) var(--sp-5) 0; }
+
+.dialog-body .note { padding-bottom: var(--sp-3); }
+
+/* 查2：按钮条上边线 —— 分隔「读内容」与「做动作」 */
+.dialog-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-5) var(--sp-4);
+  border-top: 1px solid var(--line);
+}
+
+.form {
+  display: grid;
+  grid-template-columns: 84px 1fr;
+  gap: var(--sp-3);
+  align-items: center;
+}
+
+.form-label {
+  font-size: var(--fs-sm);
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+
+.form-input {
+  width: 100%;
+  height: var(--h-ctl);
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg-sub);
+  color: var(--ink);
+  font-size: var(--fs-sm);
+  outline: none;
+}
+
+.form-input:focus { border-color: var(--ink); background: var(--bg); }
+
+/* 导入弹窗里的文件行 */
+.import-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-3);
+  padding: var(--sp-3) 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.import-row:last-child { border-bottom: none; }
+
+.import-text { flex: 1; min-width: 0; }
+
+.import-name {
+  font-size: var(--fs-md);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.import-meta {
+  margin-top: 2px;
+  font-size: var(--fs-xs);
+  color: var(--ink-3);
+}
+
+.import-errors {
+  margin: var(--sp-1) 0 0;
+  padding-left: var(--sp-4);
+  font-size: var(--fs-xs);
+  color: var(--bad);
+}

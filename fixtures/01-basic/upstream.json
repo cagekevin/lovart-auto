@@ -1,0 +1,7 @@
+{
+  "threadIdPrefix": "t",
+  "polls": [{ "status": "running" }, { "status": "done" }],
+  "result": {
+    "items": [{ "artifacts": [{ "content": "https://cdn.invalid/a.png" }] }]
+  }
+}

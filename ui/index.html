@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>lovart</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<!--
+  ⚠️ 全文件**零内联样式**：没有一处 `style="…"`。
+  隐藏用 `hidden` 属性；图标色走 CSS 类 + 令牌。
+  **没有进度条** —— 上游 `/chat/status` 只回 `status`
+  （2026-10-01 直连实测：`{"code":0,"data":{"thread_id":"…","status":"running"}}`
+  —— 没有百分比、没有排队位次），所以「单条生成到几成」**没有真值**，
+  编一个百分比就是把不知道的数字写成肯定句。
+  也**不留任何"转圈"式装饰动画**：转的永远不是进度，只会看着像卡住。
+  单条能回答的是**事实行**（见 `app.js` 的 `.task-facts`）：现在在哪一步、
+  这个状态已持续多久、试了几次、产物叫什么 —— 全是真值，一个猜的数字都没有。
+-->
+<svg class="svg-defs" aria-hidden="true">
+  <symbol id="i-img" viewBox="0 0 24 24">
+    <rect x="3" y="4.5" width="18" height="15" rx="2.4" />
+    <circle cx="8.6" cy="10" r="1.6" />
+    <path d="M4.2 17.2l5-4.8 3.9 3.9 2.7-2.7 4 4" />
+  </symbol>
+  <symbol id="i-chev" viewBox="0 0 12 12">
+    <path d="M4.5 2.5L8 6l-3.5 3.5" />
+  </symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24">
+    <rect x="9" y="9" width="11" height="11" rx="2" />
+    <path d="M5 15V6a2 2 0 0 1 2-2h9" />
+  </symbol>
+  <!-- 三个点用极短线段画，这样 fill:none + stroke 的全局规则也能正确显示 -->
+  <symbol id="i-more" viewBox="0 0 24 24">
+    <path d="M12 5h.01M12 12h.01M12 19h.01" stroke-width="3.4" />
+  </symbol>
+</svg>
+
+<header class="topbar">
+  <div class="brand">
+    <!-- 品牌图标 = **应用图标同一张图**（`ui/logo.png`，随 `frontendDist` 一起嵌进二进制）。
+         刻意不再用内联 SVG 仿画：仿出来的和 Dock 里那张永远是两个样子。 -->
+    <img class="brand-mark" src="logo.png" alt="" />
+    <b class="brand-name">lovart</b>
+  </div>
+  <button class="btn btn-sm btn-quiet" id="btnSettings">设置</button>
+</header>
+
+<div class="split">
+
+  <!-- ══ 任务中心 ══ -->
+  <section class="panel panel-board">
+    <div class="panel-head">
+      <h2 class="panel-title">任务中心</h2>
+      <span class="count" id="boardCount">—</span>
+      <div class="head-actions">
+        <!-- 「接着查」：把**没人跟**的未完成记录接回来（按 threadId 复查，不重复提交）。
+             平时隐藏，只有真出现残记录时才由 app.js 显示。 -->
+        <button class="btn btn-sm btn-quiet" id="btnResume" hidden>接着查 0</button>
+        <button class="btn btn-sm btn-stop" id="btnStop" disabled>停止</button>
+        <button class="btn btn-sm btn-quiet" id="btnOpenOutput">打开输出文件夹</button>
+        <div class="menu-anchor">
+          <button class="icon-btn" id="btnBoardMore" title="更多">
+            <svg class="icon-btn-svg"><use href="#i-more" /></svg>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel-body" id="boardBody">
+
+      <!-- 加载/失败态：读不到 ≠ 没有 -->
+      <div class="notice" id="boardNotice" hidden>
+        <p class="notice-text" id="boardNoticeText"></p>
+        <button class="btn btn-sm" id="btnRetryRead">重试</button>
+      </div>
+
+      <div id="boardMain">
+        <!-- 「要你处理」—— **你不点它就不动**的那些（今天只有"待确认"）。
+             刻意**单独成组、放最上面、默认展开**：它原先被归进「已结束」，
+             用户看到的是"它自己完成了，没问我"（2026-10-01 实测反馈）。
+             判据在 Rust（`task_group` 的 `waiting`），前端不判。 -->
+        <div id="waitingGroup" hidden>
+          <div class="group-title">
+            <span class="dot dot-warn"></span>
+            <span>待处理</span>
+            <span class="group-meta" id="waitingMeta">0 条</span>
+          </div>
+          <div class="run-list" id="waitingList"></div>
+        </div>
+
+        <div class="group-title">
+          <span class="dot" id="runningDot"></span>
+          <span id="runningTitle">处理中</span>
+          <span class="group-meta" id="runningMeta">0 在跑 · 0 排队</span>
+        </div>
+        <div class="run-list" id="runningList"></div>
+
+        <button class="waitbar" id="btnQueued" hidden>
+          <svg class="chev" aria-hidden="true"><use href="#i-chev" /></svg>
+          <span class="waitbar-text">排队中 <b id="queuedCount">0</b> 条</span>
+          <span class="waitbar-hint" id="queuedHint">展开</span>
+        </button>
+        <div class="queued-list" id="queuedList" hidden></div>
+
+        <div class="group-row">
+          <button class="group-title group-toggle" id="btnDone" aria-expanded="false">
+            <svg class="chev" aria-hidden="true"><use href="#i-chev" /></svg>
+            <!-- ⚠️ 这里叫「已结束」而不是「已完成」：这一组装的是**结束了的**，
+                 含 `failed` / `no_artifact`（结束但没图）—— 写「已完成」就是撒谎。
+                 每条到底什么状态，由卡片自己的状态名回答。 -->
+            <span>已结束</span>
+            <span class="group-count" id="doneCount">0</span>
+          </button>
+          <button class="btn btn-sm btn-quiet" id="btnRetry" hidden>重跑异常 0</button>
+        </div>
+        <div class="done-list" id="doneList" hidden></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ══ 工作台 ══ -->
+  <section class="panel panel-work">
+    <div class="panel-body">
+
+      <!-- 输入 + 参数 = 一个整体 -->
+      <div class="composer">
+        <div class="composer-top">
+          <!-- 垫图（参考图）在**提示词输入框上方、左对齐** —— 形态与 maomao 生图节点
+              一致（那边是 `ResourceStrip` 素材区在 `PromptInput` 之上，见
+               `src/components/image/nodes/ImageGenerate.tsx`）。
+               缩略图与「+」由 app.js 一起渲染、一起换行（理由见 renderRefs）。
+               ⚠️ 不挂「垫图」两个字：图本身已经把话说完（标签已删）。 -->
+          <div class="refs" id="refs" role="group" aria-label="垫图"></div>
+          <!-- 提示词 = **富文本**（contentEditable），不是 textarea：在里面输入 `@` 调出垫图，
+               选中后变成行内**芯片**（图片芯片带缩略图）。形态对齐 maomao 生图节点的
+               `PromptInput`；序列化格式（`@{id:label|thumb}`）见 `ui/promptChips.js`。
+               ⚠️ 没有可见标签 ⇒ 占位符用 `:empty::before` 自己造，无障碍名走 `aria-label`。 -->
+          <div class="composer-input">
+            <div class="prompt-input" id="promptInput" contenteditable="true"
+              role="textbox" aria-multiline="true" aria-label="提示词"></div>
+            <!-- 占位符：`contentEditable` **没有 placeholder** ⇒ 用一个绝对定位的兄弟节点顶上。
+                 显隐判据是**序列化后的文本**（不是 `innerHTML`），见 app.js 的 syncPromptPlaceholder。 -->
+            <span class="prompt-placeholder" id="promptPlaceholder" aria-hidden="true"
+              >描述画面（输入 @ 引用垫图）</span>
+            <!-- `@` 候选弹层：内容与坐标由 app.js 算（判定/定位在 `ui/promptMention.js`）。
+                 启动时会 portal 到 `body`（`position: fixed` 才不被面板裁掉）—— 这里只是初始落点。 -->
+            <div class="mention-menu" id="mentionMenu" hidden></div>
+          </div>
+        </div>
+
+        <div class="composer-bar">
+          <div class="bar-field">
+            <label class="bar-label" for="modelSelect">模型</label>
+            <select id="modelSelect"></select>
+          </div>
+          <div class="bar-field">
+            <span class="bar-label">比例</span>
+            <div class="seg" id="ratioSeg"></div>
+          </div>
+          <div class="bar-field">
+            <span class="bar-label">尺寸</span>
+            <div class="seg" id="sizeSeg"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="queue-head">
+        <h3 class="queue-title">待发</h3>
+        <span class="count" id="queueCount">0 条</span>
+        <div class="head-actions">
+          <button class="btn btn-sm btn-quiet" id="btnImport">从 inbox 导入</button>
+          <button class="btn btn-sm btn-danger" id="btnClear">清空</button>
+        </div>
+      </div>
+      <p class="note">导入将追加到待发，不覆盖已有内容。</p>
+      <div class="queue-list" id="queueList"></div>
+
+    </div>
+
+    <div class="panel-foot">
+      <button class="btn btn-primary" id="btnPublish">发布任务</button>
+    </div>
+  </section>
+
+</div>
+
+<!--
+  ══ 看大图 ══
+  参照实现（maomao 的 ImageZoomDialog）：全屏黑底、图片 contain、
+  点空白关闭、右上关闭按钮、右下像素角标、底部工具条。
+
+  ⚠️ 这里**不做滚轮缩放 / 拖拽平移** —— 那两样必须靠 `el.style.transform`
+  实现，会违反「零内联样式」。改成**两档模式**（适应窗口 / 实际大小），
+  实际大小用容器原生滚动，能力不减且没有一处内联样式。
+-->
+<div class="viewer" id="viewer" hidden>
+  <div class="viewer-stage" id="viewerStage">
+    <img class="viewer-img" id="viewerImg" alt="大图" />
+  </div>
+  <span class="viewer-dims" id="viewerDims"></span>
+  <button class="viewer-close" id="viewerClose" aria-label="关闭">×</button>
+  <div class="viewer-bar">
+    <button class="viewer-btn" id="viewerFit">适应窗口</button>
+    <button class="viewer-btn" id="viewerActual">实际大小</button>
+    <span class="viewer-sep"></span>
+    <button class="viewer-btn" id="viewerReveal">打开所在位置</button>
+    <button class="viewer-btn" id="viewerCopy">复制提示词</button>
+  </div>
+</div>
+
+<!-- ══ 发布确认 ══ -->
+<div class="mask" id="maskPublish" hidden>
+  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="publishTitle">
+    <h2 class="dialog-title" id="publishTitle">发布任务？</h2>
+    <p class="dialog-text" id="publishText">提交后任务进入左侧「处理中」。</p>
+    <div class="dialog-foot">
+      <button class="btn" id="btnPublishCancel">取消</button>
+      <button class="btn btn-primary" id="btnPublishOk">发布</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══ 清空确认 ══ -->
+<div class="mask" id="maskClear" hidden>
+  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="clearTitle">
+    <h2 class="dialog-title" id="clearTitle">清空待发？</h2>
+    <p class="dialog-text" id="clearText">待发内容将被删除，不可撤销。</p>
+    <div class="dialog-foot">
+      <button class="btn" id="btnClearCancel">取消</button>
+      <button class="btn btn-danger" id="btnClearOk">清空</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══ 导入 ══ -->
+<div class="mask" id="maskImport" hidden>
+  <div class="dialog dialog-wide" role="dialog" aria-modal="true" aria-labelledby="importTitle">
+    <h2 class="dialog-title" id="importTitle">从 inbox 导入</h2>
+    <div class="dialog-body" id="importList"></div>
+    <div class="dialog-foot">
+      <button class="btn" id="btnImportCancel">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══ 设置 ══ -->
+<div class="mask" id="maskSettings" hidden>
+  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+    <h2 class="dialog-title" id="settingsTitle">设置</h2>
+    <div class="dialog-body">
+      <div class="form">
+        <label class="form-label" for="setAccessKey">访问密钥（AK）</label>
+        <input class="form-input" id="setAccessKey" type="password" autocomplete="off" />
+        <label class="form-label" for="setSecretKey">签名密钥（SK）</label>
+        <input class="form-input" id="setSecretKey" type="password" autocomplete="off" />
+        <label class="form-label" for="setConcurrency">并发数</label>
+        <input class="form-input" id="setConcurrency" type="number" min="1" max="8" />
+        <label class="form-label" for="setOutput">输出文件夹</label>
+        <input class="form-input" id="setOutput" />
+      </div>
+      <p class="note" id="settingsNote" hidden></p>
+    </div>
+    <div class="dialog-foot">
+      <button class="btn" id="btnSettingsCancel">取消</button>
+      <button class="btn btn-primary" id="btnSettingsSave">保存</button>
+    </div>
+  </div>
+</div>
+
+<input class="visually-hidden" id="refPicker" type="file" accept="image/*" multiple />
+
+<script src="promptChips.js"></script>
+<script src="promptMention.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

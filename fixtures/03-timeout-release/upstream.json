@@ -1,0 +1,6 @@
+{
+  "threadIdPrefix": "t",
+  "polls": [{ "status": "running" }],
+  "taskTimeoutMs": 30,
+  "maxTimeouts": 2
+}

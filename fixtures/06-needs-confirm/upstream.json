@@ -1,0 +1,4 @@
+{
+  "threadIdPrefix": "t",
+  "polls": [{ "status": "pending_confirmation" }]
+}

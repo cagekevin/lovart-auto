@@ -1,0 +1,15 @@
+{
+  "send": [
+    {
+      "error": "Concurrent task limit reached",
+      "httpStatus": 402,
+      "bizCode": 2012
+    }
+  ],
+  "polls": [{ "status": "done" }],
+  "result": {
+    "items": [{ "artifacts": [{ "content": "https://cdn.invalid/a.png" }] }]
+  },
+  "maxAttempts": 1,
+  "maxBusyRetries": 2
+}
