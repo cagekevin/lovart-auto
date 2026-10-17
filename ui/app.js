@@ -43,6 +43,14 @@ const SIZES = ['1K', '2K', '4K'];
 // ⚠️ `refs` 的元素是 **`{ id, url, label }`**，不是裸字符串：提示词里的 `@` 芯片按 `id`
 //    引用垫图（token 形如 `@{ref-3:猫.png}`）—— 只存 url 的话，"删掉第 2 张"会让后面
 //    所有芯片**错位到别的图**上（芯片是文本里的固定 token，不会跟着数组下标走）。
+/**
+ * 新建任务的参数。
+ *
+ * ⚠️ 这里的 `3:4` / `2K` **只是启动占位**：真正生效的兜底参数来自后端设置
+ * （`get_settings` 的 `defaultRatio` / `defaultSize`，由 `applyDefaultSettings` 覆盖）。
+ * 之所以留字面量，是因为 `get_settings` 也可能失败 —— 那时总得有个可用的初值，
+ * 而不是让新任务带着空参数去发布（解析器会报 "ratio 必须是 w:h"）。
+ */
 const draft = { model: '', ratio: '3:4', size: '2K', refs: [] };
 
 /** 垫图 id 计数器：**只增不减**（删一张不复用编号 ⇒ 已有芯片不会突然指到新图上）。 */
@@ -1526,39 +1534,116 @@ async function importFile(index) {
   }
 }
 
-async function openSettings() {
+/**
+ * 读一次设置。失败 ⇒ `null` + 提示（**不编造默认值**：设置页显示假配置比空着更糟）。
+ *
+ * ⚠️ 兜底参数（模型/比例/尺寸）的**判定**在后端 `PromptDefaults::resolve`，
+ * 前端只负责把生效值画出来、把用户改的值送回去 —— 不在这儿再写一遍"什么是合法"。
+ */
+async function loadSettings() {
   try {
-    const value = await invoke('get_settings');
+    return await invoke('get_settings');
+  } catch (error) {
+    notice(`读设置失败：${error}`);
+    return null;
+  }
+}
+
+/**
+ * 把后端给的兜底参数应用到**新建任务**的默认选择上。
+ *
+ * 为什么新建任务也要跟着变：兜底只对"没写参数的提示词"生效，而界面上的
+ * 模型/比例/尺寸是**显式**写进队列的 —— 不跟着变的话，用户在设置里选了 4K，
+ * 手写一条提示词发出去还是 2K，他会认为设置没生效。
+ */
+function applyDefaultSettings(settings) {
+  if (settings) {
+    // 比例可能是手改 `.env` 写进去的非常用值（如 9:16）：补进分段控件，
+    // 否则一个都不高亮，用户会以为设置丢了。
+    if (settings.defaultRatio && !RATIOS.includes(settings.defaultRatio)) {
+      RATIOS.push(settings.defaultRatio);
+    }
+    if (settings.defaultRatio) draft.ratio = settings.defaultRatio;
+    if (SIZES.includes(settings.defaultSize)) draft.size = settings.defaultSize;
+    if (settings.defaultModel && models.some((model) => model.alias === settings.defaultModel)) {
+      draft.model = settings.defaultModel;
+      $('modelSelect').value = draft.model;
+    }
+  }
+  // 无论有没有读到设置都要画一次：分段控件不能是空白。
+  renderSeg('ratioSeg', RATIOS, draft.ratio, pickRatio);
+  renderSeg('sizeSeg', SIZES, draft.size, pickSize);
+}
+
+/** 设置弹窗里的三个兜底下拉：选项来自后端模型表 + 前端的合法值清单（与合成器同一份）。 */
+function renderDefaultSelects(value) {
+  const modelBox = $('setDefaultModel');
+  clear(modelBox);
+  for (const model of models) {
+    const option = el('option', '', model.name || model.alias);
+    option.value = model.alias;
+    modelBox.appendChild(option);
+  }
+  const model = value.defaultModel || models[0]?.alias || '';
+  modelBox.value = model;
+
+  // 比例：自由输入 + 常用值建议（解析器接受任意 w:h，下拉会把用户锁死在四种里）。
+  const ratioOptions = $('ratioOptions');
+  clear(ratioOptions);
+  for (const ratio of RATIOS) {
+    const option = el('option');
+    option.value = ratio;
+    ratioOptions.appendChild(option);
+  }
+  $('setDefaultRatio').value = value.defaultRatio || draft.ratio;
+
+  const sizeBox = $('setDefaultSize');
+  clear(sizeBox);
+  for (const size of SIZES) {
+    const option = el('option', '', size);
+    option.value = size;
+    sizeBox.appendChild(option);
+  }
+  sizeBox.value = value.defaultSize || SIZES[0];
+}
+
+async function openSettings() {
+  const value = await loadSettings();
+  if (value) {
     $('setAccessKey').value = value.accessKey || '';
     $('setSecretKey').value = value.secretKey || '';
     $('setConcurrency').value = value.concurrency || 7;
     $('setOutput').value = value.outputDir || 'output';
-  } catch (error) {
-    notice(`读设置失败：${error}`);
+    renderDefaultSelects(value);
   }
   openMask('maskSettings');
 }
 
 async function saveSettings() {
+  const payload = {
+    accessKey: $('setAccessKey').value.trim(),
+    secretKey: $('setSecretKey').value.trim(),
+    concurrency: Number($('setConcurrency').value) || 7,
+    outputDir: $('setOutput').value.trim() || 'output',
+    defaultModel: $('setDefaultModel').value,
+    defaultRatio: $('setDefaultRatio').value.trim(),
+    defaultSize: $('setDefaultSize').value,
+  };
   try {
-    await invoke('save_settings', {
-      payload: {
-        accessKey: $('setAccessKey').value.trim(),
-        secretKey: $('setSecretKey').value.trim(),
-        concurrency: Number($('setConcurrency').value) || 7,
-        outputDir: $('setOutput').value.trim() || 'output',
-      },
-    });
+    await invoke('save_settings', { payload });
   } catch (error) {
+    // 校验失败（非法模型/比例/尺寸）原样透传：**不落盘、界面不变**，用户看得见原因。
     notice(`保存失败：${error}`);
     return;
   }
+  // 保存成功后立刻把兜底参数用起来（后端已 `reload_dot_env`，无需重启）。
+  applyDefaultSettings(payload);
   closeMask('maskSettings');
 }
 
 // ── 启动 ─────────────────────────────────────────────────────────────
 
-async function loadModels() {
+async function loadModels(settings) {
   try {
     models = await invoke('list_models');
   } catch (error) {
@@ -1577,21 +1662,22 @@ async function loadModels() {
     option.value = model.alias;
     select.appendChild(option);
   }
-  // 默认选**工具默认模型**，不是列表第一个 —— 列表第一个是 gpt-image-2-low，
-  // 选中它会让「没动过下拉」的任务悄悄用上另一个模型。
-  const DEFAULT_MODEL = 'nano-bn-2';
-  draft.model = models.some((model) => model.alias === DEFAULT_MODEL)
-    ? DEFAULT_MODEL
-    : (models[0]?.alias ?? DEFAULT_MODEL);
+  // 默认选**兜底模型**（设置里的 `defaultModel`），不是列表第一个 ——
+  // 列表第一个是 gpt-image-2-low，选中它会让「没动过下拉」的任务悄悄用上另一个模型。
+  // 兜底值由后端解析（缺键/非法值已在内置默认上兜过），前端不再写死模型名。
+  const preferred = settings?.defaultModel || models[0]?.alias || '';
+  draft.model = models.some((model) => model.alias === preferred)
+    ? preferred
+    : (models[0]?.alias ?? preferred);
   select.value = draft.model;
   select.addEventListener('change', () => { draft.model = select.value; });
 }
 
 window.addEventListener('DOMContentLoaded', async () => {
-  await loadModels();
-
-  renderSeg('ratioSeg', RATIOS, draft.ratio, pickRatio);
-  renderSeg('sizeSeg', SIZES, draft.size, pickSize);
+  // 设置先读：模型下拉的初值与比例/尺寸的初值都由它决定（兜底参数的唯一来源在后端）。
+  const settings = await loadSettings();
+  await loadModels(settings);
+  applyDefaultSettings(settings);
 
   // 提示词是**富文本**（contentEditable）⇒ 事件自己接（整套对齐 maomao 的 PromptInput）。
   //

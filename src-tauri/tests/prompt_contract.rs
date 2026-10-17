@@ -323,3 +323,55 @@ fn 黄金_id_对账_Rust_算出的_id_与_TS_一致() {
 
     assert!(checked >= 7, "只对账了 {checked} 组，应为 7 组");
 }
+
+// ── 兜底参数（LOVART_DEFAULT_* / 设置页）────────────────────────────────
+//
+// 这一组钉的是"兜底只有一个判定点"：`PromptDefaults::resolve` 是纯函数，
+// `from_env` 只是把三个环境变量喂给它。所以这里不碰进程环境（并发测试会互相踩），
+// 直接测纯函数；`validated` 是保存设置时的守门人，两套输入必须用同一批校验。
+
+#[test]
+fn 兜底_三个都不给就是内置默认且不告警() {
+    let (resolved, warnings) = PromptDefaults::resolve(None, None, None);
+    assert_eq!(resolved, PromptDefaults::default());
+    assert!(warnings.is_empty(), "缺省是正常用法，不该刷告警：{warnings:?}");
+}
+
+#[test]
+fn 兜底_空串等同于没写() {
+    let (resolved, warnings) = PromptDefaults::resolve(Some("  "), Some(""), Some("\t"));
+    assert_eq!(resolved, PromptDefaults::default());
+    assert!(warnings.is_empty());
+}
+
+#[test]
+fn 兜底_逐字段生效且尺寸大小写归一() {
+    let (resolved, warnings) = PromptDefaults::resolve(Some("nano-bn-pro"), Some("9:16"), Some("4k"));
+    assert_eq!(resolved.model, "nano-bn-pro");
+    assert_eq!(resolved.aspect_ratio, "9:16");
+    assert_eq!(resolved.image_size, "4K", "三个档位必须归一成大写成对");
+    assert!(warnings.is_empty());
+}
+
+#[test]
+fn 兜底_三种非法值各自退回内置并各给一条告警() {
+    let (resolved, warnings) = PromptDefaults::resolve(Some("不存在的模型"), Some("3x4"), Some("5K"));
+    let base = PromptDefaults::default();
+    assert_eq!(resolved, base, "非法值绝不许被原样用上去");
+    assert_eq!(warnings.len(), 3, "一个字段一条，别合成一句：{warnings:?}");
+    assert!(warnings.iter().any(|w| w.contains("LOVART_DEFAULT_MODEL")));
+    assert!(warnings.iter().any(|w| w.contains("LOVART_DEFAULT_RATIO")));
+    assert!(warnings.iter().any(|w| w.contains("LOVART_DEFAULT_SIZE")));
+}
+
+#[test]
+fn 保存校验_只收与解析器同一套合法值() {
+    let ok = PromptDefaults::validated("nano-bn-2", "16:9", "1k").unwrap();
+    assert_eq!(ok.aspect_ratio, "16:9");
+    assert_eq!(ok.image_size, "1K", "保存时就归一，别等读取时再归一");
+
+    assert!(PromptDefaults::validated("", "3:4", "2K").unwrap_err().contains("不能为空"));
+    assert!(PromptDefaults::validated("没这个模型", "3:4", "2K").unwrap_err().contains("别名表"));
+    assert!(PromptDefaults::validated("nano-bn-2", "3:4:5", "2K").unwrap_err().contains("w:h"));
+    assert!(PromptDefaults::validated("nano-bn-2", "3:4", "8K").unwrap_err().contains("1K / 2K / 4K"));
+}

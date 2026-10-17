@@ -72,9 +72,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/make-exe.ps1   # �
 | `--refs-cache <file>` | `var/refs-cache.json` | 参考图 CDN 缓存（按内容哈希去重） |
 | `--no-refs-cache` | — | 不读写参考图缓存 |
 | `--concurrency <n>` | `7` | 并发任务数，**硬上限 8** |
-| `--model <alias>` | `nano-bn-2` | 默认模型 |
-| `--ratio <w:h>` | `3:4` | 默认比例 |
-| `--size <1K\|2K\|4K>` | `2K` | 默认尺寸档位，原样透传给上游 |
+| `--model <alias>` | `LOVART_DEFAULT_MODEL` → `nano-bn-2` | 默认模型（命令行 > `.env` > 内置） |
+| `--ratio <w:h>` | `LOVART_DEFAULT_RATIO` → `3:4` | 默认比例（命令行 > `.env` > 内置） |
+| `--size <1K\|2K\|4K>` | `LOVART_DEFAULT_SIZE` → `2K` | 默认尺寸档位（命令行 > `.env` > 内置），原样透传给上游 |
 | `--max-attempts <n>` | `3` | 可重试失败上限 |
 | `--max-busy-retries <n>` | `60` | 「服务端并发满」排队重投上限（≈1 小时 @60s 封顶） |
 | `--max-timeouts <n>` | `3` | 累计超时多少次后**释放槽位**转 `unresolved` |
@@ -93,6 +93,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/make-exe.ps1   # �
 
 **结果怎么看**：`--status` 随时可跑（生成进程正在跑时也能安全查看 —— 只读打开，不压实、不干扰追加写）。
 
+**出了事怎么看**：每次真正开跑（不含 `--check` / `--dry-run` / `--status` / `--list-models`）
+都会往 **`var/run.log`** 追加**带毫秒时间戳的过程日志** —— 提交、排队重投、超时、失败原因、
+批次开始/结束、GUI 的告警，全都在这一个文件里。CLI 与双击打开的界面写的是**同一个文件**。
+
+- 回答的是「**几点几分断的、断在哪一步**」；`state.jsonl` 回答的是「**每条现在是什么状态**」。
+- 超过 8MB 自动轮转成 `var/run.log.1`（只留一份历史），挂机几个月也不会把盘写满。
+- 日志写不进去（盘满 / 权限）**不会**影响跑批，也不会中断任务 —— 它只是旁路。
+
+```bash
+tail -n 50 var/run.log        # 昨晚最后 50 行 = 断在哪一步
+grep -n "批次结束" var/run.log # 有这行 = 批次正常收尾；没有 = 进程被杀/崩了
+grep -c "已提交" var/run.log   # 那一晚到底提交成功了几条
+```
+
 ---
 
 ## prompts.jsonl 格式
@@ -107,13 +121,23 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/make-exe.ps1   # �
 | 字段 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `prompt` | string | ✅ | 非空 |
-| `model` | string | — | 模型别名；缺省用 `--model`。**可用别名见 `--list-models`** |
-| `ratio` | string | — | `w:h`，每边 1–3 位数字；缺省 `3:4` |
-| `size` | string | — | `1K` / `2K` / `4K`；缺省 `2K` |
+| `model` | string | — | 模型别名；缺省用 **兜底模型**（`--model` > `LOVART_DEFAULT_MODEL` > `nano-bn-2`）。**可用别名见 `--list-models`** |
+| `ratio` | string | — | `w:h`，每边 1–3 位数字；缺省用兜底比例（`--ratio` > `LOVART_DEFAULT_RATIO` > `3:4`） |
+| `size` | string | — | `1K` / `2K` / `4K`；缺省用兜底尺寸（`--size` > `LOVART_DEFAULT_SIZE` > `2K`） |
 | `refs` | string[] | — | 参考图（路径 / URL / `data:`），**非空数组** |
 
 **fail-loud**：非法 JSON · 非对象 · **未知字段** · `prompt` 缺失或空 · 类型不符 ·
 **未知模型** · 非法 `ratio` / `size` —— 一律**报错并带行号**，不猜、不兜底。空行跳过。
+
+**兜底参数**（2026-10-17）：`model` / `ratio` / `size` **没写**时用兜底值，
+优先级 **命令行 > `.env`（`LOVART_DEFAULT_MODEL` / `LOVART_DEFAULT_RATIO` / `LOVART_DEFAULT_SIZE`）> 内置默认**。
+三个字段**各自独立**兜底（只漏了 `size` 就只补 `size`）。GUI 的
+「设置 → 兜底模型 / 兜底比例 / 兜底尺寸」写的就是这三把键，判定只有一处
+（`PromptDefaults::resolve`），CLI 与 GUI 共用。
+
+> ⚠️ 这是**取值**兜底，不是**校验**兜底：字段写了但不合法（`"ratio":"3x4"`）仍然报错，
+> 不会静默改成兜底值。设置页保存前会校验（非法值不落盘）；`.env` 里手改的非法值
+> 会退回内置默认并告警。
 
 **自检**（AI 的循环：写 → `--check` → 读报错 → 改 → 再 `--check` → 交给你）：
 

@@ -29,7 +29,10 @@ use crate::lovart::connection::{
     load_dot_env, read_auto_confirm, reload_dot_env, resolve_connection, to_client_deps,
     update_env_keys, AUTO_CONFIRM_KEY,
 };
-use crate::lovart::prompt::{parse_prompts, ParseOptions, PromptDefaults};
+use crate::lovart::prompt::{
+    parse_prompts, ParseOptions, PromptDefaults, DEFAULT_MODEL_KEY, DEFAULT_RATIO_KEY,
+    DEFAULT_SIZE_KEY,
+};
 use crate::run::build_status_json;
 
 /// 运行中的一个批次。
@@ -228,6 +231,11 @@ impl GuiState {
         if let Some(warning) = auto_confirm_warning {
             state.push_alert(&warning);
         }
+        // 兜底参数（模型/比例/尺寸）的非法值：**启动就说**，否则用户会以为设置生效了。
+        let (_, default_warnings) = PromptDefaults::from_env();
+        for warning in default_warnings {
+            state.push_alert(&warning);
+        }
         state
     }
 
@@ -293,6 +301,8 @@ impl GuiState {
     /// 只做「追加」——**不裁剪**。日志可以丢，告警丢了就是骗人。
     /// 消费方是 [`take_alerts`]：前端每轮拉走，拉走即清（不重复弹）。
     fn push_alert(&self, message: &str) {
+        // 告警也落日志：弹窗**关掉就没了**，而挂机出问题时人不在电脑前。
+        crate::engine::runlog::line(&format!("⚠️ 告警：{message}"));
         let mut alerts = self.alerts.lock().unwrap_or_else(|error| error.into_inner());
         alerts.push(format!(
             "[{}] {message}",
@@ -388,7 +398,9 @@ fn take_alerts(state: tauri::State<'_, GuiState>) -> Vec<String> {
 #[tauri::command]
 fn list_inbox(state: tauri::State<'_, GuiState>) -> Result<Value, String> {
     let dir = state.cwd.join("inbox");
-    let defaults = PromptDefaults::default();
+    // 与真正开跑**同一份**兜底参数（`.env` 的 LOVART_DEFAULT_*）：导入前的校验/预览
+    // 若用内置默认值，用户会看到"检查通过"而跑出来的是另一组参数。
+    let (defaults, _) = PromptDefaults::from_env();
     let mut files: Vec<Value> = Vec::new();
 
     // 目录不存在 = **正常**（还没让 AI 写过东西）⇒ 空列表。
@@ -482,7 +494,8 @@ fn start_run(
             }
             // 校验先做：有错就别开跑（与 CLI 的 `--check` 同一条路径）。
             let text = std::fs::read_to_string(&prompts_file).map_err(|error| error.to_string())?;
-            let parsed = parse_prompts(&text, &PromptDefaults::default(), &ParseOptions::default());
+            let parsed =
+                parse_prompts(&text, &PromptDefaults::from_env().0, &ParseOptions::default());
             if !parsed.errors.is_empty() {
                 return Err(format!(
                     "提示词文件有 {} 处问题，已拒绝开跑：\n{}",
@@ -515,6 +528,11 @@ fn start_run(
 
     let cwd = state.cwd.clone();
 
+    // 运行日志：`var/run.log`（进程级只绑一次）。
+    // GUI 原先把调度器的过程输出**全部丢掉**（见下面那个空闭包），结果是挂机出问题时
+    // 第二天只剩 `state.jsonl` 的最终快照、没有任何时间线。这里把它接上。
+    crate::engine::runlog::init(cwd.join("var/run.log"));
+
     // 本批次**接管**的任务 id（逐条下发给前端的 `following` 取它）。
     // 用**全量**而不是"调度器真正入队的那部分"：已终态的那几条会被调度器跳过，
     // 而它们本来就在 `finished` 组里、不画进度条 —— 多带几个 id 不会让任何一条
@@ -523,6 +541,13 @@ fn start_run(
         Batch::Declared(tasks) => tasks.iter().map(|task| task.id.clone()).collect(),
         Batch::Records(ids) => ids.iter().cloned().collect(),
     };
+
+    // 批次边界写进日志：第二天先找这一行，就知道「那一晚开了几批、每批多少条」。
+    crate::engine::runlog::line(&format!(
+        "===== 批次开始：{label}（{} 条，并发 {}）=====",
+        ids.len(),
+        concurrency()
+    ));
 
     {
         let mut board = state.board();
@@ -566,15 +591,15 @@ fn start_run(
             }
         }
 
-        // ⚠️ 调度器的过程输出**在这里刻意丢弃** —— 不是「忘了接」。
+        // 调度器的过程输出 → **只进 `var/run.log`，不进界面**。
         //
-        // 边界划分：**任务级**结果（含每条失败的原因）已经落在 `state.jsonl`，
-        // 看板就是它的显示器；**批次级**结果走 `push_alert`。
-        // 再往界面灌一份过程日志，等于给同一个事实造第二份真相
-        // （原先那条 `get_log` 通道就是这么变成幽灵的 —— DEBT TD-05-15）。
-        //
-        // 若哪天要接上它，**先想清楚它与看板的分工**，别让两处都成了显示器。
-        let log: crate::engine::scheduler::LogFn = Arc::new(|_message: &str| {});
+        // 边界没变：任务级结果仍以 `state.jsonl` 为唯一真相、看板是它的显示器；
+        // 界面也不再灌第二份过程日志（原 `get_log` 通道就是这么变成幽灵的）。
+        // 区别只在「有没有一个**离线**读者」：挂机出问题时人不在电脑前，
+        // 终端/界面都留不下任何东西 —— 日志文件是唯一能回答「几点断的」的介质。
+        let log: crate::engine::scheduler::LogFn = Arc::new(|message: &str| {
+            crate::engine::runlog::line(message);
+        });
 
         // 落盘失败 ⇒ **跑的中途**就上报一次（`StateStore` 的 `on_write_error` 只调一次，
         // 不刷屏）。这是 `PersistOutcome` 那套机制的**唯一接线口** ——
@@ -683,6 +708,19 @@ fn start_run(
                         );
                     }
                 }
+                // 批次对账行进日志 —— 与 CLI 同一句话，第二天只看这一行就知道停在哪一类。
+                let counts: Vec<String> = summary
+                    .counts
+                    .iter()
+                    .filter(|(_, count)| **count > 0)
+                    .map(|(key, count)| format!("{key}={count}"))
+                    .collect();
+                crate::engine::runlog::line(&format!(
+                    "批次结束：共 {} 条（{}），未完成 {} 条",
+                    summary.total,
+                    counts.join(" "),
+                    summary.unfinished
+                ));
             }
             Err(error) => {
                 // 批次级失败 —— 原先是 `log(...)`，而那条通道没人读 ⇒ 界面显示「发布成功」。
@@ -719,7 +757,7 @@ fn list_models() -> Vec<Value> {
 /// 读失败收口在 `engine::text`（TD-05-19）：**「读不出来」不许伪装成「文件是空的」**。
 fn prompts_json(path: &Path) -> Result<Value, String> {
     let text = read_text_required(path).map_err(|error| error.to_string())?;
-    let parsed = parse_prompts(&text, &PromptDefaults::default(), &ParseOptions::default());
+    let parsed = parse_prompts(&text, &PromptDefaults::from_env().0, &ParseOptions::default());
     if !parsed.errors.is_empty() {
         return Err(parsed.errors.join("\n"));
     }
@@ -791,11 +829,15 @@ fn move_to_imported(cwd: &Path, file: &Path) -> Result<(), String> {
 /// 把前端队列落成一个提示词文件，返回路径。
 ///
 /// 只写**非默认值**：默认模型/比例/尺寸不落进文件，这样用户拿去 CLI 跑也一样。
+///
+/// ⚠️ 这里的"默认值"必须是 [`PromptDefaults::from_env`] 解析后的**生效值**，不能是内置值：
+/// 用户把兜底模型改成 `nano-bn-pro` 后，一条**显式**写了 `nano-bn-2` 的任务若被当成
+/// "等于默认"而省掉，回头解析时会被补成 `nano-bn-pro` —— 参数静默换了个人。
 fn write_queue_file(cwd: &std::path::Path, tasks: &[Value]) -> Result<PathBuf, String> {
     if tasks.is_empty() {
         return Err("待发是空的".to_string());
     }
-    let defaults = PromptDefaults::default();
+    let (defaults, _) = PromptDefaults::from_env();
     let mut text = String::new();
     for task in tasks {
         let object = task.as_object().ok_or("任务格式不对")?;
@@ -1322,11 +1364,17 @@ fn get_settings(state: tauri::State<'_, GuiState>) -> Result<Value, String> {
             .map(|entry| entry.value.clone())
             .unwrap_or_default()
     };
+    // 兜底参数给**生效值**（缺键/非法值已经在内置默认上兜过），不是 `.env` 里的原文：
+    // 设置页显示的就是"下一次解析真正会用到的值"。
+    let (defaults, _) = PromptDefaults::from_env();
     Ok(json!({
         "accessKey": find("LOVART_ACCESS_KEY"),
         "secretKey": find("LOVART_SECRET_KEY"),
         "concurrency": concurrency(),
         "outputDir": output_dir_name(),
+        "defaultModel": defaults.model,
+        "defaultRatio": defaults.aspect_ratio,
+        "defaultSize": defaults.image_size,
     }))
 }
 
@@ -1357,6 +1405,31 @@ fn save_settings(state: tauri::State<'_, GuiState>, payload: Value) -> Result<()
         if !trimmed.is_empty() {
             updates.push(("LOVART_OUTPUT_DIR", trimmed.to_string()));
         }
+    }
+    // 兜底参数：三个一组。**先校验、后写盘** —— 非法值一旦落进 `.env`，
+    // 解析器只会退回内置默认并告警，用户会以为"设置保存成功但没生效"。
+    if ["defaultModel", "defaultRatio", "defaultSize"]
+        .iter()
+        .any(|key| payload.get(*key).is_some())
+    {
+        let (current, _) = PromptDefaults::from_env();
+        let text_of = |key: &str, fallback: &str| {
+            payload
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(fallback)
+                .to_string()
+        };
+        let validated = PromptDefaults::validated(
+            &text_of("defaultModel", &current.model),
+            &text_of("defaultRatio", &current.aspect_ratio),
+            &text_of("defaultSize", &current.image_size),
+        )?;
+        updates.push((DEFAULT_MODEL_KEY, validated.model));
+        updates.push((DEFAULT_RATIO_KEY, validated.aspect_ratio));
+        updates.push((DEFAULT_SIZE_KEY, validated.image_size));
     }
     update_env_keys(&path, &updates)?;
     // 写回后立刻**重载**（覆盖），免得这一轮还用着旧凭据。

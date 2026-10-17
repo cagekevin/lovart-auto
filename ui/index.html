@@ -267,7 +267,22 @@
         <input class="form-input" id="setConcurrency" type="number" min="1" max="8" />
         <label class="form-label" for="setOutput">输出文件夹</label>
         <input class="form-input" id="setOutput" />
+        <!-- 兜底参数：提示词没写 model / ratio / size 时才用（判定只有一个地方：
+             `PromptDefaults::resolve`）。选项来自后端：模型表 + 比例/尺寸的合法值。 -->
+        <label class="form-label" for="setDefaultModel">兜底模型</label>
+        <select class="form-input" id="setDefaultModel"></select>
+        <label class="form-label" for="setDefaultRatio">兜底比例</label>
+        <!-- 用 input + datalist 而不是 select：解析器接受任意 `w:h`（如 9:16 / 2:3），
+             下拉只列常用的几个会把用户锁死在四种里。非法值由保存时的后端校验拦下。 -->
+        <input class="form-input" id="setDefaultRatio" list="ratioOptions" placeholder="3:4" />
+        <datalist id="ratioOptions"></datalist>
+        <label class="form-label" for="setDefaultSize">兜底尺寸</label>
+        <select class="form-input" id="setDefaultSize"></select>
       </div>
+      <p class="note">
+        提示词里没写 model / ratio / size 时，用上面三个值兜底；命令行 --model / --ratio /
+        --size 仍然优先。
+      </p>
       <p class="note" id="settingsNote" hidden></p>
     </div>
     <div class="dialog-foot">

@@ -1423,6 +1423,15 @@ select:focus { border-color: var(--ink); }
 
 .form-input:focus { border-color: var(--ink); background: var(--bg); }
 
+/* 设置里的下拉：占满整行。全局 `select` 规则带 148–220px 的宽度上下限
+   （那是给工具栏用的，防止长模型名把一行顶开），表单里必须放开。 */
+.form select.form-input {
+  width: 100%;
+  max-width: none;
+  min-width: 0;
+  background-color: var(--bg-sub);
+}
+
 /* 导入弹窗里的文件行 */
 .import-row {
   display: flex;

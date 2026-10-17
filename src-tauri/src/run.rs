@@ -126,6 +126,9 @@ static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 fn log(message: &str) {
     let now = chrono::Local::now();
     println!("[{}] {message}", now.format("%H:%M:%S"));
+    // 同一条文案同时进 `var/run.log`（未绑定时是空操作）。
+    // **终端会消失，文件不会** —— 挂机排查靠的就是后者。
+    crate::engine::runlog::line(message);
 }
 
 fn now_iso() -> String {
@@ -697,6 +700,9 @@ fn image_models_text() -> String {
 ///
 /// 只列 IMAGE —— 本工具只出图，把 VIDEO / CHAT 也列出来只会误导。
 fn print_models(as_json: bool) {
+    // 这里显示的是**内置**默认（本命令刻意不读 `.env` / 不碰磁盘）：
+    // 生效值 = 命令行 > `.env` 的 LOVART_DEFAULT_MODEL > 这个内置值，
+    // 想确认生效值用 `--check`（它会打印真正会用的模型/比例/尺寸）。
     let default_model = PromptDefaults::default().model;
 
     if as_json {
@@ -711,7 +717,7 @@ fn print_models(as_json: bool) {
     }
 
     println!("================ 可用的出图模型 ================");
-    println!("默认     : {default_model}");
+    println!("内置默认 : {default_model}（实际默认见 .env 的 LOVART_DEFAULT_MODEL，`--check` 可确认）");
     println!();
     println!("{}", image_models_text());
     println!();
@@ -804,6 +810,16 @@ pub fn main_with_args(argv: &[String]) -> Result<(), String> {
         );
     }
 
+    // 配置载入：必须**早于**构造 `defaults` —— 兜底参数（LOVART_DEFAULT_*）住在 `.env` 里。
+    // 只读命令（`--help` / `--list-models` / `--status-table` / `--status`）在上面已返回，
+    // 因此它们**仍然不需要** `.env`；`--check` / `--dry-run` 会读，因为它们要报告
+    // "真正会用的默认值" —— 报告内置值而实际跑 `.env` 值，等于让自检结果说谎。
+    load_dot_env(&cwd.join(".env"))?;
+    let (env_defaults, default_warnings) = PromptDefaults::from_env();
+    for warning in &default_warnings {
+        eprintln!("⚠️ {warning}");
+    }
+
     let concurrency = arg_number(&args, "concurrency", 7.0).floor();
     if !(1.0..=HARD_MAX_CONCURRENCY as f64).contains(&concurrency) {
         return Err(format!(
@@ -821,10 +837,11 @@ pub fn main_with_args(argv: &[String]) -> Result<(), String> {
     let recheck_timeout = Duration::from_secs_f64(
         arg_number(&args, "recheck-timeout", 30.0).max(1.0) * 60.0,
     );
+    // 取值顺序：命令行 > `.env`（LOVART_DEFAULT_*）> 内置默认。与 GUI 设置页同一套兜底。
     let defaults = PromptDefaults {
-        model: arg_string(&args, "model", &PromptDefaults::default().model),
-        aspect_ratio: arg_string(&args, "ratio", &PromptDefaults::default().aspect_ratio),
-        image_size: arg_string(&args, "size", &PromptDefaults::default().image_size),
+        model: arg_string(&args, "model", &env_defaults.model),
+        aspect_ratio: arg_string(&args, "ratio", &env_defaults.aspect_ratio),
+        image_size: arg_string(&args, "size", &env_defaults.image_size),
     };
 
     // 1. 提示词（dry-run 不需要凭据，所以放在最前面）
@@ -913,8 +930,28 @@ pub fn main_with_args(argv: &[String]) -> Result<(), String> {
         return Ok(());
     }
 
-    // 2. 凭据
-    load_dot_env(&cwd.join(".env"))?;
+    // 2. 日志：**从这里开始落盘**。
+    //    只读命令（`--check` / `--dry-run` / `--status` / `--list-models`）在上面已返回，
+    //    不会往挂机日志里插噪音。
+    //    路径固定在 `var/run.log`：与 `--state` 无关 —— 换状态文件不该让日志换个地方找不到。
+    let log_file = cwd.join("var/run.log");
+    crate::engine::runlog::init(&log_file);
+    // 与 GUI **同一句**批次标记：`grep "批次开始" / "批次结束"` 两边通用。
+    log(&format!(
+        "===== 批次开始：{}（{} 条，并发 {}）=====",
+        prompts_file.display(),
+        tasks.len(),
+        concurrency
+    ));
+    log(&format!(
+        "单任务超时 {} 分，复查超时 {} 分，重试上限 {} 次；日志 {}",
+        task_timeout.as_secs() / 60,
+        recheck_timeout.as_secs() / 60,
+        max_attempts,
+        log_file.display()
+    ));
+
+    // 3. 凭据（`.env` 已在本函数前半段载入：兜底参数要在解析提示词之前就位）
     // 自动确认：命令行 > `.env` > 默认关。**不读进程环境变量**（见 docs/plan/01 §6）。
     let auto_confirm_override = auto_confirm_flag(&args)?;
     let (file_auto_confirm, auto_confirm_warning) = read_auto_confirm(&cwd.join(".env"));
@@ -928,7 +965,7 @@ pub fn main_with_args(argv: &[String]) -> Result<(), String> {
     log(&format!("接口地址 {}", connection.base_url));
     let deps = to_client_deps(&connection)?;
 
-    // 3. 排队模式：服务端是持久设置，开工前先设一次
+    // 4. 排队模式：服务端是持久设置，开工前先设一次
     set_mode(&deps, true).map_err(|error| error.to_string())?;
     let mode = query_mode(&deps).ok();
     log(&format!(
@@ -936,11 +973,11 @@ pub fn main_with_args(argv: &[String]) -> Result<(), String> {
         mode.map(|value| value.to_string()).unwrap_or_else(|| "null".to_string())
     ));
 
-    // 3.5 参考图（图生图）：本地路径读盘 → 转 base64 → 上传 Lovart CDN。
+    // 4.5 参考图（图生图）：本地路径读盘 → 转 base64 → 上传 Lovart CDN。
     //     来源两处：命令行 `--ref`（整批默认）与行内 `refs`（**覆盖**命令行，不合并）。
     resolve_refs(&args, &deps, &mut tasks, &cwd)?;
 
-    // 4. 中断处理
+    // 5. 中断处理
     install_sigint_handler();
     let deps_for_watch = deps.clone();
     std::thread::spawn(move || loop {
@@ -951,7 +988,7 @@ pub fn main_with_args(argv: &[String]) -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(100));
     });
 
-    // 5. 开跑
+    // 6. 开跑
     // 写盘失败**立刻**告警：state 是断点续跑的唯一真相，等到跑完才发现就白跑了几小时。
     let log_for_state = Arc::new(|message: &str| log(message));
     let state = StateStore::open_with(
@@ -987,10 +1024,34 @@ pub fn main_with_args(argv: &[String]) -> Result<(), String> {
     // 花了钱就要报账：**错误路径也要打印**，所以先读计数再 `?`。
     if let Some(line) = auto_confirm_line(auto_confirm.count()) {
         println!("{line}");
+        log(&line);
     }
-    let summary = result.map_err(|error| error.to_string())?;
+    let summary = match result {
+        Ok(summary) => summary,
+        Err(error) => {
+            // 批次级失败**必须落盘**：挂机时没人看终端，这句是第二天唯一的线索。
+            log(&format!("❌ 批次失败：{}", error.message()));
+            return Err(error.to_string());
+        }
+    };
 
     print_summary(&summary, started, &output_dir, &state_file);
+    // 收尾对账行进日志：挂机第二天先看这一行，就知道「昨晚到底停在哪一类」。
+    let counts: Vec<String> = summary
+        .counts
+        .iter()
+        .filter(|(_, count)| **count > 0)
+        .map(|(key, count)| format!("{key}={count}"))
+        .collect();
+    log(&format!(
+        "批次结束：共 {} 条（{}），未完成 {} 条",
+        summary.total,
+        counts.join(" "),
+        summary.unfinished
+    ));
+    if summary.persist_failed {
+        log("❌ 收尾时状态文件写不进去：本次进度可能续不上");
+    }
 
     if let Some(report_file) = report_file {
         let tasks_by_id: BTreeMap<String, PromptTask> = tasks

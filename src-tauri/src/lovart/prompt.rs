@@ -56,6 +56,118 @@ impl Default for PromptDefaults {
     }
 }
 
+/// `.env` 键 —— **提示词兜底参数的唯一来源**（GUI 设置页 · CLI · 解析器共用一份）。
+///
+/// ⚠️ 「内置默认值」只在 [`PromptDefaults::default`] 里写一次；这三把键是**覆盖**它，
+/// 不是第二份真值。缺键 ⇒ 用内置值；非法 ⇒ 用内置值 + 一条告警（不猜、不静默）。
+pub const DEFAULT_MODEL_KEY: &str = "LOVART_DEFAULT_MODEL";
+pub const DEFAULT_RATIO_KEY: &str = "LOVART_DEFAULT_RATIO";
+pub const DEFAULT_SIZE_KEY: &str = "LOVART_DEFAULT_SIZE";
+
+impl PromptDefaults {
+    /// **纯函数**：把「可能缺失 / 可能非法」的三个值解析成生效值 + 告警。
+    ///
+    /// 这里就是"兜底"的唯一判定点：
+    /// - `None` / 空串（= 提示词或 `.env` 没写）⇒ 内置默认，**不告警**（缺省是正常用法）；
+    /// - 写了但不合法 ⇒ 内置默认 + 一条告警（**绝不**把非法值原样用上去）。
+    ///
+    /// 每个字段**独立**兜底：只漏了 `size` 就只补 `size`，不会把它们绑成一坨。
+    pub fn resolve(
+        model: Option<&str>,
+        ratio: Option<&str>,
+        size: Option<&str>,
+    ) -> (Self, Vec<String>) {
+        let base = Self::default();
+        let mut warnings: Vec<String> = Vec::new();
+
+        let model = match model.map(str::trim).filter(|value| !value.is_empty()) {
+            None => base.model.clone(),
+            Some(value) if is_known_image_model(value) => value.to_string(),
+            Some(value) => {
+                warnings.push(format!(
+                    "{DEFAULT_MODEL_KEY} 的值「{value}」不在别名表里，已按 {} 处理",
+                    base.model
+                ));
+                base.model.clone()
+            }
+        };
+
+        let aspect_ratio = match ratio.map(str::trim).filter(|value| !value.is_empty()) {
+            None => base.aspect_ratio.clone(),
+            Some(value) if is_valid_ratio(value) => value.to_string(),
+            Some(value) => {
+                warnings.push(format!(
+                    "{DEFAULT_RATIO_KEY} 的值「{value}」无法识别（应为 w:h，如 3:4），已按 {} 处理",
+                    base.aspect_ratio
+                ));
+                base.aspect_ratio.clone()
+            }
+        };
+
+        let image_size = match size.map(str::trim).filter(|value| !value.is_empty()) {
+            None => base.image_size.clone(),
+            Some(value) => match normalize_size(value) {
+                Some(normalized) => normalized.to_string(),
+                None => {
+                    warnings.push(format!(
+                        "{DEFAULT_SIZE_KEY} 的值「{value}」无法识别（应为 1K / 2K / 4K），已按 {} 处理",
+                        base.image_size
+                    ));
+                    base.image_size.clone()
+                }
+            },
+        };
+
+        (
+            Self {
+                model,
+                aspect_ratio,
+                image_size,
+            },
+            warnings,
+        )
+    }
+
+    /// 读进程环境（`.env` 由 `load_dot_env` 载入）→ 生效的兜底参数 + 告警。
+    ///
+    /// ⚠️ **不要**在 `prompt.rs` 里读文件：解析器只认环境，文件由调用方决定何时载入
+    /// （GUI 启动载入、CLI 在只读命令之后载入、设置保存后 `reload_dot_env`）。
+    pub fn from_env() -> (Self, Vec<String>) {
+        let model = std::env::var(DEFAULT_MODEL_KEY).ok();
+        let ratio = std::env::var(DEFAULT_RATIO_KEY).ok();
+        let size = std::env::var(DEFAULT_SIZE_KEY).ok();
+        Self::resolve(model.as_deref(), ratio.as_deref(), size.as_deref())
+    }
+
+    /// 校验用户在设置页填的三个值（**保存前**就拒绝非法值，不写进 `.env`）。
+    ///
+    /// 与 [`Self::resolve`] 的分工：`resolve` 是"读进来时的兜底"，本函数是"写出去时的守门"。
+    /// 两者共用同一批校验函数（`is_known_image_model` / `is_valid_ratio` / `normalize_size`），
+    /// 所以不可能出现"设置页收下、解析器不认"的组合。
+    pub fn validated(model: &str, ratio: &str, size: &str) -> Result<Self, String> {
+        let model = model.trim();
+        if model.is_empty() {
+            return Err("默认模型不能为空".to_string());
+        }
+        if !is_known_image_model(model) {
+            return Err(format!(
+                "默认模型「{model}」不在别名表里（可用 `--list-models` 查看可用别名）"
+            ));
+        }
+        let ratio = ratio.trim();
+        if !is_valid_ratio(ratio) {
+            return Err(format!("默认比例「{ratio}」格式不对，应为 w:h（如 3:4）"));
+        }
+        let image_size = normalize_size(size.trim())
+            .ok_or_else(|| format!("默认尺寸「{size}」必须是 1K / 2K / 4K 之一"))?;
+        Ok(Self {
+            model: model.to_string(),
+            aspect_ratio: ratio.to_string(),
+            image_size: image_size.to_string(),
+        })
+    }
+}
+
 /// 一条待出图任务（对应 TS `PromptTask`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptTask {

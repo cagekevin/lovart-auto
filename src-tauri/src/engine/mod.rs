@@ -2,6 +2,7 @@
 
 pub mod download;
 pub mod refs;
+pub mod runlog;
 pub mod scheduler;
 pub mod state;
 pub mod text;
