@@ -53,10 +53,112 @@ struct RunningBatch {
     ids: BTreeSet<String>,
 }
 
+/// 「正在取消全部任务」期间，**任何**写任务表的命令都返回这一句。
+///
+/// 唯一一份文案：连点、发布、重跑、接着查、确认、单删都走它 ——
+/// 四处各写一句就会出现"有的说停止有的说清空"的口径分叉。
+const CLEARING_BLOCK: &str = "正在取消全部任务，请稍候";
+
+/// 看板槽：**谁在跑** 与 **是否正在清空** 的同一份状态。
+///
+/// ── 为什么必须是一个 Mutex ────────────────────────────────────────────
+/// 删除（重写 `state.jsonl`）与跑批（追加写同一个文件）**结构上**要互斥。
+/// 拆成两个锁或两个原子量，就必然有"判定完还没置位"的空窗 ——
+/// 那正是「点了取消全部，任务又被写回来」的成因。
+/// 一把锁里一次判定，插队的路根本不存在。
+#[derive(Default)]
+struct Board {
+    batch: Option<RunningBatch>,
+    /// 「取消全部」意图。
+    ///
+    /// ⚠️ **只由 `clear_done` 复位** —— 必须横跨整个删除过程：
+    /// 批次已退出、还没删完的那几毫秒里若放过 `start_run`，
+    /// 新批次会把记录写回刚清空的表（用户看到"取消完又冒出来"）。
+    wipe: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    Idle,
+    Running,
+    /// 正在取消全部任务：要么在等批次退出，要么正在删。
+    Clearing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClearIntent {
+    /// 没有批次：`wipe` 已置位，调用方在锁外立刻删。
+    Now,
+    /// 有批次：已置取消标志 + `wipe`，批次收尾时删。
+    Waiting,
+    /// 已经在清空：拒绝，不产生第二个删除者。
+    Already,
+}
+
+impl Board {
+    /// `wipe` **优先**于 `batch`：清空期间即使批次还在，也要报 `Clearing`
+    /// （否则错误文案会变成"跑批中，先停止"——而它已经在停了）。
+    fn gate(&self) -> Gate {
+        if self.wipe {
+            Gate::Clearing
+        } else if self.batch.is_some() {
+            Gate::Running
+        } else {
+            Gate::Idle
+        }
+    }
+
+    fn batch(&self) -> Option<&RunningBatch> {
+        self.batch.as_ref()
+    }
+
+    fn set_batch(&mut self, batch: RunningBatch) {
+        self.batch = Some(batch);
+    }
+
+    /// 请求「取消全部」。锁内**只改内存**，不碰磁盘。
+    fn request_clear(&mut self) -> ClearIntent {
+        if self.wipe {
+            return ClearIntent::Already;
+        }
+        self.wipe = true;
+        match self.batch.as_ref() {
+            Some(batch) => {
+                // 与「停止」是**同一个标志**：不新增第二套取消机制。
+                batch.cancelled.store(true, Ordering::SeqCst);
+                ClearIntent::Waiting
+            }
+            None => ClearIntent::Now,
+        }
+    }
+
+    /// 批次收尾：清掉 `batch`，返回「要不要清空」。
+    ///
+    /// ⚠️ `wipe` **保持置位**（不 take）—— 调用方还要在锁外删；删完再 [`Self::clear_done`]。
+    fn take_finished(&mut self) -> bool {
+        self.batch = None;
+        self.wipe
+    }
+
+    /// 删除结束（成功或失败都必须调）：复位意图。忘了调 ⇒ 永久禁写。
+    fn clear_done(&mut self) {
+        self.wipe = false;
+    }
+
+    fn clear_block(&self) -> Option<&'static str> {
+        if self.wipe {
+            Some(CLEARING_BLOCK)
+        } else {
+            None
+        }
+    }
+}
+
 /// GUI 全局状态。
 pub struct GuiState {
     cwd: PathBuf,
-    running: Mutex<Option<RunningBatch>>,
+    /// 看板槽（批次 + 清空意图）。**唯一**一份；不要再加第二个"是否在跑"的原子量。
+    board: Mutex<Board>,
     /// 全局自动确认开关（运行态真源；与每个批次的 `AutoConfirm` 共享）。
     auto_confirm: Arc<AtomicBool>,
     /// `.env` 读-改-写互斥：保存设置与切开关会同时改同一个文件。
@@ -109,7 +211,7 @@ impl GuiState {
         let (auto_confirm, auto_confirm_warning) = read_auto_confirm(&cwd.join(".env"));
         let state = Self {
             cwd,
-            running: Mutex::new(None),
+            board: Mutex::new(Board::default()),
             alerts: Mutex::new(Vec::new()),
             auto_confirm: Arc::new(AtomicBool::new(auto_confirm)),
             env_lock: Mutex::new(()),
@@ -131,6 +233,55 @@ impl GuiState {
 
     fn state_file(&self) -> PathBuf {
         self.cwd.join("var/state.jsonl")
+    }
+
+    /// 看板槽的唯一取用口（锁中毒按全仓惯例就地恢复）。
+    fn board(&self) -> std::sync::MutexGuard<'_, Board> {
+        self.board.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// 「清空中」统一写闸：**4 个**写任务表的命令在动手前各调一次。
+    ///
+    /// ⚠️ 只判"正在清空"，**不重写**原有的"跑批中"文案 ——
+    /// 那些是已经对外的原文案，没必要为了统一而改口径。
+    /// ⚠️ 调用点不得已经持有 `board` 锁（本函数内部加锁，std 的 Mutex 不可重入）。
+    fn ensure_not_clearing(&self) -> Result<(), String> {
+        match self.board().clear_block() {
+            Some(message) => Err(message.to_string()),
+            None => Ok(()),
+        }
+    }
+
+    /// 批次收尾的**唯一出口**（3 个收尾点全部走它）。
+    ///
+    /// 顺序就是契约：
+    /// ① 锁内摘掉 `batch`（此后 `get_state.running` 为 false，也没人再写状态文件）；
+    /// ② 若 `wipe` 为真，在**锁外、无写者**的情况下删未结束记录；
+    /// ③ 无论成功失败都 `clear_done` 复位（忘了它就永久禁写）；
+    /// ④ 把结果告诉用户。
+    ///
+    /// 任何一步换位置都会破掉"删除与跑批互斥"（见 `Board` 的注释）。
+    fn finish_batch(&self) {
+        let need_clear = {
+            let mut board = self.board();
+            board.take_finished()
+        };
+        if !need_clear {
+            return;
+        }
+
+        let outcome = remove_open_tasks_core(&self.state_file());
+        self.board().clear_done();
+
+        match outcome {
+            Ok(count) if count > 0 => self.push_alert(&format!(
+                "已取消并删除 {count} 条未结束任务记录（已结束的任务与图片未删除）"
+            )),
+            Ok(_) => self.push_alert("没有未结束的任务可删"),
+            Err(message) => {
+                self.push_alert(&format!("清空任务失败：{message}；记录仍在，可以重试"))
+            }
+        }
     }
 
     fn output_dir(&self) -> PathBuf {
@@ -178,22 +329,24 @@ impl GuiState {
 fn get_state(state: tauri::State<'_, GuiState>) -> Result<Value, String> {
     let mut payload = build_status_json(&state.state_file(), &state.output_dir())?;
     // 计数只在本批存在时有意义；没有批次就是 0（不伪造"上次跑到多少"）。
-    let (batch, auto_confirmed) = {
-        let running = state
-            .running
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        match running.as_ref() {
+    let (batch, auto_confirmed, clearing) = {
+        let board = state.board();
+        // `clearing` 与 `running` 是**两件事**：清空期间批次往往还在收尾，
+        // 所以 `running` 仍为 true（不撒谎），`clearing` 才是"正在取消全部"。
+        let clearing = board.gate() == Gate::Clearing;
+        match board.batch() {
             Some(batch) => (
                 Some((batch.label.clone(), batch.ids.clone())),
                 batch.auto_confirm.count(),
+                clearing,
             ),
-            None => (None, 0),
+            None => (None, 0, clearing),
         }
     };
     let auto_confirm = state.auto_confirm.load(Ordering::Relaxed);
     if let Some(object) = payload.as_object_mut() {
         object.insert("running".to_string(), Value::Bool(batch.is_some()));
+        object.insert("clearing".to_string(), Value::Bool(clearing));
         object.insert(
             "runningBatch".to_string(),
             batch
@@ -310,9 +463,12 @@ fn start_run(
     state: tauri::State<'_, GuiState>,
     source: RunSource,
 ) -> Result<(), String> {
+    // 第一道闸：清空中 / 已有批次。放在读文件、解析、读 `.env` **之前** ——
+    // 这些是有成本的失败，没必要等做完才告诉用户"开不了"。
+    state.ensure_not_clearing()?;
     {
-        let running = state.running.lock().unwrap_or_else(|error| error.into_inner());
-        if running.is_some() {
+        let board = state.board();
+        if board.batch().is_some() {
             return Err("已有批次在跑，先停止它".to_string());
         }
     }
@@ -369,8 +525,13 @@ fn start_run(
     };
 
     {
-        let mut running = state.running.lock().unwrap_or_else(|error| error.into_inner());
-        *running = Some(RunningBatch {
+        let mut board = state.board();
+        // 复核一次：上面那道闸之后，可能有人点了「取消所有任务」（空闲路径会立刻删）。
+        // **置位与判定在同一把锁里** —— 否则批次会挂在清空之后，把记录又写回空表。
+        if board.clear_block().is_some() {
+            return Err(CLEARING_BLOCK.to_string());
+        }
+        board.set_batch(RunningBatch {
             cancelled: Arc::clone(&cancelled),
             auto_confirm: Arc::clone(&auto_confirm),
             label: label.clone(),
@@ -397,7 +558,9 @@ fn start_run(
                 // 批次**根本没跑起来** ⇒ 批次级失败 ⇒ 必须让用户看到（原先只写进没人读的日志）。
                 if let Some(state) = app_for_thread.try_state::<GuiState>() {
                     state.push_alert(&format!("参考图处理失败，这一批没有开跑：{message}"));
-                    *state.running.lock().unwrap_or_else(|error| error.into_inner()) = None;
+                    // 收尾点 #1：这里也必须走 finish_batch —— 直接清 `running` 会让
+                    // 「取消全部」的 wipe 永远没人执行 ⇒ 之后所有写命令永久被拒。
+                    state.finish_batch();
                 }
                 return;
             }
@@ -433,7 +596,8 @@ fn start_run(
             Err(error) => {
                 if let Some(state) = app_for_thread.try_state::<GuiState>() {
                     state.push_alert(&format!("打不开状态文件，这一批没有开跑：{error}"));
-                    *state.running.lock().unwrap_or_else(|error| error.into_inner()) = None;
+                    // 收尾点 #2：同 #1，必须走统一出口。
+                    state.finish_batch();
                 }
                 return;
             }
@@ -529,7 +693,8 @@ fn start_run(
         }
 
         if let Some(state) = app_for_thread.try_state::<GuiState>() {
-            *state.running.lock().unwrap_or_else(|error| error.into_inner()) = None;
+            // 收尾点 #3（正常结束 / 取消 / 批次失败）：唯一出口。
+            state.finish_batch();
         }
     });
 
@@ -715,12 +880,8 @@ fn publish_queue(
 ///
 /// ⚠️ 必须做在起批**之前**：派工只处理**非终态**记录，终态的没重置就不会被处理。
 fn reset_for_retry(state: &tauri::State<'_, GuiState>, id: &str) -> Result<(), String> {
-    if state
-        .running
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .is_some()
-    {
+    state.ensure_not_clearing()?;
+    if state.board().batch().is_some() {
         return Err("正在跑批，先停止再重跑（重跑要改状态文件，和跑批写的是同一个文件）".to_string());
     }
     let mut store = StateStore::open(&state.state_file()).map_err(|error| error.to_string())?;
@@ -872,12 +1033,8 @@ fn confirm_task(
     id: String,
 ) -> Result<String, String> {
     let (_record, thread_id) = confirmable(&state, &id)?;
-    if state
-        .running
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .is_some()
-    {
+    state.ensure_not_clearing()?;
+    if state.board().batch().is_some() {
         return Err("正在跑批，先停止再确认（确认要改状态文件，和跑批写的是同一个文件）".to_string());
     }
 
@@ -1050,17 +1207,63 @@ fn remove_tasks(state: tauri::State<'_, GuiState>, ids: Vec<String>) -> Result<u
     if ids.is_empty() {
         return Ok(0);
     }
-    if state
-        .running
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .is_some()
-    {
+    // 清空期间连单删也拒绝：两者都是"整体重写 state.jsonl"，并发会互相覆盖。
+    state.ensure_not_clearing()?;
+    if state.board().batch().is_some() {
         return Err("正在跑批，先停止再删除（删除要重写状态文件，和跑批写的是同一个文件）".to_string());
     }
 
     let mut store = StateStore::open(&state.state_file()).map_err(|error| error.to_string())?;
     store.remove(&ids).map_err(|error| error.to_string())
+}
+
+/// 删除**看板未结束**的记录（`active` / `queued` / `waiting`），返回删除条数。
+///
+/// ── 为什么它不是一个 Tauri 命令 ──────────────────────────────────────
+/// 它要跑在"批次已经退出、又没人能开新批"的那一段里（见 `GuiState::finish_batch`），
+/// 由 `cancel_all_tasks` 与批次线程**共用同一个实现** —— 不另开第二个删除入口。
+///
+/// 判据用 [`crate::run::is_board_open`]（看板分组本体），**不是** `is_unfinished`：
+/// 后者是 `!terminal`，会把终态的 `needs_confirm`（待处理）漏掉。
+///
+/// 一次 `remove` = 一次 `compact`（临时文件 + rename）⇒ 要么全删要么全不删。
+pub fn remove_open_tasks_core(state_file: &Path) -> Result<usize, String> {
+    let mut store = StateStore::open(state_file).map_err(|error| error.to_string())?;
+    let ids: Vec<String> = store
+        .all()
+        .into_iter()
+        .filter(|record| crate::run::is_board_open(record.status))
+        .map(|record| record.id.clone())
+        .collect();
+    if ids.is_empty() {
+        // 一条都没有时**不写盘**：没有要删的就别重写整个文件。
+        return Ok(0);
+    }
+    store.remove(&ids).map_err(|error| error.to_string())
+}
+
+/// 取消所有任务：停掉当前批次（若有）→ 等它退出 → 删除全部未结束记录。
+///
+/// 返回值：
+/// - 空闲：`{"cleared": N, "stopping": false}`（N 就是实际删除条数）
+/// - 跑批中：`{"cleared": 0, "stopping": true}`，最终条数在批次收尾时由告警给出
+///
+/// 为什么跑批中**立刻返回**而不是同步等 60 秒：取消是协作式的，
+/// 等下去会把 UI 线程挂住（用户看到的是"点了没反应"）。
+#[tauri::command]
+fn cancel_all_tasks(state: tauri::State<'_, GuiState>) -> Result<Value, String> {
+    let intent = state.board().request_clear();
+    match intent {
+        ClearIntent::Already => Err(CLEARING_BLOCK.to_string()),
+        ClearIntent::Waiting => Ok(json!({ "cleared": 0, "stopping": true })),
+        ClearIntent::Now => {
+            // 锁已释放，且 `wipe` 置位 ⇒ 期间没有任何写者能进来（`start_run` 被拒）。
+            let outcome = remove_open_tasks_core(&state.state_file());
+            // 成功失败都要复位：失败不复位 = 永久禁写。
+            state.board().clear_done();
+            outcome.map(|cleared| json!({ "cleared": cleared, "stopping": false }))
+        }
+    }
 }
 
 /// 在系统文件管理器里定位到某个文件（图片菜单的「打开所在位置」）。
@@ -1184,8 +1387,9 @@ fn set_auto_confirm(state: tauri::State<'_, GuiState>, enabled: bool) -> Result<
 /// 停止当前批次（协作式取消：调度器会在下一个检查点退出）。
 #[tauri::command]
 fn stop_run(state: tauri::State<'_, GuiState>) -> Result<(), String> {
-    let running = state.running.lock().unwrap_or_else(|error| error.into_inner());
-    match running.as_ref() {
+    // 清空期间也允许按「停止」：同一个标志，幂等，不产生第二条取消路径。
+    let board = state.board();
+    match board.batch() {
         Some(batch) => {
             batch.cancelled.store(true, Ordering::SeqCst);
             // 取消是**协作式**的：最坏要等当前那次 HTTP 请求超时（60 秒）才真的退出。
@@ -1313,6 +1517,7 @@ pub fn run() {
             resume_one,
             resume_unfinished,
             remove_tasks,
+            cancel_all_tasks,
             reveal_path,
             open_output_dir,
             get_settings,
@@ -1322,4 +1527,94 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("启动窗口失败");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn batch(cancelled: Arc<AtomicBool>) -> RunningBatch {
+        RunningBatch {
+            cancelled,
+            auto_confirm: AutoConfirm::disabled(),
+            label: "测试批次".to_string(),
+            ids: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn b1_空闲请求清空_立刻可删且闸已落下() {
+        let mut board = Board::default();
+        assert_eq!(board.gate(), Gate::Idle);
+        assert_eq!(board.request_clear(), ClearIntent::Now);
+        assert_eq!(board.gate(), Gate::Clearing);
+        assert!(board.clear_block().is_some());
+    }
+
+    #[test]
+    fn b2_有批次请求清空_置同一个取消标志并进入清空() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut board = Board::default();
+        board.set_batch(batch(Arc::clone(&flag)));
+        assert_eq!(board.gate(), Gate::Running);
+        assert_eq!(board.request_clear(), ClearIntent::Waiting);
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "「取消所有任务」必须复用「停止」的那个标志"
+        );
+        assert_eq!(board.gate(), Gate::Clearing, "wipe 必须优先于 batch");
+    }
+
+    #[test]
+    fn b3_连点只产生一个删除者() {
+        let mut board = Board::default();
+        assert_eq!(board.request_clear(), ClearIntent::Now);
+        assert_eq!(board.request_clear(), ClearIntent::Already);
+    }
+
+    #[test]
+    fn b4_收尾摘批次但清空意图必须留到删除结束() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut board = Board::default();
+        board.set_batch(batch(flag));
+        board.request_clear();
+        assert!(board.take_finished(), "批次结束后应当执行删除");
+        assert!(board.batch().is_none());
+        assert_eq!(
+            board.gate(),
+            Gate::Clearing,
+            "删除期间必须仍然禁写，否则新批会把记录写回刚清空的表"
+        );
+    }
+
+    #[test]
+    fn b5_删除结束必须恢复可写() {
+        let mut board = Board::default();
+        board.request_clear();
+        board.clear_done();
+        assert_eq!(board.gate(), Gate::Idle);
+        assert!(board.clear_block().is_none());
+    }
+
+    #[test]
+    fn b6_正常收尾不误删() {
+        let mut board = Board::default();
+        board.set_batch(batch(Arc::new(AtomicBool::new(false))));
+        assert!(!board.take_finished(), "没人点取消就不该删任何记录");
+        assert_eq!(board.gate(), Gate::Idle);
+    }
+
+    #[test]
+    fn b7_清空闸只挡清空_不抢跑批的文案() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut board = Board::default();
+        assert!(board.clear_block().is_none());
+        board.set_batch(batch(flag));
+        assert!(
+            board.clear_block().is_none(),
+            "跑批中由各命令自己的原文案拒绝，这里不许抢口径"
+        );
+        board.request_clear();
+        assert_eq!(board.clear_block(), Some(CLEARING_BLOCK));
+    }
 }

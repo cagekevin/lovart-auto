@@ -331,6 +331,18 @@ fn task_group(status: TaskStatus) -> &'static str {
     }
 }
 
+/// 看板上「未结束」= `active` + `queued` + `waiting`（即**不在「已结束」组**）。
+///
+/// 这是「取消所有任务」的**作用域判据**，也是它唯一的一份实现（`gui` 直接调）。
+///
+/// ⚠️ **不要**用 `engine::state::is_unfinished` 顶替：后者是 `!terminal`，
+/// 而 `needs_confirm`（待处理）是**终态** —— 于是"待处理"会被漏删。
+/// 也**不要**复用 `resume_unfinished` 的过滤（它按 `is_unfinished` 选，问题不同）。
+/// 判据就是分组本身（[`task_group`]），不另抄一份状态清单。
+pub(crate) fn is_board_open(status: TaskStatus) -> bool {
+    task_group(status) != "finished"
+}
+
 /// 异常状态 → 界面要用的两件套：`(色调, 一句人话)`。**读表**（`abnormal` 列）。
 ///
 /// ⚠️ 文案里**不许出现实现黑话**（槽位 / 目录 / 500…），也不许口语化。

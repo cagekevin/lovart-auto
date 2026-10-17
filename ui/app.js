@@ -155,6 +155,10 @@ function boardSignature(data) {
     tasks.length,
     body,
     data.runningBatch ? 'r' : '-',
+    // ⚠️ `clearing` **必须进签名**：点「取消所有任务」那一刻，tasks / running 一个都没变，
+    //    变的只是 clearing。签名漏了它 ⇒ 结构"没变" ⇒ 早退 ⇒ 界面上没有任何反馈，
+    //    用户看到的是"点了没反应"（与 stopRun 那段注释同一个教训）。
+    data.clearing ? 'c' : '-',
     doneOpen ? 'D' : '-',
     queuedOpen ? 'Q' : '-',
     // 上游探针的结论也进签名：它到了 ⇒ 要重画（否则标题行永远停在「正在探测…」）。
@@ -345,9 +349,16 @@ async function refreshBoard() {
 /** 最近一次拿到的任务列表（面板头的「清理已结束」要用）。 */
 let lastTasks = [];
 
+/**
+ * 「正在取消全部任务」—— 后端 `get_state.clearing` 的镜像（**只用于显示和禁用**，
+ * 能不能开跑由后端判，前端不自己推）。
+ */
+let boardClearing = false;
+
 function renderBoard(data) {
   const tasks = data.tasks || [];
   lastTasks = tasks;
+  boardClearing = Boolean(data.clearing);
   // 分组判据来自 Rust（见文件头的说明），前端不自己算。
   const running = tasks.filter((task) => task.group === 'active');
   const queued = tasks.filter((task) => task.group === 'queued');
@@ -374,16 +385,20 @@ function renderBoard(data) {
   // 本地没人跟的那几条：把**上游的真实情况**一并说出来（自动探测的结论）。
   // 只说「未跟进」只讲了本地半边 —— 用户真正要知道的是"那几条还有没有戏"。
   const upstreamNote = stranded > 0 ? ` · ${upstreamSummary()}` : '';
+  // 清空期间必须说出来：删除最坏要等 60 秒，界面不写这句就是"点了没反应"。
+  const clearingNote = boardClearing ? ' · 正在取消全部任务' : '';
   $('runningMeta').textContent =
     (live
       ? `${followed} 在跑 · ${queued.length} 排队${stranded > 0 ? ` · ${stranded} 未跟进` : ''}`
-      : `${running.length + queued.length} 条待续跑 · 本地未跟进`) + upstreamNote;
+      : `${running.length + queued.length} 条待续跑 · 本地未跟进`) + upstreamNote + clearingNote;
   $('runningDot').classList.toggle('dot-idle', !live);
 
   // 「接着查」= README 里「下次自动复查」的兑现按钮。
   // 只在**真有没人跟的**未完成记录时出现：正常跑批时它根本不显示，不会诱导乱点。
   show($('btnResume'), stranded > 0);
   $('btnResume').textContent = `接着查 ${stranded}`;
+  // 清空期间会写状态文件的按钮一律禁用（后端也拒，这里是别让人白点）。
+  $('btnResume').disabled = boardClearing;
 
   // 在跑：卡片
   const runningList = $('runningList');
@@ -424,6 +439,10 @@ function renderBoard(data) {
   $('btnDone').setAttribute('aria-expanded', String(doneOpen));
   show($('btnRetry'), retryable.length > 0);
   $('btnRetry').textContent = `重跑异常 ${retryable.length}`;
+  $('btnRetry').disabled = boardClearing;
+  // 「发布」的判据只有一份（`syncPublishButton`）：清空开始/结束都要重算，
+  // 否则清空结束后按钮会一直灰着（那一次没有队列变化来触发 renderQueue）。
+  syncPublishButton();
 
   const doneList = $('doneList');
   show(doneList, doneOpen && finished.length > 0);
@@ -439,9 +458,10 @@ function renderBoard(data) {
   // 「停止」只在**真的能停**的时候出现 —— 没有批次在跑时它是个死按钮，
   // 常驻只会让人以为「点了能停」（上一版就是这样：显示 5 在跑 + 灰按钮）。
   // 藏起来不是「少了功能」：那 5 条要的不是停止，是**续跑**（再发布一次就会续上）。
+  // 清空期间它已经在停了，再给一个「停止」只会让人以为还能改主意。
   const stop = $('btnStop');
-  stop.hidden = !live;
-  stop.disabled = !live;
+  stop.hidden = !live || boardClearing;
+  stop.disabled = !live || boardClearing;
   stop.textContent = '停止';
 }
 
@@ -757,6 +777,17 @@ function moreButton(task, file) {
       ))) return;
       removeTasks([task.id], '删除');
     }, true));
+    // 「取消所有任务」—— **只给处理中（active）的卡片**。
+    //
+    // 作用域是"全部未结束"（处理中 + 排队 + 待处理），入口放这里是因为：
+    // 用户要的是"在正在跑的地方就能停掉全部"，而不是滚回板头找板级 ⋯。
+    // 板级 ⋯（`btnBoardMore`）刻意**不接**：同一个动作只留一个入口。
+    if (task.group === 'active') {
+      actions.push(menuItem('取消所有任务', () => {
+        closeMenu();
+        cancelAllTasks();
+      }, true, boardClearing));
+    }
     if (actions.length) {
       menu.appendChild(el('div', 'menu-sep'));
       for (const item of actions) menu.appendChild(item);
@@ -785,9 +816,11 @@ async function removeTasks(ids, label) {
   await refreshBoard();
 }
 
-function menuItem(label, onClick, danger) {
+function menuItem(label, onClick, danger, disabled) {
   const button = el('button', `menu-item${danger ? ' is-danger' : ''}`, label);
   button.type = 'button';
+  // 禁用的菜单项**仍然显示**：藏起来会让人以为功能没了。
+  button.disabled = Boolean(disabled);
   button.addEventListener('click', onClick);
   return button;
 }
@@ -871,9 +904,19 @@ function refSrc(ref) {
 
 // ── 待发队列 ─────────────────────────────────────────────────────────
 
+/**
+ * 「发布」按钮的**唯一**判据：队列空 / 正在发布 / 正在取消全部。
+ *
+ * 单独抽出来是因为它有两个触发来源：队列变化（`renderQueue`）与清空状态变化
+ * （`renderBoard`）。两处各写一份表达式，迟早会有一处漏掉清空那一项。
+ */
+function syncPublishButton() {
+  $('btnPublish').disabled = queue.length === 0 || busy || boardClearing;
+}
+
 function renderQueue() {
   $('queueCount').textContent = `${queue.length} 条`;
-  $('btnPublish').disabled = queue.length === 0 || busy;
+  syncPublishButton();
 
   const list = $('queueList');
   clear(list);
@@ -1376,6 +1419,43 @@ async function stopRun() {
     show($('boardNotice'), true);
   }
   await refreshBoard();
+}
+
+/** 整个流程（弹窗 + 命令）上锁：连点会开两个弹窗 / 发两次写请求。 */
+let cancelAllBusy = false;
+
+/**
+ * 取消所有任务 = **停掉当前批次 + 删除全部未结束记录**（已结束的、图片、报告都不动）。
+ *
+ * 顺序由后端保证（先停 → 等批次线程退出 → 再删），前端只做两件事：
+ * ① 把不可逆的代价说清；② 把返回值如实转述（不自己推断"应该删完了吧"）。
+ *
+ * ⚠️ 跑批中命令**立刻返回** `stopping`（不等那 60 秒，否则界面像卡死），
+ *    最终删除条数由批次收尾时的告警通道回报。
+ */
+async function cancelAllTasks() {
+  if (cancelAllBusy) return;
+  cancelAllBusy = true;
+  try {
+    const ok = await askConfirm(
+      '取消所有任务？',
+      '会停止当前批次（最坏等当前请求结束，约 60 秒），并删除全部未结束任务的记录（含处理中、排队、待处理）。已结束的任务、图片文件和报告都不会删除；上游若仍在生成，那些图不会再被取回。此操作不能撤销。',
+    );
+    if (!ok) return;
+    const result = await invoke('cancel_all_tasks');
+    if (result.stopping) {
+      notice('已请求取消全部任务：批次退出后自动清空（最坏约 60 秒）');
+    } else if (result.cleared > 0) {
+      notice(`已取消并删除 ${result.cleared} 条未结束任务记录（已结束的任务与图片未删除）`);
+    } else {
+      notice('没有未结束的任务可删');
+    }
+  } catch (error) {
+    notice(`取消所有任务失败：${error}`);
+  } finally {
+    cancelAllBusy = false;
+    await refreshBoard();
+  }
 }
 
 async function openImport() {

@@ -840,6 +840,13 @@ button { cursor: pointer; color: inherit; }
 
 .menu-item.is-danger { color: var(--bad); }
 
+/* 禁用态：**仍然显示** —— 藏起来会被当成"功能没了"，比灰着更糟。 */
+.menu-item:disabled {
+  opacity: 0.45;
+  cursor: default;
+  background: transparent;
+}
+
 .menu-sep { height: 1px; margin: var(--sp-1) 0; background: var(--line); }
 
 /* ══ 看大图 ════════════════════════════════════════════════════════ */
