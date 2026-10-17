@@ -22,6 +22,8 @@
 //!   --task-timeout <分钟>    单任务轮询总超时（默认 90）
 //!   --recheck-timeout <分钟> 复查已超时任务的轮询超时（默认 30）
 //!   --allow-unknown-model    未知模型名只警告，不终止（默认终止）
+//!   --auto-confirm           自动确认高成本操作（会扣积分；每任务每批最多一次）
+//!   --no-auto-confirm        关闭自动确认（覆盖 .env）
 //!   --check                  只校验提示词文件（**给 AI 自检用**）：不联网、不提交
 //!   --dry-run                只解析并打印计划，不提交任何任务
 //!   --list-models            列出可用的出图模型别名（从代码生成，权威来源）
@@ -42,14 +44,14 @@ use serde_json::{json, Value};
 
 use crate::cli::{arg_list, arg_number, arg_string, has_arg, parse_args, ParsedArgs};
 use crate::engine::refs::{load_refs_cache, read_ref_inputs, refs_signature, save_refs_cache};
-use crate::engine::scheduler::{run_scheduler, SchedulerOptions, SchedulerSummary};
+use crate::engine::scheduler::{run_scheduler, AutoConfirm, SchedulerOptions, SchedulerSummary};
 use crate::engine::state::{
     is_not_done, is_unfinished, row as status_row, Action, StateStore, TaskRecord, TaskStatus,
     STATUS_TABLE,
 };
 use crate::lovart::attachments::resolve_attachments;
 use crate::lovart::client::{query_mode, set_mode, ClientDeps};
-use crate::lovart::connection::{load_dot_env, resolve_connection, to_client_deps};
+use crate::lovart::connection::{load_dot_env, read_auto_confirm, resolve_connection, to_client_deps};
 use crate::lovart::models::MODEL_SPECS;
 use crate::lovart::prompt::{parse_prompts, ParseOptions, PromptDefaults, PromptTask};
 
@@ -79,6 +81,8 @@ fn known_args() -> BTreeSet<String> {
         "task-timeout",
         "recheck-timeout",
         "allow-unknown-model",
+        "auto-confirm",
+        "no-auto-confirm",
         "dry-run",
         "check",
         "list-models",
@@ -91,6 +95,29 @@ fn known_args() -> BTreeSet<String> {
     .iter()
     .map(|name| name.to_string())
     .collect()
+}
+
+/// 解析 `--auto-confirm` / `--no-auto-confirm`（互斥）。`None` = 没表态，交给 `.env`。
+///
+/// 纯函数（不读文件、不联网）⇒ 可直接测。两个同时给是**用户意图冲突**，不猜。
+fn auto_confirm_flag(args: &ParsedArgs) -> Result<Option<bool>, String> {
+    let on = has_arg(args, "auto-confirm");
+    let off = has_arg(args, "no-auto-confirm");
+    if on && off {
+        return Err("--auto-confirm 与 --no-auto-confirm 不能同时使用".to_string());
+    }
+    Ok(if on {
+        Some(true)
+    } else if off {
+        Some(false)
+    } else {
+        None
+    })
+}
+
+/// 结束时的对账行（N=0 不打印）。
+fn auto_confirm_line(count: usize) -> Option<String> {
+    (count > 0).then(|| format!("本批自动确认 {count} 条"))
 }
 
 /// 全局停止标志 —— 由 SIGINT 处理器置位，watcher 线程再把它同步进调度器的取消标志。
@@ -876,6 +903,15 @@ pub fn main_with_args(argv: &[String]) -> Result<(), String> {
 
     // 2. 凭据
     load_dot_env(&cwd.join(".env"))?;
+    // 自动确认：命令行 > `.env` > 默认关。**不读进程环境变量**（见 docs/plan/01 §6）。
+    let auto_confirm_override = auto_confirm_flag(&args)?;
+    let (file_auto_confirm, auto_confirm_warning) = read_auto_confirm(&cwd.join(".env"));
+    if let Some(warning) = auto_confirm_warning {
+        eprintln!("⚠️ {warning}");
+    }
+    let auto_confirm = AutoConfirm::new(Arc::new(AtomicBool::new(
+        auto_confirm_override.unwrap_or(file_auto_confirm),
+    )));
     let connection = resolve_connection()?;
     log(&format!("接口地址 {}", connection.base_url));
     let deps = to_client_deps(&connection)?;
@@ -919,7 +955,7 @@ pub fn main_with_args(argv: &[String]) -> Result<(), String> {
     .map_err(|error| error.to_string())?;
 
     let started = std::time::Instant::now();
-    let summary = run_scheduler(SchedulerOptions {
+    let result = run_scheduler(SchedulerOptions {
         deps,
         batch: crate::engine::scheduler::Batch::Declared(tasks.clone()),
         state,
@@ -932,10 +968,15 @@ pub fn main_with_args(argv: &[String]) -> Result<(), String> {
         max_attempts: Some(max_attempts),
         max_busy_retries: Some(max_busy_retries),
         busy_backoff_base: None,
+        auto_confirm: Arc::clone(&auto_confirm),
         log: Arc::new(|message: &str| log(message)),
         ports: None,
-    })
-    .map_err(|error| error.to_string())?;
+    });
+    // 花了钱就要报账：**错误路径也要打印**，所以先读计数再 `?`。
+    if let Some(line) = auto_confirm_line(auto_confirm.count()) {
+        println!("{line}");
+    }
+    let summary = result.map_err(|error| error.to_string())?;
 
     print_summary(&summary, started, &output_dir, &state_file);
 
@@ -1119,5 +1160,43 @@ fn print_help() {
     match std::fs::read_to_string(&readme) {
         Ok(text) => println!("{text}"),
         Err(_) => println!("见仓库根 README.md"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::parse_args;
+
+    fn parsed(argv: &[&str]) -> ParsedArgs {
+        let known: BTreeSet<String> = known_args();
+        let argv: Vec<String> = argv.iter().map(|value| value.to_string()).collect();
+        parse_args(&argv, &known)
+    }
+
+    #[test]
+    fn c1_两个参数同时出现_报错() {
+        let error = auto_confirm_flag(&parsed(&["--auto-confirm", "--no-auto-confirm"]))
+            .expect_err("必须报错，不猜");
+        assert!(error.contains("不能同时"), "{error}");
+    }
+
+    #[test]
+    fn c2_参数取值() {
+        assert_eq!(
+            auto_confirm_flag(&parsed(&["--auto-confirm"])).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            auto_confirm_flag(&parsed(&["--no-auto-confirm"])).unwrap(),
+            Some(false)
+        );
+        assert_eq!(auto_confirm_flag(&parsed(&[])).unwrap(), None);
+    }
+
+    #[test]
+    fn c6_对账行() {
+        assert_eq!(auto_confirm_line(0), None, "0 条不打印，不制造噪音");
+        assert_eq!(auto_confirm_line(3).unwrap(), "本批自动确认 3 条");
     }
 }

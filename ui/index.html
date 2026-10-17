@@ -45,6 +45,13 @@
     <img class="brand-mark" src="logo.png" alt="" />
     <b class="brand-name">lovart</b>
   </div>
+  <!-- 全局自动确认：**常驻状态 + 快捷切换**。花钱策略必须一直看得见，
+       所以放在顶栏而不是埋进设置页（设置页不再放第二个开关）。 -->
+  <button class="btn btn-sm auto-switch" id="btnAutoConfirm" aria-pressed="false"
+    title="遇到需确认的高成本操作时自动确认并扣积分">
+    <span class="auto-switch-dot" aria-hidden="true"></span>
+    <span id="autoConfirmLabel">自动确认关</span>
+  </button>
   <button class="btn btn-sm btn-quiet" id="btnSettings">设置</button>
 </header>
 

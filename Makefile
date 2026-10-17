@@ -1,8 +1,9 @@
-# 两个入口：跑测试（唯一可信的验收）· 打包成 macOS 应用。
+# 三个入口：跑测试（唯一可信的验收）· 打包成 macOS 应用 · 打包成 Windows exe。
 #
 #   make check      编译 + 全部测试
 #   make check-rs   同上（别名）
 #   make app        打包 macOS 应用包 lovart.app（双击即用）
+#   make win        打包 Windows exe lovart-client.exe（双击即用，见 scripts/make-exe.ps1）
 #   make clean-rs   清掉 Rust 构建产物
 #
 # ⚠️ 全绿只证明「和上次一样」，**不证明「规则真的成立」** —— 期望值本身可能是错的。
@@ -12,7 +13,7 @@
 #        --expect-exit 101 --expect-out '<哪条测试该红>'
 #    （⚠️ cargo test 失败时退出码是 101，不是 vitest 的 1。）
 
-.PHONY: check check-rs app clean-rs
+.PHONY: check check-rs app win clean-rs
 
 check: check-rs
 
@@ -23,6 +24,11 @@ check-rs:
 #    只拷旧二进制不会更新界面。
 app:
 	./scripts/make-app.sh
+
+# ⚠️ 同上：改过 `ui/` 也必须走它（前端资源是编译期嵌进 exe 的）。
+#    需在 Windows 上、且 `make` 可用；否则直接跑 scripts/make-exe.ps1。
+win:
+	powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/make-exe.ps1
 
 clean-rs:
 	cd src-tauri && cargo clean

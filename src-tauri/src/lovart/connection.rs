@@ -75,6 +75,30 @@ fn parse_value(raw: &str, line_no: usize, errors: &mut Vec<String>) -> Option<St
     }
 }
 
+/// 去掉行首空白与可选的 `export ` 前缀（`.env` 常被 shell source）。
+///
+/// **这是「一行怎么算声明」的唯一规则** —— `parse_dot_env` 与 [`update_env_keys`] 共用。
+/// 各写一份的话，`export KEY=…` 在解析器里认、在写入器里不认 ⇒ 切换开关会**追加第二行**，
+/// 而读取取第一条 ⇒ 写了等于没写，且每切一次多一行垃圾。
+fn strip_export(raw_line: &str) -> &str {
+    let line = raw_line.trim();
+    match line.strip_prefix("export ") {
+        Some(rest) => rest.trim(),
+        None => line,
+    }
+}
+
+/// 从一行里取变量名；不是声明行（空行 / 注释 / 无 `=` / 名字非法）⇒ `None`。
+fn env_line_key(raw_line: &str) -> Option<&str> {
+    let line = strip_export(raw_line);
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let eq = line.find('=')?;
+    let key = line[..eq].trim();
+    is_valid_key(key).then_some(key)
+}
+
 /// 解析 `.env` 文本 —— **纯函数**（I/O 留在 [`load_dot_env`]，这里才好测）。
 ///
 /// ── 支持 ────────────────────────────────────────────────────────────
@@ -83,13 +107,9 @@ pub fn parse_dot_env(text: &str) -> ParsedDotEnv {
     let mut parsed = ParsedDotEnv::default();
     for (index, raw_line) in text.split('\n').enumerate() {
         let line_no = index + 1;
-        let mut line = raw_line.trim();
+        let line = strip_export(raw_line);
         if line.is_empty() || line.starts_with('#') {
             continue;
-        }
-        // `export KEY=VALUE` 是常见写法（.env 常被 shell source）
-        if let Some(rest) = line.strip_prefix("export ") {
-            line = rest.trim();
         }
 
         let Some(eq) = line.find('=') else {
@@ -115,6 +135,113 @@ pub fn parse_dot_env(text: &str) -> ParsedDotEnv {
         });
     }
     parsed
+}
+
+// ── 自动确认开关（全局）────────────────────────────────────────────────
+
+/// 自动确认开关在 `.env` 里的键名 —— **唯一常量**，GUI / CLI / 测试都引用它。
+pub const AUTO_CONFIRM_KEY: &str = "LOVART_AUTO_CONFIRM";
+
+/// 只认 `true` / `false`（大小写不敏感）。其它值 ⇒ `None`（由调用方按关闭处理并告警）。
+///
+/// 花钱开关不猜：`1` / `yes` / 空 都不算开。
+fn parse_env_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// 读 `.env` 里的自动确认开关 —— **GUI 与 CLI 共用的唯一读入口**。
+///
+/// 返回 `(值, 需要告知用户的问题)`：
+/// - 文件不存在 / 没有这个键 ⇒ `(false, None)`（正常状态，不告警）；
+/// - 值非法 / 读失败 ⇒ `(false, Some(文案))`（降级为关，但必须说出来）。
+///
+/// ⚠️ 不读进程环境变量：一个看不见的 `LOVART_AUTO_CONFIRM=1` 不能推翻用户在界面上点的开关。
+pub fn read_auto_confirm(path: &Path) -> (bool, Option<String>) {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (false, None),
+        // `load_dot_env` 对读失败是静默的（它把"读不出来"当成"没有 .env"），
+        // 所以这条必须由开关这一层报出来，否则就是静默降级。
+        Err(error) => {
+            return (
+                false,
+                Some(format!(
+                    "读不了 {}：{error}，自动确认按关闭处理",
+                    path.display()
+                )),
+            )
+        }
+    };
+    let parsed = parse_dot_env(&text);
+    let Some(entry) = parsed
+        .entries
+        .iter()
+        .find(|entry| entry.key == AUTO_CONFIRM_KEY)
+    else {
+        return (false, None);
+    };
+    match parse_env_bool(&entry.value) {
+        Some(value) => (value, None),
+        None => (
+            false,
+            Some(format!(
+                "{AUTO_CONFIRM_KEY} 的值「{}」无法识别，已按关闭处理",
+                entry.value
+            )),
+        ),
+    }
+}
+
+/// 按行更新 `.env` 里的若干键 —— **唯一写入口**（`set_auto_confirm` 与 `save_settings` 共用）。
+///
+/// 与旧版"解析成 entries 再整体重写"的区别：**注释、空行、其它键、`export` 前缀全部原样保留**。
+/// 同名多行一律改成同一个值（不留歧义）；缺键则追加到末尾。
+pub fn update_env_keys(path: &Path, updates: &[(&str, String)]) -> Result<(), String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("读不了 {}：{error}", path.display())),
+    };
+    let mut lines: Vec<String> = if text.is_empty() {
+        Vec::new()
+    } else {
+        text.split('\n')
+            .map(|line| line.trim_end_matches('\r').to_string())
+            .collect()
+    };
+
+    for (key, value) in updates {
+        let mut found = false;
+        for line in &mut lines {
+            if env_line_key(line).as_deref() != Some(*key) {
+                continue;
+            }
+            let exported = line.trim_start().starts_with("export ");
+            *line = if exported {
+                format!("export {key}={value}")
+            } else {
+                format!("{key}={value}")
+            };
+            found = true;
+        }
+        if !found {
+            // 与上一行隔一个空行（文件非空且末尾不是空行时）。
+            if lines.last().is_some_and(|line| !line.is_empty()) {
+                lines.push(String::new());
+            }
+            lines.push(format!("{key}={value}"));
+        }
+    }
+
+    let mut out = lines.join("\n");
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    std::fs::write(path, out).map_err(|error| format!("写不了 {}：{error}", path.display()))
 }
 
 /// 解析 `.env` 并注入进程环境 —— **唯一的实现**。
@@ -204,4 +331,151 @@ pub fn to_client_deps(connection: &Connection) -> Result<ClientDeps, String> {
         connection.secret_key.clone(),
         std::sync::Arc::new(transport),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    fn temp_env(text: Option<&str>) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lovart-env-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".env");
+        if let Some(text) = text {
+            std::fs::write(&path, text).unwrap();
+        }
+        path
+    }
+
+    fn text_of(path: &std::path::Path) -> String {
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    #[test]
+    fn e1_文件不存在_关闭且不告警() {
+        assert_eq!(read_auto_confirm(&temp_env(None)), (false, None));
+    }
+
+    #[test]
+    fn e2_缺键_关闭且不告警() {
+        let path = temp_env(Some("LOVART_ACCESS_KEY=ak\n"));
+        assert_eq!(read_auto_confirm(&path), (false, None));
+    }
+
+    #[test]
+    fn e3_大小写都认() {
+        assert_eq!(
+            read_auto_confirm(&temp_env(Some("LOVART_AUTO_CONFIRM=true\n"))),
+            (true, None)
+        );
+        assert_eq!(
+            read_auto_confirm(&temp_env(Some("LOVART_AUTO_CONFIRM=FALSE\n"))),
+            (false, None)
+        );
+    }
+
+    #[test]
+    fn e4_export_引号_空格都认() {
+        let path = temp_env(Some("export LOVART_AUTO_CONFIRM = \"true\"\n"));
+        assert_eq!(read_auto_confirm(&path), (true, None));
+    }
+
+    #[test]
+    fn e5_非法值_关闭并告警() {
+        let (value, warning) = read_auto_confirm(&temp_env(Some("LOVART_AUTO_CONFIRM=1\n")));
+        assert!(!value);
+        assert!(warning.unwrap().contains("无法识别"));
+    }
+
+    #[test]
+    fn e6_读失败_关闭并告警() {
+        let path = temp_env(None);
+        std::fs::write(&path, [0xFFu8, 0xFE]).unwrap();
+        let (value, warning) = read_auto_confirm(&path);
+        assert!(!value);
+        assert!(warning.unwrap().contains("读不了"));
+    }
+
+    #[test]
+    fn e7_注释不算声明() {
+        let path = temp_env(Some("# LOVART_AUTO_CONFIRM=true\n"));
+        assert_eq!(read_auto_confirm(&path), (false, None));
+    }
+
+    #[test]
+    fn e8_只改目标行_注释与其它键保留() {
+        let path = temp_env(Some(
+            "# 注释\nLOVART_ACCESS_KEY=ak\nLOVART_AUTO_CONFIRM=false\n",
+        ));
+        update_env_keys(&path, &[(AUTO_CONFIRM_KEY, "true".to_string())]).unwrap();
+        assert_eq!(
+            text_of(&path),
+            "# 注释\nLOVART_ACCESS_KEY=ak\nLOVART_AUTO_CONFIRM=true\n"
+        );
+    }
+
+    #[test]
+    fn e9_export_前缀保留且不追加第二行() {
+        let path = temp_env(Some("export LOVART_AUTO_CONFIRM=false\n"));
+        update_env_keys(&path, &[(AUTO_CONFIRM_KEY, "true".to_string())]).unwrap();
+        assert_eq!(text_of(&path), "export LOVART_AUTO_CONFIRM=true\n");
+    }
+
+    #[test]
+    fn e10_等号带空格也原地替换() {
+        let path = temp_env(Some("LOVART_AUTO_CONFIRM = false\n"));
+        update_env_keys(&path, &[(AUTO_CONFIRM_KEY, "true".to_string())]).unwrap();
+        assert_eq!(text_of(&path), "LOVART_AUTO_CONFIRM=true\n");
+    }
+
+    #[test]
+    fn e11_同名多行全改() {
+        let path = temp_env(Some(
+            "LOVART_AUTO_CONFIRM=false\nLOVART_AUTO_CONFIRM=false\n",
+        ));
+        update_env_keys(&path, &[(AUTO_CONFIRM_KEY, "true".to_string())]).unwrap();
+        assert_eq!(
+            text_of(&path),
+            "LOVART_AUTO_CONFIRM=true\nLOVART_AUTO_CONFIRM=true\n"
+        );
+    }
+
+    #[test]
+    fn e12_缺键只追加一次() {
+        let path = temp_env(Some("LOVART_ACCESS_KEY=ak\n"));
+        update_env_keys(&path, &[(AUTO_CONFIRM_KEY, "true".to_string())]).unwrap();
+        update_env_keys(&path, &[(AUTO_CONFIRM_KEY, "false".to_string())]).unwrap();
+        let text = text_of(&path);
+        assert_eq!(
+            text.matches("LOVART_AUTO_CONFIRM=").count(),
+            1,
+            "重复切换不许长行：{text}"
+        );
+        assert!(text.contains("LOVART_AUTO_CONFIRM=false"));
+    }
+
+    #[test]
+    fn e13_注释里的键不改() {
+        let path = temp_env(Some("# LOVART_AUTO_CONFIRM=true\n"));
+        update_env_keys(&path, &[(AUTO_CONFIRM_KEY, "false".to_string())]).unwrap();
+        let text = text_of(&path);
+        assert!(text.starts_with("# LOVART_AUTO_CONFIRM=true\n"));
+        assert!(text.contains("\nLOVART_AUTO_CONFIRM=false"));
+    }
+
+    #[test]
+    fn e14_前缀相似的键不误伤() {
+        let path = temp_env(Some("LOVART_AUTO_CONFIRM_EXTRA=true\n"));
+        update_env_keys(&path, &[(AUTO_CONFIRM_KEY, "false".to_string())]).unwrap();
+        let text = text_of(&path);
+        assert!(text.contains("LOVART_AUTO_CONFIRM_EXTRA=true"));
+        assert!(text.contains("LOVART_AUTO_CONFIRM=false"));
+    }
 }

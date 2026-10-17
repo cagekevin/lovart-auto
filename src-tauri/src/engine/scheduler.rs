@@ -25,9 +25,9 @@
 //! 所以 `Ctx` 包在 `Mutex` 里，并且**只在「取件 / 写状态」这两小段持锁**，
 //! 网络 I/O 一律在锁外。TS 那边"忘了 await 就并发写"这类问题在这里不可能发生。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -54,7 +54,7 @@ use crate::lovart::contract::SendInput;
 use crate::lovart::errors::{is_busy_error, is_retryable_error, ErrType, LovartError};
 use crate::lovart::project::{send_chat_with_project, ProjectCache};
 use crate::lovart::prompt::{build_lovart_prompt, build_lovart_tool_config, PromptTask};
-use crate::lovart::task::{extract_artifacts, poll_thread};
+use crate::lovart::task::{extract_artifacts, poll_thread, AutoConfirmDecision};
 
 /// 「服务端并发满 / thread 忙 / 限流」的退避基数：5s → 10s → 20s → 40s → 60s 封顶。
 const BUSY_BACKOFF_BASE_MS: u64 = 5_000;
@@ -85,6 +85,8 @@ pub trait Ports: Send + Sync {
         deps: &ClientDeps,
         thread_id: &str,
         task_timeout: Duration,
+        allow: &dyn Fn() -> AutoConfirmDecision,
+        confirmed: &AtomicUsize,
     ) -> Result<Value, LovartError>;
     fn extract_artifacts(&self, result: &Value) -> Result<Vec<String>, LovartError>;
     fn download(
@@ -130,10 +132,12 @@ impl Ports for RealPorts {
         deps: &ClientDeps,
         thread_id: &str,
         task_timeout: Duration,
+        allow: &dyn Fn() -> AutoConfirmDecision,
+        confirmed: &AtomicUsize,
     ) -> Result<Value, LovartError> {
         let mut scoped = deps.clone();
         scoped.task_timeout = task_timeout;
-        poll_thread(&scoped, thread_id)
+        poll_thread(&scoped, thread_id, allow, confirmed)
     }
 
     fn extract_artifacts(&self, result: &Value) -> Result<Vec<String>, LovartError> {
@@ -181,6 +185,65 @@ pub enum Batch {
     Records(Vec<String>),
 }
 
+/// 自动确认策略 —— **一个机制，三件事**：开关（全局热更新）、计数（本批）、许可（本批）。
+///
+/// 为什么不拆成三个字段散在各处：它们回答的是同一个问题「这次能不能花钱」。
+/// 拆开后必然出现"计数改了、许可忘了"这类漂移，且花钱策略会渗进排队上下文（`Ctx`）。
+///
+/// ⚠️ 协议层（`lovart::task`）不认识这个类型，只收 `allow` 回调 + 计数器引用 ——
+///    花钱策略属于调度层，协议层只管"怎么发请求"。
+pub struct AutoConfirm {
+    /// 全局开关：与 `GuiState.auto_confirm` 共享同一个原子量 ⇒ 切换立即生效。
+    enabled: Arc<AtomicBool>,
+    /// 本批已自动确认次数（`confirm` 成功那一刻 +1，与轮询收场无关）。
+    confirmed: AtomicUsize,
+    /// 本批已发放过许可的任务 id（内存，不落盘；批次结束随 `Shared` 一起消失）。
+    attempted: Mutex<HashSet<String>>,
+}
+
+impl AutoConfirm {
+    pub fn new(enabled: Arc<AtomicBool>) -> Arc<Self> {
+        Arc::new(Self {
+            enabled,
+            confirmed: AtomicUsize::new(0),
+            attempted: Mutex::new(HashSet::new()),
+        })
+    }
+
+    /// 永远关闭 —— 测试 / 默认值用。
+    pub fn disabled() -> Arc<Self> {
+        Self::new(Arc::new(AtomicBool::new(false)))
+    }
+
+    /// 「此刻能确认吗」：读开关 + 原子占位，**一步完成**。
+    ///
+    /// 顺序是刻意的：先判开关（关 ⇒ `Disabled`，不碰集合），再占位。
+    /// 关掉开关后，已用过许可的任务会报"未开启"——对应的是用户最后一个动作。
+    pub fn decide(&self, id: &str) -> AutoConfirmDecision {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return AutoConfirmDecision::Disabled;
+        }
+        let mut attempted = self
+            .attempted
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if attempted.insert(id.to_string()) {
+            AutoConfirmDecision::Allow
+        } else {
+            AutoConfirmDecision::AlreadyUsed
+        }
+    }
+
+    /// 给协议层用的计数器（确认成功时由 `resolve_pending` +1）。
+    pub fn confirmed(&self) -> &AtomicUsize {
+        &self.confirmed
+    }
+
+    pub fn count(&self) -> usize {
+        self.confirmed.load(Ordering::Relaxed)
+    }
+}
+
 pub struct SchedulerOptions {
     pub deps: ClientDeps,
     pub batch: Batch,
@@ -194,6 +257,8 @@ pub struct SchedulerOptions {
     pub max_attempts: Option<u32>,
     pub max_busy_retries: Option<u32>,
     pub busy_backoff_base: Option<Duration>,
+    /// 自动确认策略（全局开关 + 本批计数 + 本批许可）。
+    pub auto_confirm: Arc<AutoConfirm>,
     pub log: LogFn,
     /// 外部副作用出口；缺省用 [`RealPorts`]。
     pub ports: Option<Arc<dyn Ports>>,
@@ -245,7 +310,9 @@ fn error_text(error: &LovartError) -> String {
 struct Shared {
     ctx: Mutex<Ctx>,
     log: LogFn,
-    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    cancelled: Arc<AtomicBool>,
+    /// 自动确认策略（全局开关 + 本批计数 + 本批许可）。
+    auto_confirm: Arc<AutoConfirm>,
 }
 
 impl Shared {
@@ -828,7 +895,10 @@ fn poll_and_finish(
         )
     };
 
-    let result = match ports.poll(&deps, thread_id, task_timeout) {
+    // 自动确认：`allow` 在"即将确认"那一刻求值（开关热更新）；计数器与轮询收场无关。
+    let auto = Arc::clone(&shared.auto_confirm);
+    let allow = || auto.decide(id);
+    let result = match ports.poll(&deps, thread_id, task_timeout, &allow, auto.confirmed()) {
         Ok(result) => result,
         Err(error) => {
             handle_poll_error(worker_id, id, &error, shared, is_final_sweep);
@@ -940,7 +1010,8 @@ fn handle_poll_error(
             return;
         }
         ErrType::PendingConfirmation => {
-            // **不自动确认**，避免静默扣积分。
+            // 未开启 / 本批已用过许可 / 自动确认失败 —— 三种都转人工，原因原样写在 `error` 里。
+            // ⚠️ 日志不能再说"不自动扣积分"：自动确认失败时那句话是假的。
             shared.finish(
                 id,
                 TaskStatus::NeedsConfirm,
@@ -949,7 +1020,10 @@ fn handle_poll_error(
                     ..Default::default()
                 },
             );
-            shared.log(&format!("[w{worker_id}] ⚠️ {id} 需人工确认，已跳过（不自动扣积分）"));
+            shared.log(&format!(
+                "[w{worker_id}] ⚠️ {id} 转人工：{}",
+                error_text(error)
+            ));
             return;
         }
         ErrType::Timeout => {
@@ -1114,6 +1188,7 @@ pub fn run_scheduler(options: SchedulerOptions) -> Result<SchedulerSummary, Lova
         max_attempts,
         max_busy_retries,
         busy_backoff_base,
+        auto_confirm,
         log,
         ports,
     } = options;
@@ -1286,6 +1361,7 @@ pub fn run_scheduler(options: SchedulerOptions) -> Result<SchedulerSummary, Lova
         ctx: Mutex::new(ctx),
         log: Arc::clone(&log),
         cancelled,
+        auto_confirm,
     });
 
     let mut handles = Vec::new();
@@ -1363,5 +1439,65 @@ fn worker_loop(worker_id: usize, shared: &Shared) {
         if sleep_or_abort(shared, Duration::from_millis(wait)).is_err() {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flag(value: bool) -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(value))
+    }
+
+    #[test]
+    fn a1_关闭时不占位() {
+        let enabled = flag(false);
+        let auto = AutoConfirm::new(Arc::clone(&enabled));
+        assert_eq!(auto.decide("a"), AutoConfirmDecision::Disabled);
+        // 关着的时候不该消耗许可：打开后同一任务仍然允许。
+        enabled.store(true, Ordering::Relaxed);
+        assert_eq!(auto.decide("a"), AutoConfirmDecision::Allow);
+    }
+
+    #[test]
+    fn a2_首次允许_再次已用() {
+        let auto = AutoConfirm::new(flag(true));
+        assert_eq!(auto.decide("a"), AutoConfirmDecision::Allow);
+        assert_eq!(auto.decide("a"), AutoConfirmDecision::AlreadyUsed);
+    }
+
+    #[test]
+    fn a3_不同任务各自允许() {
+        let auto = AutoConfirm::new(flag(true));
+        assert_eq!(auto.decide("a"), AutoConfirmDecision::Allow);
+        assert_eq!(auto.decide("b"), AutoConfirmDecision::Allow);
+    }
+
+    #[test]
+    fn a4_关掉后已用许可的任务报未开启() {
+        let enabled = flag(true);
+        let auto = AutoConfirm::new(Arc::clone(&enabled));
+        assert_eq!(auto.decide("a"), AutoConfirmDecision::Allow);
+        enabled.store(false, Ordering::Relaxed);
+        assert_eq!(auto.decide("a"), AutoConfirmDecision::Disabled);
+    }
+
+    #[test]
+    fn a5_每批独立() {
+        let a = AutoConfirm::new(flag(true));
+        let b = AutoConfirm::new(flag(true));
+        a.confirmed().fetch_add(1, Ordering::Relaxed);
+        assert_eq!(a.count(), 1);
+        assert_eq!(b.count(), 0, "两个批次不许共用计数");
+    }
+
+    #[test]
+    fn a6_计数单调() {
+        let auto = AutoConfirm::new(flag(true));
+        assert_eq!(auto.count(), 0);
+        auto.confirmed().fetch_add(1, Ordering::Relaxed);
+        auto.confirmed().fetch_add(1, Ordering::Relaxed);
+        assert_eq!(auto.count(), 2);
     }
 }

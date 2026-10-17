@@ -239,6 +239,65 @@ async function flushAlerts() {
   notice(alerts.join('\n'));
 }
 
+// ── 自动确认开关（顶栏常驻）───────────────────────────────────────────
+//
+// 真源在后端（`get_state.autoConfirm`）；这里只做两件事：
+// ① 把后端给的值画出来；② 点击时调用唯一写命令，成功后**立即**用返回值刷新，
+// 不等下一轮轮询（轮询失败时 chip 会停在旧值，那是假象）。
+
+let autoConfirmState = false;
+let autoConfirmedCount = 0;
+let autoConfirmBusy = false;
+let lastWaitingCount = 0;
+
+function renderAutoConfirm(enabled, count) {
+  autoConfirmState = Boolean(enabled);
+  autoConfirmedCount = Number(count) || 0;
+  const chip = $('btnAutoConfirm');
+  if (!chip) return;
+  chip.setAttribute('aria-pressed', autoConfirmState ? 'true' : 'false');
+  let label = autoConfirmState ? '自动确认中' : '自动确认关';
+  if (autoConfirmState && autoConfirmedCount > 0) {
+    label += ` · 本批 ${autoConfirmedCount}`;
+  }
+  $('autoConfirmLabel').textContent = label;
+}
+
+async function applyAutoConfirm(enabled) {
+  try {
+    const value = await invoke('set_auto_confirm', { enabled });
+    renderAutoConfirm(value, autoConfirmedCount);
+    // 历史待确认**不会**被自动处理 —— 打开后必须说一次，否则用户以为开关没生效。
+    if (value && lastWaitingCount > 0) {
+      notice(`历史 ${lastWaitingCount} 条待确认不会被自动处理，需要逐条确认`);
+    }
+  } catch (error) {
+    // 失败原样透传；界面保持原状态（后端也没改内存）。
+    notice(`切换自动确认失败：${error}`);
+  }
+}
+
+async function toggleAutoConfirm() {
+  // 整个流程（弹窗 + 命令）都上锁：否则连点会开两个弹窗 / 发两次写请求。
+  if (autoConfirmBusy) return;
+  autoConfirmBusy = true;
+  try {
+    if (autoConfirmState) {
+      // 关闭永不弹窗：安全方向不该有摩擦。
+      await applyAutoConfirm(false);
+      return;
+    }
+    const ok = await askConfirm(
+      '开启自动确认？',
+      '开启后，所有批次遇到上游要求确认的高成本操作时，将自动确认并继续。会扣积分，且不逐条展示报价；同一任务每批最多自动确认一次，再遇到会转人工。',
+    );
+    if (!ok) return;
+    await applyAutoConfirm(true);
+  } finally {
+    autoConfirmBusy = false;
+  }
+}
+
 async function refreshBoard() {
   let data;
   try {
@@ -252,6 +311,9 @@ async function refreshBoard() {
   }
   show($('boardNotice'), false);
   show($('boardMain'), true);
+
+  // 顶栏开关状态：每秒对账一次（切换后另有命令返回值即时刷新）。
+  renderAutoConfirm(data.autoConfirm, data.autoConfirmed);
 
   // 批次级告警：**必须显示**，所以放在「结构没变就早退」之前 ——
   // 告警的出现与任务列表的结构无关（跑批失败时列表往往一点没变）。
@@ -335,6 +397,7 @@ function renderBoard(data) {
   // 「要你处理」—— **你不点它就不动**的那些（判据在 Rust：`task_group` 的 `waiting`）。
   // 刻意**排在最上面、默认展开**：它原先躺在「已结束」里，用户以为"它自己完成了"。
   const waiting = tasks.filter((task) => task.group === 'waiting');
+  lastWaitingCount = waiting.length;
   show($('waitingGroup'), waiting.length > 0);
   $('waitingMeta').textContent = `${waiting.length} 条`;
   const waitingList = $('waitingList');
@@ -1366,7 +1429,15 @@ async function importFile(index) {
         model: task.model,
         ratio: task.aspectRatio,
         size: task.imageSize,
-        refs: task.refs || [],
+        // ⚠️ 后端给的是 **url 字符串数组**，而队列里的 `refs` 必须是 `{id,url,label}`
+        //    （见文件头的约定）。原先直接塞字符串 ⇒ 两个后果一起出现：
+        //    ① 待发缩略图取 `firstRef.url` 得 undefined ⇒ 一片破图；
+        //    ② 发布时 `.map((ref) => ref.url)` 全变 undefined ⇒ queue.jsonl 里
+        //       **refs 整段消失**，整批静默退化成文生图（垫图白垫，产品全靠猜）。
+        refs: (task.refs || []).map((url) => {
+          refSeq += 1;
+          return { id: `ref-${refSeq}`, url, label: refLabelOf(url, refSeq) };
+        }),
       });
     }
     renderQueue();
@@ -1631,6 +1702,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     refreshBoard();
   });
 
+  $('btnAutoConfirm').addEventListener('click', toggleAutoConfirm);
   $('btnSettings').addEventListener('click', openSettings);
   $('btnSettingsCancel').addEventListener('click', () => closeMask('maskSettings'));
   $('btnSettingsSave').addEventListener('click', saveSettings);

@@ -40,6 +40,20 @@ make app                    # → 仓库根目录下的 lovart.app
 > 判定顺序见 `src-tauri/src/gui.rs` 的 `workspace_dir()`：`.app` 同级目录是仓库 ⇒ 用它。
 > 所以 `.app` 要**和 `.env` / `inbox/` / `var/` / `output/` 放同一层**。
 
+**Windows 上的正式交付形态是仓库根下的 `lovart-client.exe`**（`scripts/make-exe.ps1` 生成）：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/make-exe.ps1   # 或：make win
+```
+
+它做三件事：从 `assets/icon.png` 生成 `src-tauri/icons/icon.ico` → 载入 MSVC 环境编译
+（前端资源同样是**编译期**嵌入，改过 `ui/` 必须重跑）→ 把 exe 拷到仓库根。
+双击 = 图形界面；`.\lovart-client.exe --help` = 命令行。产物是**自包含单文件**，运行时依赖为 0。
+
+> ⚠️ Windows 上没有 `.app` 那层外壳，`bundle_sibling_dir()` 不适用 —— 工作区判定走
+> `workspace_dir()` 的「**当前目录是工作区**」分支：双击时当前目录 = exe 所在目录，
+> 所以 exe 要和 `.env` / `inbox/` / `var/` / `output/` 放同一层（即仓库根）。
+
 **命令行写法**：`--key value` 与 `--key=value` 等价；`--ref` 可重复也可逗号分隔；
 `--` 之后的内容不再当参数解析；`-h` / `--help` 打印本文件。**未知参数会报错终止**（不会静默忽略）。
 
@@ -68,6 +82,8 @@ make app                    # → 仓库根目录下的 lovart.app
 | `--task-timeout <分钟>` | `90` | 单任务轮询总超时 |
 | `--recheck-timeout <分钟>` | `30` | 复查已超时任务时的轮询超时 |
 | `--allow-unknown-model` | — | 未知模型名只警告不终止（**默认终止**，防整批静默跑错模型） |
+| `--auto-confirm` | — | 自动确认高成本操作（**会扣积分**；每任务每批最多一次，失败转人工不重试） |
+| `--no-auto-confirm` | — | 关闭自动确认（覆盖 `.env` 的 `LOVART_AUTO_CONFIRM`） |
 | `--check` | — | **只校验提示词文件**（给 AI 自检用）：不联网、不提交；有错则非零退出并报行号 |
 | `--dry-run` | — | 只打印计划，不提交 |
 | `--list-models` | — | 列出可用的**出图**模型别名（从代码生成，权威来源）；配 `--json` 机器可读 |
@@ -143,8 +159,10 @@ lovart-client --list-models            # 权威别名表，不会像文档那样
    **从状态派生**（`count(SLOT_HOLDING_STATUSES)`），**不维护计数器** —— 手动计数器必然漂。
    超时被放走的任务**仍占槽位**，所以要优先复查它，而不是立刻补新任务。
 2. **超时 ≠ 失败。** 轮询超时只释放 worker，任务转 `timeout` 保留 threadId，收尾再查。
-3. **绝不自动确认 `pending_confirmation`。** 那是高成本操作要用户批准才扣积分的闸门；
-   自动确认等于**静默花钱**。遇到它会记 `needs_confirm` 并跳过。
+3. **默认不自动确认 `pending_confirmation`。** 那是高成本操作要用户批准才扣积分的闸门。
+   顶栏的**全局开关**（`.env` 的 `LOVART_AUTO_CONFIRM`）打开后才会自动确认并继续，
+   且**同一任务每批最多一次**；确认失败一律转人工、**不重试**（请求可能已在服务端生效，
+   重试就是重复扣费）。关着时遇到它仍记 `needs_confirm` 并跳过。
 4. **每次提交前重设排队模式。** 服务端模式是**账号级持久设置**，可能被别处（如 AI Canvas）改回 fast。
 5. **不要与 AI Canvas 同时用 Lovart**，两边会互相改模式。
 6. **尺寸只给档位标签，不给像素。** 提示词里只写 `resolution: 2K, aspect_ratio: 3:4`，
@@ -169,6 +187,7 @@ lovart-client --list-models            # 权威别名表，不会像文档那样
 ```text
 lovart 自动/
 ├── lovart.app/           macOS 应用包（`make app` 生成，**不进版本库**）
+├── lovart-client.exe     Windows 单文件交付（`make win` 生成，**不进版本库**）
 ├── src-tauri/            唯一实现（Rust）：GUI 与无头 CLI 是**同一个二进制**
 │   ├── src/
 │   │   ├── main.rs             双击 = GUI；带参数 = 无头 CLI
@@ -179,10 +198,11 @@ lovart 自动/
 │   │   └── lovart/             协议层（HMAC 签名 / 轮询状态机 / project / 附件 / 错误码表）
 │   └── tests/                  回归测试（`cargo test`）
 ├── ui/                   前端：index.html · app.js · style.css · logo.png（无框架、无构建）
-├── assets/icon.png       图标源（1024，打包脚本从它生成 .icns）
+├── assets/icon.png       图标源（1024，打包脚本从它生成 .icns / .ico）
 ├── packaging/macos/      `.app` 外壳样板（Info.plist）
 ├── scripts/
 │   ├── make-app.sh       打包 `lovart.app`（`make app`）
+│   ├── make-exe.ps1      打包 `lovart-client.exe`（`make win`）
 │   └── probe.mjs         「先红后绿」探针执行器
 ├── fixtures/             黄金用例：prompts + 脚本化上游 + 期望状态
 ├── inbox/                AI 写提示词的落点（见 inbox/README.md）

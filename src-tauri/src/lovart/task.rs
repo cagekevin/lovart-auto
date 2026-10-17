@@ -6,23 +6,82 @@
 //!    只有确定性硬失败（400/401/403/404）才立刻判失败并透传上游文案；
 //! 3. **间隔退避**：10s → 20s → 40s → 60s 封顶。长任务若固定 3 秒轮询会打爆请求量触发限流。
 //!
-//! 状态机：`done` → 取 result；`pending_confirmation` → `AUTO_CONFIRM` 时自动确认，
-//! 否则抛错；`abort` → 失败。
+//! 状态机：`done` → 取 result；`pending_confirmation` → 由调用方给的 `allow` 三态决定
+//! （允许 / 未开启 / 本批已用过），允许则确认并继续，否则抛错；`abort` → 失败。
+//!
+//! ── 自动确认为什么在这里也要"一次性" ────────────────────────────────
+//! 协议层只保证**同一次轮询调用内**不会反复确认（`allow` 背后的许可集合覆盖了这一点）；
+//! 跨调用（超时复查 / 重试）由调度层的 `AutoConfirm` 集合保证。两层都不许省。
 //!
 //! ── Rust 比 TS 强的一处 ─────────────────────────────────────────────
 //! **取消是醒着的**：TS 的 `sleep(interval)` 最长睡 60 秒，Ctrl+C 要等它睡完才响应；
 //! 这里 [`sleep_or_abort`] 切成 ≤200ms 的小段，每段查一次取消标志
 //! ⇒ 按 Ctrl+C 后最多 200ms 就抛出 `Abort`。
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::sleep;
 use std::time::Duration;
 
 use serde_json::Value;
 
 use super::client::{confirm_thread, get_result, get_status, ClientDeps};
-use super::config::{AUTO_CONFIRM, POLL_MAX_INTERVAL_MS};
+use super::config::POLL_MAX_INTERVAL_MS;
 use super::contract::{as_json_array, as_string, is_truthy};
 use super::errors::{is_retryable_error, ErrType, LovartError};
+
+/// 「此刻能自动确认吗」的三种答案。
+///
+/// 为什么不是 `bool`：`false` 有两种完全不同的原因（开关关 / 本批已用过），
+/// 对用户是两句不同的话；压成 bool 就只能写一句含糊的兜底话。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoConfirmDecision {
+    /// 开关开 && 本任务本批首次（返回时许可已占位）。
+    Allow,
+    /// 开关关。
+    Disabled,
+    /// 本任务本批已经用过许可。
+    AlreadyUsed,
+}
+
+/// 处理一次 `pending_confirmation` —— **两处分支共用的唯一实现**。
+///
+/// `Ok(())` = 已确认，调用方应 `continue` 继续轮询；`Err` = 转人工。
+/// 计数在 `confirm_thread` 返回成功的那一刻落，**不经过返回值** ——
+/// 轮询后面超时 / 取消 / 报错都不会把这笔账弄丢。
+fn resolve_pending(
+    deps: &ClientDeps,
+    thread_id: &str,
+    allow: &dyn Fn() -> AutoConfirmDecision,
+    confirmed: &AtomicUsize,
+) -> Result<(), LovartError> {
+    match allow() {
+        // ⚠️ 这句文案是**黄金用例的一部分**（`fixtures/*/expected-state.jsonl`），
+        //    默认关闭路径必须逐字节不变 —— 改它就得连黄金一起手改（README 有说明）。
+        AutoConfirmDecision::Disabled => Err(LovartError::internal(
+            "任务需人工确认（pending_confirmation），本程序不自动确认以免静默扣积分",
+            ErrType::PendingConfirmation,
+        )),
+        // 安全阀：确认过还继续要确认 = 继续加钱的信号。手动再确认会**再扣一次**，必须说清。
+        AutoConfirmDecision::AlreadyUsed => Err(LovartError::internal(
+            "已自动确认过一次，上游仍要求确认；手动继续会再次扣积分",
+            ErrType::PendingConfirmation,
+        )),
+        AutoConfirmDecision::Allow => match confirm_thread(deps, thread_id) {
+            Ok(()) => {
+                confirmed.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            // ⚠️ 确认失败**绝不重试**：请求可能已在服务端生效，重试 = 重复扣费风险。
+            Err(error) => Err(LovartError::internal(
+                format!(
+                    "自动确认失败（{}），已转人工，不会重复确认",
+                    error.message()
+                ),
+                ErrType::PendingConfirmation,
+            )),
+        },
+    }
+}
 
 /// 取消检查粒度：睡这么久就醒一次看有没有被取消。
 const CANCEL_POLL_MS: u64 = 200;
@@ -96,7 +155,15 @@ fn backoff(
 }
 
 /// 轮询直到终态；返回 result（已含 items）。
-pub fn poll_thread(deps: &ClientDeps, thread_id: &str) -> Result<Value, LovartError> {
+///
+/// `allow`：**在"即将确认"那一刻**求值（不是轮询开始时快照）⇒ 开关热更新双向即时；
+/// `confirmed`：确认成功时 +1（由调用方提供，计数与轮询收场无关）。
+pub fn poll_thread(
+    deps: &ClientDeps,
+    thread_id: &str,
+    allow: &dyn Fn() -> AutoConfirmDecision,
+    confirmed: &AtomicUsize,
+) -> Result<Value, LovartError> {
     let max_interval = Duration::from_millis(POLL_MAX_INTERVAL_MS);
     let deadline = std::time::Instant::now() + deps.task_timeout;
     let mut interval = deps.poll_interval;
@@ -123,14 +190,8 @@ pub fn poll_thread(deps: &ClientDeps, thread_id: &str) -> Result<Value, LovartEr
                 return Err(LovartError::internal("Lovart 任务被中止", ErrType::Abort));
             }
             "pending_confirmation" => {
-                if AUTO_CONFIRM {
-                    confirm_thread(deps, thread_id)?;
-                    continue;
-                }
-                return Err(LovartError::internal(
-                    "任务需人工确认（pending_confirmation），本程序不自动确认以免静默扣积分",
-                    ErrType::PendingConfirmation,
-                ));
+                resolve_pending(deps, thread_id, allow, confirmed)?;
+                continue;
             }
             "done" => {
                 // 复核，防子任务未起跑误判 done。
@@ -166,14 +227,8 @@ pub fn poll_thread(deps: &ClientDeps, thread_id: &str) -> Result<Value, LovartEr
                         .and_then(|object| object.get("pending_confirmation"))
                         .is_some_and(is_truthy);
                     if pending {
-                        if AUTO_CONFIRM {
-                            confirm_thread(deps, thread_id)?;
-                            continue;
-                        }
-                        return Err(LovartError::internal(
-                            "任务需人工确认（pending_confirmation），本程序不自动确认以免静默扣积分",
-                            ErrType::PendingConfirmation,
-                        ));
+                        resolve_pending(deps, thread_id, allow, confirmed)?;
+                        continue;
                     }
                     return Ok(result);
                 }

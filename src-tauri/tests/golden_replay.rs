@@ -32,7 +32,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use lovart_client::engine::scheduler::{
-    run_scheduler, Batch, Ports, RealPorts, SchedulerOptions,
+    run_scheduler, AutoConfirm, Batch, Ports, RealPorts, SchedulerOptions,
 };
 use lovart_client::engine::state::{normalize_state_text, StateStore};
 use lovart_client::engine::download::DownloadedFile;
@@ -43,6 +43,7 @@ use lovart_client::lovart::config::PATH_PREFIX;
 use lovart_client::lovart::contract::SendInput;
 use lovart_client::lovart::errors::LovartError;
 use lovart_client::lovart::prompt::{parse_prompts, ParseOptions, PromptDefaults};
+use lovart_client::lovart::task::AutoConfirmDecision;
 
 /// 轮询次数预算：超过就判「未收敛」。
 ///
@@ -199,8 +200,11 @@ impl Ports for ReplayPorts {
         deps: &ClientDeps,
         thread_id: &str,
         task_timeout: Duration,
+        allow: &dyn Fn() -> AutoConfirmDecision,
+        confirmed: &AtomicUsize,
     ) -> Result<Value, LovartError> {
-        self.inner.poll(deps, thread_id, task_timeout)
+        self.inner
+            .poll(deps, thread_id, task_timeout, allow, confirmed)
     }
 
     fn extract_artifacts(&self, result: &Value) -> Result<Vec<String>, LovartError> {
@@ -362,6 +366,8 @@ fn run_fixture(fixture: &Fixture) -> String {
             max_attempts,
             max_busy_retries,
             busy_backoff_base: Some(Duration::from_millis(1)),
+            // 黄金用例录的是"默认关闭"的行为：这里必须恒关，否则回放会去真确认。
+            auto_confirm: AutoConfirm::disabled(),
             log: Arc::new(|_message: &str| {}),
             ports: Some(Arc::new(ReplayPorts {
                 inner: RealPorts::new(),

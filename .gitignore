@@ -20,5 +20,8 @@ output/
 # macOS 应用包（`make app` 的产物：13MB 二进制 + 图标，可复现 ⇒ 不入库）
 *.app/
 
+# Windows 单文件交付（`make win` 的产物：12MB 二进制，可复现 ⇒ 不入库）
+lovart-client.exe
+
 # macOS
 .DS_Store

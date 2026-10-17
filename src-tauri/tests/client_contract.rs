@@ -10,6 +10,7 @@
 #![allow(non_snake_case)]
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -24,7 +25,8 @@ use lovart_client::lovart::contract::{is_truthy, normalize_send_body, SendInput}
 use lovart_client::lovart::errors::{
     is_busy_error, is_retryable_error, is_retryable_http_status, ErrType, LovartError,
 };
-use lovart_client::lovart::task::poll_thread;
+use lovart_client::engine::scheduler::AutoConfirm;
+use lovart_client::lovart::task::{extract_artifacts, poll_thread, AutoConfirmDecision};
 
 // ── 假传输 ────────────────────────────────────────────────────────────
 
@@ -441,7 +443,7 @@ fn lovart_request_的_base_url_末尾斜杠不会双写() {
 /// `and_then(Value::as_bool).unwrap_or(false)`，这条立刻红。
 #[test]
 fn result_路径的_pending_confirmation_是对象也要判待确认() {
-    let (mut deps, _) = deps_with(vec![
+    let (mut deps, fake) = deps_with(vec![
         // ① /chat/status → done
         Ok(ok(json!({ "code": 0, "data": { "status": "done" } }))),
         // ② done 复核再查一次 → 还是 done
@@ -455,12 +457,19 @@ fn result_路径的_pending_confirmation_是对象也要判待确认() {
     // 复核等待在生产是 5 秒，测试里清零（否则每条用例白等 5 秒）。
     deps.done_recheck = Duration::ZERO;
 
-    let error = poll_thread(&deps, "t-1").unwrap_err();
+    let error = poll_thread(
+        &deps,
+        "t-1",
+        &|| AutoConfirmDecision::Disabled,
+        &AtomicUsize::new(0),
+    )
+    .unwrap_err();
     assert_eq!(
         error.kind(),
         ErrType::PendingConfirmation,
         "对象形状的 pending_confirmation 被判成了「已完成」—— 确认闸门被绕过"
     );
+    assert_eq!(confirm_requests(&fake), 0, "默认关闭时不许发确认");
 }
 
 /// JS 真值判定（对齐 TS `if (x)`）—— 上游那个字段可能是 `true` / 对象 / 字符串。
@@ -478,4 +487,245 @@ fn js_真值判定_与_TS_对齐() {
     for falsy in [json!(null), json!(false), json!(0), json!("")] {
         assert!(!is_truthy(&falsy), "{falsy} 在 JS 里是假值");
     }
+}
+
+// ── 自动确认（全局开关）────────────────────────────────────────────────
+//
+// 这组用例守四条红线：
+// 1. 默认关闭：一条确认都不许发；
+// 2. 开启后：先 POST /chat/confirm，再继续轮询（不能跳过 done 复核）；
+// 3. 每任务每批最多一次：第二次 pending 必须转人工；
+// 4. 计数在确认成功那一刻落，与轮询最终怎么收场无关。
+
+fn confirm_requests(fake: &Fake) -> usize {
+    fake.seen()
+        .iter()
+        .filter(|request| request.url.contains("/chat/confirm"))
+        .count()
+}
+
+fn ok_result(url: &str) -> Result<HttpResponse, String> {
+    Ok(ok(json!({
+        "code": 0,
+        "data": { "items": [{ "artifacts": [{ "type": "image", "content": url }] }] }
+    })))
+}
+
+#[test]
+fn 默认关闭_状态路径不确认() {
+    let (deps, fake) = deps_with(vec![Ok(ok(
+        json!({ "code": 0, "data": { "status": "pending_confirmation" } }),
+    ))]);
+    let confirmed = AtomicUsize::new(0);
+    let error = poll_thread(
+        &deps,
+        "t-1",
+        &|| AutoConfirmDecision::Disabled,
+        &confirmed,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.kind(), ErrType::PendingConfirmation);
+    assert!(
+        error.message().contains("人工确认"),
+        "文案应说清是未开启：{}",
+        error.message()
+    );
+    assert_eq!(confirm_requests(&fake), 0, "默认关闭时不许发确认");
+    assert_eq!(confirmed.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn 自动确认开启后_状态路径先确认再继续() {
+    let (mut deps, fake) = deps_with(vec![
+        Ok(ok(json!({ "code": 0, "data": { "status": "pending_confirmation" } }))),
+        Ok(ok(json!({ "code": 0, "data": {} }))), // confirm
+        Ok(ok(json!({ "code": 0, "data": { "status": "done" } }))),
+        Ok(ok(json!({ "code": 0, "data": { "status": "done" } }))), // done 复核
+        ok_result("https://x/a.png"),
+    ]);
+    deps.done_recheck = Duration::ZERO;
+
+    let auto = AutoConfirm::new(Arc::new(AtomicBool::new(true)));
+    let allow = || auto.decide("t-1");
+    let result = poll_thread(&deps, "t-1", &allow, auto.confirmed()).unwrap();
+
+    assert_eq!(confirm_requests(&fake), 1, "应恰好确认一次");
+    assert_eq!(auto.count(), 1, "确认成功要计数");
+    assert_eq!(
+        extract_artifacts(&result).unwrap(),
+        vec!["https://x/a.png".to_string()]
+    );
+    let status_calls = fake
+        .seen()
+        .iter()
+        .filter(|request| request.url.contains("/chat/status"))
+        .count();
+    assert_eq!(
+        status_calls, 3,
+        "pending 1 次 + done 复核 2 次，确认不能跳过状态机"
+    );
+}
+
+#[test]
+fn 自动确认开启后_结果路径先确认再继续() {
+    let (mut deps, fake) = deps_with(vec![
+        Ok(ok(json!({ "code": 0, "data": { "status": "done" } }))),
+        Ok(ok(json!({ "code": 0, "data": { "status": "done" } }))),
+        Ok(ok(json!({
+            "code": 0,
+            "data": { "pending_confirmation": { "estimated_cost": 12 } }
+        }))),
+        Ok(ok(json!({ "code": 0, "data": {} }))), // confirm
+        Ok(ok(json!({ "code": 0, "data": { "status": "done" } }))),
+        Ok(ok(json!({ "code": 0, "data": { "status": "done" } }))),
+        ok_result("https://x/b.png"),
+    ]);
+    deps.done_recheck = Duration::ZERO;
+
+    let auto = AutoConfirm::new(Arc::new(AtomicBool::new(true)));
+    let allow = || auto.decide("t-1");
+    let result = poll_thread(&deps, "t-1", &allow, auto.confirmed()).unwrap();
+
+    assert_eq!(confirm_requests(&fake), 1);
+    assert_eq!(auto.count(), 1);
+    assert_eq!(
+        extract_artifacts(&result).unwrap(),
+        vec!["https://x/b.png".to_string()]
+    );
+}
+
+#[test]
+fn 同一任务第二次_pending_不再确认() {
+    let (deps, fake) = deps_with(vec![
+        Ok(ok(json!({ "code": 0, "data": { "status": "pending_confirmation" } }))),
+        Ok(ok(json!({ "code": 0, "data": {} }))), // confirm
+        Ok(ok(json!({ "code": 0, "data": { "status": "pending_confirmation" } }))),
+    ]);
+
+    let auto = AutoConfirm::new(Arc::new(AtomicBool::new(true)));
+    let allow = || auto.decide("t-1");
+    let error = poll_thread(&deps, "t-1", &allow, auto.confirmed()).unwrap_err();
+
+    assert_eq!(error.kind(), ErrType::PendingConfirmation);
+    assert!(
+        error.message().contains("已自动确认过一次"),
+        "必须说清「再确认会再扣一次」：{}",
+        error.message()
+    );
+    assert_eq!(confirm_requests(&fake), 1, "同一任务本批只能确认一次");
+    assert_eq!(auto.count(), 1);
+}
+
+#[test]
+fn 自动确认失败_只发一次且转人工() {
+    let (deps, fake) = deps_with(vec![
+        Ok(ok(json!({ "code": 0, "data": { "status": "pending_confirmation" } }))),
+        Ok(http(500, r#"{"code":500,"message":"boom"}"#)),
+    ]);
+
+    let auto = AutoConfirm::new(Arc::new(AtomicBool::new(true)));
+    let allow = || auto.decide("t-1");
+    let error = poll_thread(&deps, "t-1", &allow, auto.confirmed()).unwrap_err();
+
+    assert_eq!(error.kind(), ErrType::PendingConfirmation);
+    assert!(
+        error.message().contains("自动确认失败"),
+        "文案要说明是确认失败：{}",
+        error.message()
+    );
+    assert!(
+        error.message().contains("boom"),
+        "上游原文必须透传：{}",
+        error.message()
+    );
+    assert_eq!(confirm_requests(&fake), 1, "确认失败绝不重试");
+    assert_eq!(auto.count(), 0, "失败不计账");
+}
+
+#[test]
+fn 确认成功后轮询失败_计数不丢() {
+    let (deps, _fake) = deps_with(vec![
+        Ok(ok(json!({ "code": 0, "data": { "status": "pending_confirmation" } }))),
+        Ok(ok(json!({ "code": 0, "data": {} }))), // confirm
+        Ok(http(401, r#"{"code":401,"message":"nope"}"#)),
+    ]);
+
+    let auto = AutoConfirm::new(Arc::new(AtomicBool::new(true)));
+    let allow = || auto.decide("t-1");
+    let error = poll_thread(&deps, "t-1", &allow, auto.confirmed()).unwrap_err();
+
+    assert_eq!(auto.count(), 1, "钱花了，账不能随轮询错误丢掉");
+    assert_ne!(
+        error.kind(),
+        ErrType::PendingConfirmation,
+        "这是轮询硬失败，不是待确认"
+    );
+}
+
+#[test]
+fn 关掉开关后_不再确认() {
+    let enabled = Arc::new(AtomicBool::new(true));
+    let auto = AutoConfirm::new(Arc::clone(&enabled));
+
+    let (deps, _) = deps_with(vec![
+        Ok(ok(json!({ "code": 0, "data": { "status": "pending_confirmation" } }))),
+        Ok(ok(json!({ "code": 0, "data": {} }))),
+        Ok(ok(json!({ "code": 0, "data": { "status": "pending_confirmation" } }))),
+    ]);
+    let allow = || auto.decide("t-1");
+    let _ = poll_thread(&deps, "t-1", &allow, auto.confirmed()).unwrap_err();
+
+    // 关掉后新一次轮询：pending 直接转人工，且不再发确认。
+    enabled.store(false, Ordering::Relaxed);
+    let (deps2, fake2) = deps_with(vec![Ok(ok(
+        json!({ "code": 0, "data": { "status": "pending_confirmation" } }),
+    ))]);
+    let error = poll_thread(&deps2, "t-1", &allow, auto.confirmed()).unwrap_err();
+
+    assert!(
+        error.message().contains("人工确认"),
+        "关掉后应报未开启：{}",
+        error.message()
+    );
+    assert_eq!(confirm_requests(&fake2), 0);
+}
+
+/// 服务第一条 status 时把开关关掉 —— 用来证明开关是在「确认那一刻」读的，
+/// 不是轮询开始时快照（若是快照，这条用例会确认一次而变红）。
+struct FlipTransport {
+    inner: Arc<Fake>,
+    enabled: Arc<AtomicBool>,
+}
+
+impl Transport for FlipTransport {
+    fn send(&self, request: &HttpRequest) -> Result<HttpResponse, String> {
+        if request.url.contains("/chat/status") {
+            self.enabled.store(false, Ordering::Relaxed);
+        }
+        self.inner.send(request)
+    }
+}
+
+#[test]
+fn 开关在确认那一刻才求值() {
+    let fake = Fake::new(vec![Ok(ok(
+        json!({ "code": 0, "data": { "status": "pending_confirmation" } }),
+    ))]);
+    let enabled = Arc::new(AtomicBool::new(true));
+    let transport: Arc<dyn Transport> = Arc::new(FlipTransport {
+        inner: Arc::clone(&fake),
+        enabled: Arc::clone(&enabled),
+    });
+    let deps = ClientDeps::new("http://replay.invalid", "ak", "sk", transport);
+    let auto = AutoConfirm::new(Arc::clone(&enabled));
+    let allow = || auto.decide("t-1");
+    let error = poll_thread(&deps, "t-1", &allow, auto.confirmed()).unwrap_err();
+
+    assert!(error.message().contains("人工确认"), "{}", error.message());
+    assert_eq!(
+        confirm_requests(&fake),
+        0,
+        "开关在轮询开始后关掉，就不该再确认"
+    );
 }

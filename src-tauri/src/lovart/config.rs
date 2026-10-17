@@ -8,13 +8,9 @@ pub const PATH_PREFIX: &str = "/v1/openapi";
 /// 默认 base URL。
 pub const DEFAULT_BASE_URL: &str = "https://lgw.lovart.ai";
 
-/// 是否自动确认高成本操作（`pending_confirmation`）。
-///
-/// ⚠️ **必须是 `false`**：官方明确要求「Do NOT auto-confirm」。
-/// 设为 `true` 会在不询问的情况下直接扣积分 —— 批量跑起来就是静默花钱。
-/// 设为 `false` 后遇到 `pending_confirmation` 会抛 `PendingConfirmation`，
-/// 由调度层记为 `needs_confirm` 跳过。
-pub const AUTO_CONFIRM: bool = false;
+// 自动确认策略**不在这里**：它是运行时开关（`engine::scheduler::AutoConfirm`），
+// 由 `.env` 的 `LOVART_AUTO_CONFIRM` 决定。编译期常量曾让它无法配置，
+// 也让"关掉"无法在跑批中生效 —— 见 docs/plan/01 的决策记录。
 
 /// 轮询起始间隔（ms）。
 pub const POLL_INTERVAL_MS: u64 = 10_000;

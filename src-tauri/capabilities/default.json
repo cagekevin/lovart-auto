@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "拖放垫图（把图片拖进窗口）依赖 webview 的 drag-drop 事件：前端 wireDropZone() 用 onDragDropEvent 订阅，底层调用 Tauri 事件插件的 plugin:event|listen。此前本目录下没有任何 capability 文件，core:event 被 ACL 默认拒绝 → 打开窗口即报 Command plugin:event|listen not allowed by ACL。这里只放开「监听 / 取消监听」，不放开「发送事件」。",
+  "windows": ["main"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}

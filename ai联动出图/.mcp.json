@@ -1,0 +1,12 @@
+{
+    "mcpServers":  {
+                       "lovart":  {
+                                      "type":  "http",
+                                      "url":  "https://lgw.lovart.ai/v1/openapi/mcp/widgets",
+                                      "headers":  {
+                                                      "Authorization":  "Bearer eyJraWQiOiJzZXNzaW9uLWhzMjU2IiwidHlwIjoiSldUIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIwMjczN2FmMGM4MjE0ZjZhODFmNjY4NTA0NDc0YTExOSIsImF1ZCI6Imh0dHBzOi8vbGd3LmxvdmFydC5haS92MS9vcGVuYXBpL21jcC93aWRnZXRzIiwibmJmIjoxNzkwMjQzMjQ1LCJncmFudF9pZCI6Im9nX0luQ2NLUTQzYTMxNnhNUERRTC01cWRoNnQ4dlo2blc3eGxHQUdjLXo3alEiLCJpc3MiOiJodHRwczovL2FwaS5sb3ZhcnQuYWkvYXBpL3d3dyIsImV4cCI6MTc5MjgzNTI0NSwiaWF0IjoxNzkwMjQzMjQ1LCJqdGkiOiI2NEctRHR6YnNyU3AxMlBTUXBKanhqVGU1UWJ3R0JzVVlIWm1idFZpNWZFIiwiY2xpZW50X2lkIjoiY29kZXgtbG92YXJ0IiwicGxhdGZvcm0iOiJDT0RFWCJ9.oUvzqINQXRAgzotcaeKpnAdoFdzMaHtAI-pco-kfX7I"
+                                                  },
+                                      "description":  "Lovart AI 设计 / 图像生成 MCP"
+                                  }
+                   }
+}

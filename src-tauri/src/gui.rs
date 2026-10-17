@@ -19,14 +19,16 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 use tauri::Manager;
 
-use crate::engine::scheduler::{run_scheduler, SchedulerOptions};
-use crate::engine::scheduler::Batch;
+use crate::engine::scheduler::{run_scheduler, AutoConfirm, Batch, SchedulerOptions};
 use crate::engine::state::{
     clear, is_unfinished, row as status_row, Action, RecordPatch, StateStore, StateStoreOptions,
     TaskRecord, TaskStatus,
 };
 use crate::engine::text::{read_text, read_text_required};
-use crate::lovart::connection::{load_dot_env, reload_dot_env, resolve_connection, to_client_deps};
+use crate::lovart::connection::{
+    load_dot_env, read_auto_confirm, reload_dot_env, resolve_connection, to_client_deps,
+    update_env_keys, AUTO_CONFIRM_KEY,
+};
 use crate::lovart::prompt::{parse_prompts, ParseOptions, PromptDefaults};
 use crate::run::build_status_json;
 
@@ -34,6 +36,8 @@ use crate::run::build_status_json;
 struct RunningBatch {
     /// 调度器的取消标志。
     cancelled: Arc<AtomicBool>,
+    /// 本批的自动确认机制（与调度器共享同一个 Arc；`get_state` 读计数）。
+    auto_confirm: Arc<AutoConfirm>,
     label: String,
     /// **本批次交给调度器的任务 id**（= 这批真会去提交/复查的那些）。
     ///
@@ -53,6 +57,10 @@ struct RunningBatch {
 pub struct GuiState {
     cwd: PathBuf,
     running: Mutex<Option<RunningBatch>>,
+    /// 全局自动确认开关（运行态真源；与每个批次的 `AutoConfirm` 共享）。
+    auto_confirm: Arc<AtomicBool>,
+    /// `.env` 读-改-写互斥：保存设置与切开关会同时改同一个文件。
+    env_lock: Mutex<()>,
     /// **批次级**告警 —— 用户**必须看到**、且看板**表达不了**的那些事。
     ///
     /// ── 为什么它取代了原来的 `log` ────────────────────────────────────
@@ -97,10 +105,14 @@ fn concurrency() -> usize {
 
 impl GuiState {
     pub fn new(cwd: PathBuf) -> Self {
+        // 自动确认开关只认 `.env`（不读进程环境变量）。非法值 / 读失败 ⇒ 关 + 一条告警。
+        let (auto_confirm, auto_confirm_warning) = read_auto_confirm(&cwd.join(".env"));
         let state = Self {
             cwd,
             running: Mutex::new(None),
             alerts: Mutex::new(Vec::new()),
+            auto_confirm: Arc::new(AtomicBool::new(auto_confirm)),
+            env_lock: Mutex::new(()),
         };
 
         // ⚠️ 启动就把 `.env` 载进来：设置里的「并发数 / 输出文件夹」也住在那里，
@@ -110,6 +122,9 @@ impl GuiState {
         // 设置界面显示的是**假配置**。原先是 `let _ =`，等于把这件事藏起来（DEBT TD-05-24）。
         if let Err(error) = load_dot_env(&state.cwd.join(".env")) {
             state.push_alert(&format!("配置载入失败，界面上的设置可能不是真实配置：{error}"));
+        }
+        if let Some(warning) = auto_confirm_warning {
+            state.push_alert(&warning);
         }
         state
     }
@@ -162,12 +177,21 @@ impl GuiState {
 #[tauri::command]
 fn get_state(state: tauri::State<'_, GuiState>) -> Result<Value, String> {
     let mut payload = build_status_json(&state.state_file(), &state.output_dir())?;
-    let batch = state
-        .running
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .as_ref()
-        .map(|batch| (batch.label.clone(), batch.ids.clone()));
+    // 计数只在本批存在时有意义；没有批次就是 0（不伪造"上次跑到多少"）。
+    let (batch, auto_confirmed) = {
+        let running = state
+            .running
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match running.as_ref() {
+            Some(batch) => (
+                Some((batch.label.clone(), batch.ids.clone())),
+                batch.auto_confirm.count(),
+            ),
+            None => (None, 0),
+        }
+    };
+    let auto_confirm = state.auto_confirm.load(Ordering::Relaxed);
     if let Some(object) = payload.as_object_mut() {
         object.insert("running".to_string(), Value::Bool(batch.is_some()));
         object.insert(
@@ -177,6 +201,8 @@ fn get_state(state: tauri::State<'_, GuiState>) -> Result<Value, String> {
                 .map(|(label, _)| Value::String(label.clone()))
                 .unwrap_or(Value::Null),
         );
+        object.insert("autoConfirm".to_string(), Value::Bool(auto_confirm));
+        object.insert("autoConfirmed".to_string(), json!(auto_confirmed));
         if let Some(tasks) = object.get_mut("tasks").and_then(Value::as_array_mut) {
             for task in tasks {
                 let following = task
@@ -328,6 +354,8 @@ fn start_run(
     let connection = resolve_connection()?;
     let deps = to_client_deps(&connection)?;
     let cancelled = Arc::clone(&deps.cancelled);
+    // 每批一份机制：开关与 `GuiState` 共享（热更新），计数与许可按批隔离。
+    let auto_confirm = AutoConfirm::new(Arc::clone(&state.auto_confirm));
 
     let cwd = state.cwd.clone();
 
@@ -344,6 +372,7 @@ fn start_run(
         let mut running = state.running.lock().unwrap_or_else(|error| error.into_inner());
         *running = Some(RunningBatch {
             cancelled: Arc::clone(&cancelled),
+            auto_confirm: Arc::clone(&auto_confirm),
             label: label.clone(),
             ids,
         });
@@ -439,6 +468,7 @@ fn start_run(
             }
         };
 
+        let auto_for_count = Arc::clone(&auto_confirm);
         let result = run_scheduler(SchedulerOptions {
             deps,
             batch,
@@ -453,9 +483,20 @@ fn start_run(
             max_attempts: None,
             max_busy_retries: None,
             busy_backoff_base: None,
+            auto_confirm,
             log: Arc::clone(&log),
             ports: None,
         });
+
+        // 花了钱就要报账：**Ok / Err 两个分支都读**，且必须在清 `running` 之前。
+        let auto_count = auto_for_count.count();
+        if auto_count > 0 {
+            if let Some(state) = app_for_thread.try_state::<GuiState>() {
+                state.push_alert(&format!(
+                    "本批自动确认 {auto_count} 条（已扣积分，明细以上游账单为准）"
+                ));
+            }
+        }
 
         match result {
             Ok(summary) => {
@@ -1086,57 +1127,58 @@ fn get_settings(state: tauri::State<'_, GuiState>) -> Result<Value, String> {
     }))
 }
 
-/// 存设置：改 `.env` 里那两个键，**其余行原样保留**。
+/// 存设置：**按行**更新 `.env` 里那几个键，注释 / 空行 / 其它键原样保留。
 ///
-/// ⚠️ 这里的读取**绝不能兜底成空**：下面会按「其余行原样保留」重写整个文件，
-/// 一旦把「读不出来」当成「文件是空的」，就会**把用户的配置整个冲掉**
-/// （密钥、注释、其它键全没）—— 这是**数据丢失**，不是显示问题（DEBT TD-05-19）。
+/// ⚠️ 读失败**绝不能兜底成空**：那会把用户的配置整个冲掉（DEBT TD-05-19）。
 #[tauri::command]
 fn save_settings(state: tauri::State<'_, GuiState>, payload: Value) -> Result<(), String> {
     let path = state.cwd.join(".env");
-    let text = read_text(&path)
-        .map_err(|error| format!("读不了 .env：{error}"))?
-        .unwrap_or_default();
-    let mut entries = crate::lovart::connection::parse_dot_env(&text).entries;
-    let mut set = |key: &str, value: String| {
-        match entries.iter_mut().find(|entry| entry.key == key) {
-            Some(entry) => entry.value = value,
-            None => entries.push(crate::lovart::connection::DotEnvEntry {
-                key: key.to_string(),
-                value,
-                line: 0, // 新追加的行没有源行号
-            }),
-        }
-    };
+    let _guard = state
+        .env_lock
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut updates: Vec<(&str, String)> = Vec::new();
     if let Some(value) = payload.get("accessKey").and_then(Value::as_str) {
-        set("LOVART_ACCESS_KEY", value.trim().to_string());
+        updates.push(("LOVART_ACCESS_KEY", value.trim().to_string()));
     }
     if let Some(value) = payload.get("secretKey").and_then(Value::as_str) {
-        set("LOVART_SECRET_KEY", value.trim().to_string());
+        updates.push(("LOVART_SECRET_KEY", value.trim().to_string()));
     }
     // 并发数 / 输出文件夹也落进 `.env` —— 它们是**真在用的**（见 `concurrency()` / `output_dir_name()`），
     // 不是只显示不生效的装饰。
     if let Some(value) = payload.get("concurrency").and_then(Value::as_u64) {
-        let clamped = value.clamp(1, 8);
-        set("LOVART_CONCURRENCY", clamped.to_string());
+        updates.push(("LOVART_CONCURRENCY", value.clamp(1, 8).to_string()));
     }
     if let Some(value) = payload.get("outputDir").and_then(Value::as_str) {
         let trimmed = value.trim();
         if !trimmed.is_empty() {
-            set("LOVART_OUTPUT_DIR", trimmed.to_string());
+            updates.push(("LOVART_OUTPUT_DIR", trimmed.to_string()));
         }
     }
-    let mut out = String::new();
-    for entry in &entries {
-        out.push_str(&format!("{}={}\n", entry.key, entry.value));
-    }
-    std::fs::write(&path, out).map_err(|error| error.to_string())?;
+    update_env_keys(&path, &updates)?;
     // 写回后立刻**重载**（覆盖），免得这一轮还用着旧凭据。
     // ⚠️ 必须是 `reload_dot_env` 而不是 `load_dot_env`：后者是「不覆盖」语义
     // （刻意让真实环境变量优先），而 `GuiState::new` 启动时已经载入过一次
     // ⇒ 用它会**整段跳过** —— 文件改了、运行时还用旧密钥（DEBT TD-05-11）。
     reload_dot_env(&path)?;
     Ok(())
+}
+
+/// 切换全局自动确认开关 —— **唯一的写入口**（顶栏 chip 用它）。
+///
+/// ⚠️ 顺序必须是「先写盘成功、后改内存」：反过来会出现"界面显示开、磁盘是 false"，
+/// 重启后悄悄变回去 —— 又一个"看着生效其实没生效"。
+#[tauri::command]
+fn set_auto_confirm(state: tauri::State<'_, GuiState>, enabled: bool) -> Result<bool, String> {
+    let _guard = state
+        .env_lock
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let path = state.cwd.join(".env");
+    let value = if enabled { "true" } else { "false" };
+    update_env_keys(&path, &[(AUTO_CONFIRM_KEY, value.to_string())])?;
+    state.auto_confirm.store(enabled, Ordering::Relaxed);
+    Ok(enabled)
 }
 
 /// 停止当前批次（协作式取消：调度器会在下一个检查点退出）。
@@ -1275,6 +1317,7 @@ pub fn run() {
             open_output_dir,
             get_settings,
             save_settings,
+            set_auto_confirm,
             stop_run
         ])
         .run(tauri::generate_context!())

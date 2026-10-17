@@ -293,6 +293,32 @@ button { cursor: pointer; color: inherit; }
 
 .btn-stop:hover:not(:disabled) { background: var(--bad); color: var(--bg); }
 
+/* ══ 顶栏：自动确认开关（常驻状态）══════════════════════════════════ */
+
+.auto-switch {
+  gap: 6px;
+  color: var(--ink-2);
+}
+
+.auto-switch-dot {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--ink-3);
+}
+
+/* 开着 = 会花钱：用警示色，别只靠一个小圆点。 */
+.auto-switch[aria-pressed="true"] {
+  color: var(--bad);
+  border-color: var(--bad);
+  background: var(--bad-bg);
+}
+
+.auto-switch[aria-pressed="true"] .auto-switch-dot {
+  background: var(--bad);
+}
+
 /* ══ 任务中心：处理中 ══════════════════════════════════════════════ */
 
 .group-title {
