@@ -176,59 +176,60 @@ impl fmt::Display for LovartError {
 
 impl std::error::Error for LovartError {}
 
-/// 「服务端忙 / 并发满 / thread 忙」的码 —— 它们是**排队状态**，不是失败。
+/// 错误分类 —— **唯一口径**。所有「该不该重试 / 该怎么退避」都从这里派生。
 ///
-/// 表：`402/2012` 配额或并发上限 · `409/2011` thread 忙 · `429/1429` 限流。
-///
-/// ⚠️ 两类码混在一张表里：非 2xx 时 `code` 是 **HTTP 状态码**（402 / 409 / 429），
-/// 业务码只存在于响应体里（2011 / 2012 / 1429）。[`is_busy_error`] 两边都查。
-///
-/// 原先只列了 `{402, 2012, 1429}` ⇒ **409 / 2011 / 429 会被当成普通可重试失败**，
-/// 计入 `maxAttempts`（默认 3）。批量跑几百张时，撞三次限流任务就被判死，
-/// 而它本该退避重投。
-pub const BUSY_CODES: [i64; 6] = [402, 409, 429, 2011, 2012, 1429];
-
-/// 该 HTTP 状态码是否「值得再试」。
-///
-/// ⚠️ **402 必须算可重试**：提交时 402 = 并发满 ⇒ 退避后重投。
-/// 402 表示服务端槽位已满（账号级 8 个），是**瞬时状态**，不是确定性失败。
-///
-/// 网络层错误（0）· 402 · 408 · 429 · 5xx 视为瞬态；
-/// 其余 4xx（400/401/403/404）是确定性硬失败，重试没有意义。
-pub fn is_retryable_http_status(status: i64) -> bool {
-    if status == 0 {
-        return true;
-    }
-    status == 402 || status == 408 || status == 429 || (500..=599).contains(&status)
+/// 表：`402/2012` 并发上限 · `409/2011` thread 忙 · `429/1429` 限流 ·
+/// `0/408/5xx/Transport` 瞬态 · 其余硬失败。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorClass {
+    /// 限流：全局熔断，不按任务计次。
+    RateLimit,
+    /// 并发满：只对本任务退避（等槽位）。
+    Concurrency,
+    /// thread 忙：只对本任务退避。
+    ThreadBusy,
+    /// 网络 / 408 / 5xx：按 `attempts` 重试。
+    Transient,
+    /// 400/401/403/404 / 2xx 非 JSON：重试没有意义。
+    Hard,
 }
 
-/// 是否「服务端忙 / 并发满 / thread 忙」—— **排队状态**，不是失败。
-pub fn is_busy_error(error: &LovartError) -> bool {
-    if let Some(biz_code) = error.biz_code() {
-        if BUSY_CODES.contains(&biz_code) {
-            return true;
+/// 先查 `biz_code`，再查 HTTP `code`；都没有 ⇒ `Hard`。
+///
+/// ⚠️ **业务码只在命中已知表时才优先**：上游可能在 429 响应里塞一个
+/// 无关的 `code: 1`，若直接 `biz_code.or(http_code)` 会把 429 盖成 Hard。
+pub fn classify_error(error: &LovartError) -> ErrorClass {
+    match error {
+        LovartError::Transport { .. } => ErrorClass::Transient,
+        LovartError::Upstream(upstream) => {
+            let by_biz = upstream.biz_code.and_then(classify_code);
+            let by_http = upstream.code.as_number().and_then(classify_code);
+            by_biz.or(by_http).unwrap_or(ErrorClass::Hard)
         }
     }
-    match error.code().and_then(ErrCode::as_number) {
-        Some(code) => BUSY_CODES.contains(&code),
-        None => false,
+}
+
+fn classify_code(code: i64) -> Option<ErrorClass> {
+    match code {
+        402 | 2012 => Some(ErrorClass::Concurrency),
+        409 | 2011 => Some(ErrorClass::ThreadBusy),
+        429 | 1429 => Some(ErrorClass::RateLimit),
+        0 | 408 => Some(ErrorClass::Transient),
+        500..=599 => Some(ErrorClass::Transient),
+        _ => None,
     }
 }
 
-/// 是否「值得再试」的瞬态错误 —— **唯一实现**。
-///
-/// 原先这条规则在 TS 里有**三份**实现，且字面量互有出入（DEBT TD-02-05 的母体：
-/// 同一规则多处实现）。Rust 侧只有这一个。
+/// 是否「值得再试」—— `ErrorClass` 的派生谓词，**不再维护第二份码表**。
 ///
 /// ⚠️ **用户主动取消不算瞬态** —— 那种情况必须立刻结束，不能重试。
 /// 该判断由调用方负责（见 `task::is_transient`）。
 pub fn is_retryable_error(error: &LovartError) -> bool {
-    match error {
-        // 传输层（网络 / DNS / TLS / 单请求超时）一律瞬态。
-        LovartError::Transport { .. } => true,
-        LovartError::Upstream(upstream) => match upstream.code.as_number() {
-            Some(code) => is_retryable_http_status(code),
-            None => false,
-        },
-    }
+    matches!(
+        classify_error(error),
+        ErrorClass::RateLimit
+            | ErrorClass::Concurrency
+            | ErrorClass::ThreadBusy
+            | ErrorClass::Transient
+    )
 }

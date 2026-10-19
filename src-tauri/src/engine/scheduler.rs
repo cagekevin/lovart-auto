@@ -29,14 +29,15 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
 use crate::engine::download::{download_artifact, slugify, DownloadedFile};
 use crate::engine::state::{
-    clear, is_terminal, is_unfinished, new_record, row as status_row, set, slots_in_use, Clearable,
-    Job as JobKind, PersistOutcome, RecordPatch, StateStore, TaskRecord, TaskStatus,
+    clear, is_terminal, is_unfinished, new_record, reset_for_retry, row as status_row, set,
+    slots_in_use, Clearable, Job as JobKind, PersistOutcome, RecordPatch, StateStore, TaskRecord,
+    TaskStatus,
 };
 
 /// 垫图地址的补丁值：**有就给、没有就显式清空**。
@@ -51,16 +52,26 @@ fn ref_urls_of(task: &PromptTask) -> Clearable<Vec<String>> {
 }
 use crate::lovart::client::{set_mode, ClientDeps};
 use crate::lovart::contract::SendInput;
-use crate::lovart::errors::{is_busy_error, is_retryable_error, ErrType, LovartError};
+use crate::lovart::errors::{classify_error, is_retryable_error, ErrorClass, ErrType, LovartError};
 use crate::lovart::project::{send_chat_with_project, ProjectCache};
 use crate::lovart::prompt::{build_lovart_prompt, build_lovart_tool_config, PromptTask};
 use crate::lovart::task::{extract_artifacts, poll_thread, AutoConfirmDecision};
 
-/// 「服务端并发满 / thread 忙 / 限流」的退避基数：5s → 10s → 20s → 40s → 60s 封顶。
+/// 「服务端并发满 / thread 忙」的退避基数：5s → 10s → 20s → 40s → 60s 封顶。
 const BUSY_BACKOFF_BASE_MS: u64 = 5_000;
 
-/// 退避封顶（ms）。
+/// 402/409 退避封顶（ms）。
 const BUSY_BACKOFF_MAX_MS: u64 = 60_000;
+
+/// 全局任务间隔默认值（ms）。
+const TASK_INTERVAL_DEFAULT_MS: u64 = 1_000;
+
+/// 429 熔断基数 / 封顶（ms）。
+const RATE_LIMIT_BACKOFF_BASE_MS: u64 = 60_000;
+const RATE_LIMIT_BACKOFF_MAX_MS: u64 = 900_000;
+
+/// 累计限流等待告警阈值（ms）。
+const RATE_LIMIT_TOTAL_WAIT_ALERT_MS: u64 = 6 * 3600 * 1000;
 
 /// 无活可干时的空转上限（ms）。
 const IDLE_POLL_MS: u64 = 1_000;
@@ -257,6 +268,12 @@ pub struct SchedulerOptions {
     pub max_attempts: Option<u32>,
     pub max_busy_retries: Option<u32>,
     pub busy_backoff_base: Option<Duration>,
+    /// 全局任务间隔（提交，含重试）。缺省 1000ms。
+    pub task_interval: Option<Duration>,
+    /// 429 熔断基数（测试缝）。缺省 60s。
+    pub rate_limit_backoff_base: Option<Duration>,
+    /// 重置无 threadId 的 Failed 并重跑。
+    pub retry_failed: bool,
     /// 自动确认策略（全局开关 + 本批计数 + 本批许可）。
     pub auto_confirm: Arc<AutoConfirm>,
     pub log: LogFn,
@@ -277,6 +294,116 @@ struct Job {
     id: String,
 }
 
+/// 取件三态：有活 / 等多久 / 队列空。
+enum TakeOutcome {
+    Job(Job),
+    Wait(u64),
+    Empty,
+}
+
+/// 429 熔断的日志载荷（锁内只改状态，日志由 `Shared` 在锁外打）。
+struct RateLimitEvent {
+    wait: Duration,
+    level: u32,
+    total_wait: Duration,
+    alert: bool,
+}
+
+/// 全局限速闸门：**一个闸门只在一处**。
+///
+/// - `task_interval`：所有 worker 共享的提交间隔（含重试）；
+/// - `breaker_until`：429 全局熔断，期间不提交；
+/// - `on_rate_limited` / `on_success`：唯一的状态变更入口。
+struct SubmitGate {
+    last_submit_at: Option<Instant>,
+    task_interval: Duration,
+    breaker_until: Option<Instant>,
+    breaker_level: u32,
+    rate_limit_total_wait: Duration,
+    backoff_base: Duration,
+}
+
+impl SubmitGate {
+    fn new(task_interval: Duration, backoff_base: Duration) -> Self {
+        Self {
+            last_submit_at: None,
+            task_interval,
+            breaker_until: None,
+            breaker_level: 0,
+            rate_limit_total_wait: Duration::ZERO,
+            backoff_base,
+        }
+    }
+
+    /// 间隔 + 熔断，一步判定；`Err(wait_ms)` = 现在不能提交。
+    fn try_claim(&mut self, now: Instant) -> Result<(), u64> {
+        if let Some(until) = self.breaker_until {
+            let remaining = until.saturating_duration_since(now);
+            if !remaining.is_zero() {
+                return Err(remaining.as_millis() as u64);
+            }
+        }
+        if let Some(last) = self.last_submit_at {
+            let elapsed = now.saturating_duration_since(last);
+            if elapsed < self.task_interval {
+                return Err((self.task_interval - elapsed).as_millis() as u64);
+            }
+        }
+        self.last_submit_at = Some(now);
+        Ok(())
+    }
+
+    /// 只读熔断剩余（给 Recheck 用：轮询也吃 API 预算，熔断期间必须停）。
+    fn breaker_remaining(&self, now: Instant) -> u64 {
+        self.breaker_until
+            .map(|until| until.saturating_duration_since(now).as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// 锁内只改状态；日志由 `Shared` 在锁外打。
+    fn on_rate_limited(&mut self, now: Instant) -> RateLimitEvent {
+        let level = self.breaker_level + 1;
+        let wait = exponential_backoff(
+            level,
+            self.backoff_base,
+            Duration::from_millis(RATE_LIMIT_BACKOFF_MAX_MS),
+        );
+        self.breaker_until = Some(now + wait);
+        self.breaker_level = level;
+        self.rate_limit_total_wait += wait;
+        RateLimitEvent {
+            wait,
+            level,
+            total_wait: self.rate_limit_total_wait,
+            alert: self.rate_limit_total_wait
+                >= Duration::from_millis(RATE_LIMIT_TOTAL_WAIT_ALERT_MS),
+        }
+    }
+
+    /// 成功提交：只有在熔断已到期时才清零。
+    ///
+    /// ⚠️ 闸门串行化的是**认领**，不是**请求完成**：worker A 在 T 时刻 429 开熔断，
+    /// worker B 在 T-ε 认领、POST 超过 1s 才成功，会在 T+1s 调到这里。若直接清零，
+    /// 会把 A 的升级抹掉（level 永远停在 60s 不再涨）。所以熔断未到期时忽略这次成功。
+    fn on_success(&mut self, now: Instant) {
+        if self.breaker_until.is_some_and(|until| until > now) {
+            return;
+        }
+        self.breaker_level = 0;
+        self.rate_limit_total_wait = Duration::ZERO;
+        self.breaker_until = None;
+    }
+}
+
+/// 指数退避 + jitter，**唯一的公式实现**。
+///
+/// ⚠️ 先 jitter 再 `min(max)`：否则 60s/900s 的「封顶」实际会变成 78s/1170s。
+fn exponential_backoff(level: u32, base: Duration, max: Duration) -> Duration {
+    let factor = 1u32 << level.saturating_sub(1).min(20);
+    let raw = base.saturating_mul(factor);
+    Duration::from_millis(jitter(raw.as_millis() as u64)).min(max)
+}
+
 struct Ctx {
     deps: ClientDeps,
     ports: Arc<dyn Ports>,
@@ -293,6 +420,10 @@ struct Ctx {
     task_by_id: BTreeMap<String, PromptTask>,
     /// 唯一的待处理列表。**工作类型由记录的 `status` 派生**，不再分三个队列。
     queue: Vec<String>,
+    /// 全局提交闸门（间隔 + 429 熔断）。
+    gate: SubmitGate,
+    /// 排队模式是否已设置（惰性初始化，正常跑批只调 1 次）。
+    mode_ready: bool,
 }
 
 fn now_ms() -> u64 {
@@ -313,6 +444,8 @@ struct Shared {
     cancelled: Arc<AtomicBool>,
     /// 自动确认策略（全局开关 + 本批计数 + 本批许可）。
     auto_confirm: Arc<AutoConfirm>,
+    /// `set_mode` 的 once 守卫：只让一个 worker 进去，网络 I/O 不持 `Ctx` 锁。
+    mode_init: Mutex<()>,
 }
 
 impl Shared {
@@ -326,6 +459,47 @@ impl Shared {
 
     fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// 惰性设置排队模式：once 守卫，正常跑批只调 1 次。
+    fn ensure_mode(&self, deps: &ClientDeps, ports: &dyn Ports) -> Result<(), LovartError> {
+        if self.lock().mode_ready {
+            return Ok(());
+        }
+        let _guard = self
+            .mode_init
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.lock().mode_ready {
+            return Ok(());
+        }
+        ports.set_mode(deps, true)?;
+        self.lock().mode_ready = true;
+        Ok(())
+    }
+
+    /// 429：开全局熔断；日志在锁外打。
+    fn on_rate_limited(&self) {
+        let event = {
+            let mut ctx = self.lock();
+            ctx.gate.on_rate_limited(Instant::now())
+        };
+        self.log(&format!(
+            "🚧 429 限流，全局暂停 {}s（第 {} 次）",
+            event.wait.as_secs(),
+            event.level
+        ));
+        if event.alert {
+            self.log(&format!(
+                "⚠️ 累计限流等待 {} 分钟，疑似配额耗尽，建议停止并检查账户",
+                event.total_wait.as_secs() / 60
+            ));
+        }
+    }
+
+    /// 提交成功：熔断等级与累计等待归零（熔断未到期时忽略，见 `SubmitGate::on_success`）。
+    fn on_success(&self) {
+        self.lock().gate.on_success(Instant::now());
     }
 
     /// 写状态（不改变队列成员）。
@@ -350,39 +524,19 @@ impl Shared {
 
     /// 把任务置为**终态**的唯一出口。
     ///
-    /// 顺带解除其他任务的排队等待：有任务到达终态 ⇒ 服务端确实空出一个槽位
-    /// ⇒ 其他任务不必干等退避。（这是「有任务完成并发就不再满」的落点。）
+    /// **不做唤醒**：终态只改自己的记录；别的任务靠 `ready_at` + `TakeOutcome::Wait` 到期唤醒。
     fn finish(&self, id: &str, status: TaskStatus, mut patch: RecordPatch) {
         patch.status = Some(status);
         let mut ctx = self.lock();
         // 收住错误、**不吞**（理由见 `Shared::update`）。持锁期间不调 `log`，
-        // 先攒起来、放锁后再报 —— 免得 `log` 回调万一碰 `ctx` 就成了死锁。
-        let mut problems: Vec<String> = Vec::new();
-        if let Err(error) = ctx.state.update(id, patch) {
-            problems.push(format!("状态更新失败（内部 bug，请报告）：{error}"));
-        }
-        if is_terminal(status) {
-            let queued: Vec<String> = ctx.queue.clone();
-            for queued_id in queued {
-                let needs_clear = ctx
-                    .state
-                    .get(&queued_id)
-                    .is_some_and(|record| record.ready_at != 0);
-                if needs_clear {
-                    if let Err(error) = ctx.state.update(
-                        &queued_id,
-                        RecordPatch {
-                            ready_at: Some(0),
-                            ..Default::default()
-                        },
-                    ) {
-                        problems.push(format!("解除排队等待失败（内部 bug，请报告）：{error}"));
-                    }
-                }
-            }
-        }
+        // 放锁后再报 —— 免得 `log` 回调万一碰 `ctx` 就成了死锁。
+        let problem = ctx
+            .state
+            .update(id, patch)
+            .err()
+            .map(|error| format!("状态更新失败（内部 bug，请报告）：{error}"));
         drop(ctx);
-        for problem in problems {
+        if let Some(problem) = problem {
             self.log(&problem);
         }
     }
@@ -405,39 +559,22 @@ impl Shared {
         }
     }
 
-    /// 无活可干时该睡多久。
+    /// 取件。返回三态：有活 / 等多久 / 队列空。
     ///
-    /// 取「空转上限」与「最早一个等待退避的任务到期时间」的**较小者**：
-    /// 固定睡 1 秒会让 `ready_at` 只差 1ms 的任务白等满 1 秒；
-    /// 批量撞限流时每个任务都白等一秒，整批明显变慢（DEBT TD-11-03 的魔法数之一）。
-    /// 上限保留 1 秒，是为了仍能及时察觉「别的 worker 完成 → `finish` 提前解除等待」。
-    fn idle_wait_ms(&self) -> u64 {
-        let ctx = self.lock();
-        let now = now_ms();
-        let mut wait = IDLE_POLL_MS;
-        for id in &ctx.queue {
-            if let Some(record) = ctx.state.get(id) {
-                if record.ready_at > now {
-                    wait = wait.min(record.ready_at - now);
-                }
-            }
-        }
-        wait.max(1)
-    }
-
-    fn queue_is_empty(&self) -> bool {
-        self.lock().queue.is_empty()
-    }
-
-    /// 取件。返回 `None` = 暂时没有可做的活。
-    fn take_job(&self) -> Option<Job> {
+    /// 闸门只在这里：Submit 必须过 `SubmitGate`；被挡住时**跳过 Submit 继续找非 Submit 候选**，
+    /// 避免 `Redownload` / `RecheckFinal` 被饿死。
+    fn take_job(&self) -> TakeOutcome {
         let mut ctx = self.lock();
-        let now = now_ms();
+        let now_ms_value = now_ms();
         let slots = slots_in_use(&ctx.state);
         let concurrency = ctx.concurrency;
+        let now = Instant::now();
+        // 429 熔断期间，提交和轮询都停；Redownload 是 CDN 下载，不占 API 预算，不拦。
+        let breaker_wait = ctx.gate.breaker_remaining(now);
 
         // 先收集候选再决定 —— 避免在遍历时持有对 `ctx.state` 的借用。
         let mut best: Option<(usize, u32, JobKind)> = None;
+        let mut earliest_ready: Option<u64> = None;
         for (index, id) in ctx.queue.iter().enumerate() {
             let Some(record) = ctx.state.get(id) else {
                 continue;
@@ -447,11 +584,22 @@ impl Shared {
             let Some(kind) = status_row(record.status).job else {
                 continue; // `job` 为空（终态 / 提交中）残留在队列里：跳过
             };
-            if record.ready_at > now {
+            if record.ready_at > now_ms_value {
+                let remaining = record.ready_at - now_ms_value;
+                earliest_ready =
+                    Some(earliest_ready.map_or(remaining, |value| value.min(remaining)));
                 continue; // 还没到重试时间
             }
             if kind == JobKind::Submit && slots >= concurrency {
                 continue; // 提交要占槽位
+            }
+            if breaker_wait > 0
+                && matches!(
+                    kind,
+                    JobKind::Submit | JobKind::Recheck | JobKind::RecheckFinal
+                )
+            {
+                continue; // 熔断期间提交和轮询都停；Redownload 是 CDN 下载，不拦
             }
             let priority = status_row(record.status).priority;
             if best.is_none_or(|(_, best_priority, _)| priority < best_priority) {
@@ -459,7 +607,52 @@ impl Shared {
             }
         }
 
-        let (index, _, kind) = best?;
+        let Some((index, _, kind)) = best else {
+            if ctx.queue.is_empty() {
+                return TakeOutcome::Empty;
+            }
+            let wait = earliest_ready
+                .unwrap_or(IDLE_POLL_MS)
+                .min(IDLE_POLL_MS)
+                .min(if breaker_wait > 0 {
+                    breaker_wait
+                } else {
+                    u64::MAX
+                });
+            return TakeOutcome::Wait(wait.max(1));
+        };
+
+        // 提交要过全局闸门；被挡住就跳过它，继续找非 Submit 候选。
+        if kind == JobKind::Submit {
+            if let Err(wait) = ctx.gate.try_claim(now) {
+                let mut fallback: Option<(usize, u32, JobKind)> = None;
+                for (index, id) in ctx.queue.iter().enumerate() {
+                    let Some(record) = ctx.state.get(id) else {
+                        continue;
+                    };
+                    let Some(kind) = status_row(record.status).job else {
+                        continue;
+                    };
+                    if kind == JobKind::Submit || record.ready_at > now_ms_value {
+                        continue;
+                    }
+                    let priority = status_row(record.status).priority;
+                    if fallback.is_none_or(|(_, p, _)| priority < p) {
+                        fallback = Some((index, priority, kind));
+                    }
+                }
+                if let Some((index, _, kind)) = fallback {
+                    let id = ctx.queue.remove(index);
+                    return TakeOutcome::Job(Job { kind, id });
+                }
+                // 闸门挡住时，也要为「更早到期的非 Submit 任务」醒来。
+                let wait = earliest_ready
+                    .map_or(wait, |value| wait.min(value))
+                    .min(IDLE_POLL_MS);
+                return TakeOutcome::Wait(wait.max(1));
+            }
+        }
+
         let id = ctx.queue.remove(index);
         // 预占：变成**显式状态**，槽位计数随之派生 —— 不再需要 `slots_in_use += 1`
         if kind == JobKind::Submit {
@@ -471,7 +664,7 @@ impl Shared {
                 },
             );
         }
-        Some(Job { kind, id })
+        TakeOutcome::Job(Job { kind, id })
     }
 }
 
@@ -587,8 +780,8 @@ fn run_submit(worker_id: usize, id: &str, shared: &Shared) {
         task.model, task.image_size, task.aspect_ratio
     ));
 
-    // 服务端模式是持久设置，可能被别处改回 fast，所以每次提交前都重设。
-    if let Err(error) = ports.set_mode(&deps, true) {
+    // 服务端模式是持久设置：只在首次提交时惰性设置一次（once 守卫）。
+    if let Err(error) = shared.ensure_mode(&deps, ports.as_ref()) {
         handle_submit_error(worker_id, id, &error, &record, shared);
         return;
     }
@@ -624,6 +817,8 @@ fn run_submit(worker_id: usize, id: &str, shared: &Shared) {
         handle_submit_error(worker_id, id, &error, &record, shared);
         return;
     }
+    // P6：校验通过后才算真正成功，避免异常路径误清零熔断。
+    shared.on_success();
 
     // 提交成功**立刻落盘**：即使进程随后被杀，下次也能按 threadId 续轮询而不是重复提交。
     shared.update(
@@ -665,51 +860,73 @@ fn handle_submit_error(
         return;
     }
 
-    // 「服务端并发满」= **排队状态，不是失败**。按本任务累计次数退避后重投。
-    if is_busy_error(error) {
-        let busy = {
-            let ctx = shared.lock();
-            ctx.state.get(id).and_then(|r| Some(r.busy_retries)).unwrap_or(0) + 1
-        };
-        let max_busy = shared.lock().max_busy_retries;
-        if busy > max_busy {
-            shared.finish(
+    match classify_error(error) {
+        // 429 = 限流：全局熔断，**不按任务计次**。
+        ErrorClass::RateLimit => {
+            shared.on_rate_limited();
+            shared.requeue(
                 id,
-                TaskStatus::Failed,
+                TaskStatus::Pending,
+                RecordPatch {
+                    ready_at: Some(0),
+                    error: Some(Some(format!("限流，全局暂停中：{}", error_text(error)))),
+                    ..Default::default()
+                },
+            );
+            shared.log(&format!(
+                "[w{worker_id}] ⏸️ {id} 提交撞限流，回待提交，等待全局熔断"
+            ));
+            return;
+        }
+        // 402/409 = 并发满 / thread 忙：只对本任务退避，不动全局。
+        ErrorClass::Concurrency | ErrorClass::ThreadBusy => {
+            let (busy, max_busy, base) = {
+                let ctx = shared.lock();
+                (
+                    ctx.state.get(id).and_then(|r| Some(r.busy_retries)).unwrap_or(0) + 1,
+                    ctx.max_busy_retries,
+                    ctx.busy_backoff_base,
+                )
+            };
+            if busy > max_busy {
+                shared.finish(
+                    id,
+                    TaskStatus::Failed,
+                    RecordPatch {
+                        busy_retries: Some(busy),
+                        error: Some(Some(format!(
+                            "服务端持续并发满 {busy} 次，放弃：{}",
+                            error_text(error)
+                        ))),
+                        ..Default::default()
+                    },
+                );
+                shared.log(&format!(
+                    "[w{worker_id}] ❌ {id} 服务端持续并发满 {busy} 次，放弃"
+                ));
+                return;
+            }
+            let wait = exponential_backoff(busy, base, Duration::from_millis(BUSY_BACKOFF_MAX_MS));
+            shared.requeue(
+                id,
+                TaskStatus::Pending,
                 RecordPatch {
                     busy_retries: Some(busy),
+                    ready_at: Some(now_ms() + wait.as_millis() as u64),
                     error: Some(Some(format!(
-                        "服务端持续并发满 {busy} 次，放弃：{}",
+                        "服务端并发满，排队重投：{}",
                         error_text(error)
                     ))),
                     ..Default::default()
                 },
             );
-            shared.log(&format!("[w{worker_id}] ❌ {id} 服务端持续并发满 {busy} 次，放弃"));
+            shared.log(&format!(
+                "[w{worker_id}] ⏸️ {id} 服务端并发已满，{}s 后重投",
+                wait.as_secs()
+            ));
             return;
         }
-        // 按**本任务**的累计次数退避（不是全局梯度）⇒ 各任务时间天然错开，不会齐撞
-        let base_ms = shared.lock().busy_backoff_base.as_millis() as u64;
-        let backoff = BUSY_BACKOFF_MAX_MS.min(base_ms.saturating_mul(1u64 << (busy - 1).min(20)));
-        let wait_ms = jitter(backoff); // jitter：再错开一层
-        shared.requeue(
-            id,
-            TaskStatus::Pending,
-            RecordPatch {
-                busy_retries: Some(busy),
-                ready_at: Some(now_ms() + wait_ms),
-                error: Some(Some(format!(
-                    "服务端并发满，排队重投：{}",
-                    error_text(error)
-                ))),
-                ..Default::default()
-            },
-        );
-        shared.log(&format!(
-            "[w{worker_id}] ⏸️ {id} 服务端并发已满，{}s 后重投（有任务完成会提前解除）",
-            wait_ms / 1000
-        ));
-        return;
+        ErrorClass::Transient | ErrorClass::Hard => {}
     }
 
     // 提交阶段失败：按可重试性决定回到 pending 还是判失败。
@@ -984,6 +1201,38 @@ fn handle_poll_error(
         return;
     }
 
+    // 429 = 限流：开全局熔断；**不回 Pending**（会重复提交生成）。
+    if classify_error(error) == ErrorClass::RateLimit {
+        shared.on_rate_limited();
+        if is_final_sweep {
+            // 收尾只跑一轮：只落状态，不 requeue（否则可能死循环）。
+            shared.update(
+                id,
+                RecordPatch {
+                    status: Some(TaskStatus::Unresolved),
+                    ready_at: Some(0),
+                    error: Some(Some(format!("限流，全局暂停中：{}", error_text(error)))),
+                    ..Default::default()
+                },
+            );
+        } else {
+            shared.requeue(
+                id,
+                TaskStatus::Running,
+                RecordPatch {
+                    ready_at: Some(0),
+                    error: Some(Some(format!("限流，全局暂停中：{}", error_text(error)))),
+                    ..Default::default()
+                },
+            );
+        }
+        shared.log(&format!(
+            "[w{worker_id}] ⏸️ {id} 轮询撞限流，保持 {}，等待全局熔断",
+            if is_final_sweep { "unresolved" } else { "running" }
+        ));
+        return;
+    }
+
     let (attempts, max_attempts, max_timeouts) = {
         let ctx = shared.lock();
         (
@@ -1188,6 +1437,9 @@ pub fn run_scheduler(options: SchedulerOptions) -> Result<SchedulerSummary, Lova
         max_attempts,
         max_busy_retries,
         busy_backoff_base,
+        task_interval,
+        rate_limit_backoff_base,
+        retry_failed,
         auto_confirm,
         log,
         ports,
@@ -1287,6 +1539,28 @@ pub fn run_scheduler(options: SchedulerOptions) -> Result<SchedulerSummary, Lova
         }
 
         if is_terminal(existing.status) {
+            if retry_failed
+                && existing.status == TaskStatus::Failed
+                && existing.thread_id.is_none()
+            {
+                match reset_for_retry(&mut state, &task.id) {
+                    Ok(_) => {
+                        queue.push(task.id.clone());
+                        log(&format!("[retry-failed] 🔁 {} 已重置为待提交", task.id));
+                    }
+                    Err(error) => {
+                        log(&format!("[retry-failed] 重置失败（内部 bug）：{error}"));
+                    }
+                }
+            } else if retry_failed
+                && existing.status == TaskStatus::Failed
+                && existing.thread_id.is_some()
+            {
+                log(&format!(
+                    "⚠️ {} 失败但已有 threadId，跳过 --retry-failed",
+                    task.id
+                ));
+            }
             continue;
         }
 
@@ -1339,11 +1613,16 @@ pub fn run_scheduler(options: SchedulerOptions) -> Result<SchedulerSummary, Lova
         max_timeouts: max_timeouts.unwrap_or(3).max(1),
         download_retries: download_retries.unwrap_or(3).max(1),
         max_attempts: max_attempts.unwrap_or(3),
-        max_busy_retries: max_busy_retries.unwrap_or(60).max(1),
+        max_busy_retries: max_busy_retries.unwrap_or(300).max(1),
         busy_backoff_base: busy_backoff_base
             .unwrap_or(Duration::from_millis(BUSY_BACKOFF_BASE_MS)),
         task_by_id,
         queue,
+        gate: SubmitGate::new(
+            task_interval.unwrap_or(Duration::from_millis(TASK_INTERVAL_DEFAULT_MS)),
+            rate_limit_backoff_base.unwrap_or(Duration::from_millis(RATE_LIMIT_BACKOFF_BASE_MS)),
+        ),
+        mode_ready: false,
     };
     let queue_len = ctx.queue.len();
 
@@ -1362,6 +1641,7 @@ pub fn run_scheduler(options: SchedulerOptions) -> Result<SchedulerSummary, Lova
         log: Arc::clone(&log),
         cancelled,
         auto_confirm,
+        mode_init: Mutex::new(()),
     });
 
     let mut handles = Vec::new();
@@ -1420,24 +1700,21 @@ pub fn run_scheduler(options: SchedulerOptions) -> Result<SchedulerSummary, Lova
 
 fn worker_loop(worker_id: usize, shared: &Shared) {
     while !shared.is_cancelled() {
-        if let Some(job) = shared.take_job() {
-            match job.kind {
+        match shared.take_job() {
+            TakeOutcome::Job(job) => match job.kind {
                 JobKind::Submit => run_submit(worker_id, &job.id, shared),
                 JobKind::Recheck => run_recheck(worker_id, &job.id, shared),
                 // 收尾两件活（只补下载 / 兜底复查）走同一入口，进去按 `kind` 分派。
                 JobKind::Redownload | JobKind::RecheckFinal => {
                     run_final(worker_id, &job.id, job.kind, shared)
                 }
+            },
+            TakeOutcome::Wait(ms) => {
+                if sleep_or_abort(shared, Duration::from_millis(ms)).is_err() {
+                    break;
+                }
             }
-            continue;
-        }
-        // 没有可取的活：队列空就退出，否则是在等槽位/等退避，等一下再试
-        if shared.queue_is_empty() {
-            break;
-        }
-        let wait = shared.idle_wait_ms();
-        if sleep_or_abort(shared, Duration::from_millis(wait)).is_err() {
-            break;
+            TakeOutcome::Empty => break,
         }
     }
 }

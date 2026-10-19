@@ -21,19 +21,20 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use lovart_client::engine::download::DownloadedFile;
 use lovart_client::engine::scheduler::{
-    run_scheduler, Batch, Ports, RealPorts, SchedulerOptions, SchedulerSummary,
+    run_scheduler, AutoConfirm, Batch, Ports, RealPorts, SchedulerOptions, SchedulerSummary,
 };
 use lovart_client::engine::state::{normalize_state_text, NormalizedState, StateStore};
 use lovart_client::lovart::client::{ClientDeps, HttpRequest, HttpResponse, Transport};
 use lovart_client::lovart::errors::LovartError;
 use lovart_client::lovart::prompt::{parse_prompts, ParseOptions, PromptDefaults, PromptTask};
+use lovart_client::lovart::task::AutoConfirmDecision;
 
 /// 与 `run.ts` 的 `DEFAULTS` 一致 —— 黄金用例不该依赖命令行默认值漂移。
 pub fn defaults() -> PromptDefaults {
@@ -92,6 +93,9 @@ pub struct UpstreamScript {
     pub concurrency: Option<usize>,
     pub max_attempts: Option<u32>,
     pub max_busy_retries: Option<u32>,
+    pub task_interval_ms: Option<u64>,
+    pub rate_limit_backoff_ms: Option<u64>,
+    pub retry_failed: Option<bool>,
     pub max_timeouts: Option<u32>,
     /// 单任务轮询总超时（ms）；缺省 60_000。**超时用例要调小**。
     pub task_timeout_ms: Option<u64>,
@@ -112,6 +116,10 @@ pub struct ReplayTransport {
     stats: Mutex<ReplayStats>,
     thread_seq: Mutex<u32>,
     send_attempt: Mutex<usize>,
+    /// 每次 `POST /chat` 的时间戳，用于断言全局提交间隔。
+    send_times: Mutex<Vec<Instant>>,
+    /// 每次 `GET /chat/status` 的时间戳，用于断言轮询 429 后确实等了熔断。
+    poll_times: Mutex<Vec<Instant>>,
     /// **按 thread 独立**的轮询索引 —— 全局索引会让多任务互相交错，黄金就不可复现了。
     poll_index: Mutex<BTreeMap<String, usize>>,
 }
@@ -135,12 +143,22 @@ impl ReplayTransport {
             stats: Mutex::new(ReplayStats::default()),
             thread_seq: Mutex::new(0),
             send_attempt: Mutex::new(0),
+            send_times: Mutex::new(Vec::new()),
+            poll_times: Mutex::new(Vec::new()),
             poll_index: Mutex::new(BTreeMap::new()),
         }
     }
 
     pub fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
+    }
+
+    pub fn send_times(&self) -> Vec<Instant> {
+        self.send_times.lock().unwrap().clone()
+    }
+
+    pub fn poll_times(&self) -> Vec<Instant> {
+        self.poll_times.lock().unwrap().clone()
     }
 
     pub fn poll_count(&self) -> usize {
@@ -173,6 +191,7 @@ impl Transport for ReplayTransport {
             }
             "/mode/set" | "/mode/query" => Ok(ok_data(json!({}))),
             "/chat" => {
+                self.send_times.lock().unwrap().push(Instant::now());
                 self.stats.lock().unwrap().send += 1;
                 let steps = self
                     .script
@@ -206,6 +225,7 @@ impl Transport for ReplayTransport {
                 Ok(ok_data(json!({ "thread_id": format!("{prefix}-{seq}") })))
             }
             "/chat/status" => {
+                self.poll_times.lock().unwrap().push(Instant::now());
                 let mut stats = self.stats.lock().unwrap();
                 stats.poll += 1;
                 // 纪律②：预算超了就抛（非瞬态）⇒ 任务判失败、循环结束，测试**失败**而不是挂住
@@ -289,8 +309,11 @@ impl Ports for ReplayPorts {
         deps: &ClientDeps,
         thread_id: &str,
         task_timeout: Duration,
+        allow: &dyn Fn() -> AutoConfirmDecision,
+        confirmed: &AtomicUsize,
     ) -> Result<Value, LovartError> {
-        self.inner.poll(deps, thread_id, task_timeout)
+        self.inner
+            .poll(deps, thread_id, task_timeout, allow, confirmed)
     }
 
     fn extract_artifacts(&self, result: &Value) -> Result<Vec<String>, LovartError> {
@@ -324,6 +347,12 @@ pub struct FixtureRun {
     pub calls: Vec<String>,
     pub downloads: usize,
     pub summary: SchedulerSummary,
+    /// 本轮回放产生的全部日志（用于断言「🚧 限流」等文案）。
+    pub logs: Vec<String>,
+    /// 每次 `POST /chat` 的时间戳（用于断言全局提交间隔）。
+    pub send_times: Vec<Instant>,
+    /// 每次 `GET /chat/status` 的时间戳（用于断言轮询 429 后的熔断等待）。
+    pub poll_times: Vec<Instant>,
 }
 
 static SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -406,7 +435,17 @@ pub fn run_fixture(dir: &Path) -> FixtureRun {
                 download_retries: Some(1),
                 max_attempts: script.max_attempts,
                 max_busy_retries: script.max_busy_retries,
+                task_interval: script
+                    .task_interval_ms
+                    .map(Duration::from_millis)
+                    .or(Some(Duration::from_millis(1))),
+                rate_limit_backoff_base: script
+                    .rate_limit_backoff_ms
+                    .map(Duration::from_millis)
+                    .or(Some(Duration::from_millis(1))),
+                retry_failed: script.retry_failed.unwrap_or(false),
                 busy_backoff_base: Some(Duration::from_millis(1)),
+                auto_confirm: AutoConfirm::disabled(),
                 log: Arc::clone(&log),
                 ports: Some(Arc::clone(&ports)),
             })
@@ -421,6 +460,9 @@ pub fn run_fixture(dir: &Path) -> FixtureRun {
     let normalized = normalize_state_text(&state_text);
     let calls = transport.calls();
     let downloads = transport.download_count();
+    let logs = logs.lock().unwrap().clone();
+    let send_times = transport.send_times();
+    let poll_times = transport.poll_times();
     let _ = std::fs::remove_dir_all(&temp);
 
     FixtureRun {
@@ -429,6 +471,9 @@ pub fn run_fixture(dir: &Path) -> FixtureRun {
         calls,
         downloads,
         summary: summary.expect("至少跑一轮"),
+        logs,
+        send_times,
+        poll_times,
     }
 }
 

@@ -16,7 +16,9 @@
 //!   --ratio <w:h>            默认比例（默认 3:4）
 //!   --size <1K|2K|4K>        默认尺寸（默认 2K）
 //!   --max-attempts <n>       可重试失败上限（默认 3）
-//!   --max-busy-retries <n>   「服务端并发满」排队重投上限（默认 60）
+//!   --max-busy-retries <n>   402/409 重投上限（默认 300）
+//!   --task-interval-ms <n>   全局任务间隔（ms，默认 1000；0 关闭）
+//!   --retry-failed           重置无 threadId 的 Failed 并重跑
 //!   --max-timeouts <n>       累计超时多少次后释放槽位（默认 3）
 //!   --download-retries <n>   单张产物下载重试次数（默认 3）
 //!   --task-timeout <分钟>    单任务轮询总超时（默认 90）
@@ -76,6 +78,8 @@ fn known_args() -> BTreeSet<String> {
         "size",
         "max-attempts",
         "max-busy-retries",
+        "task-interval-ms",
+        "retry-failed",
         "max-timeouts",
         "download-retries",
         "task-timeout",
@@ -828,7 +832,7 @@ pub fn main_with_args(argv: &[String]) -> Result<(), String> {
     }
     let concurrency = concurrency as usize;
     let max_attempts = arg_number(&args, "max-attempts", 3.0).floor().max(1.0) as u32;
-    let max_busy_retries = arg_number(&args, "max-busy-retries", 60.0).floor().max(1.0) as u32;
+    let max_busy_retries = arg_number(&args, "max-busy-retries", 300.0).floor().max(1.0) as u32;
     let max_timeouts = arg_number(&args, "max-timeouts", 3.0).floor().max(1.0) as u32;
     let download_retries = arg_number(&args, "download-retries", 3.0).floor().max(1.0) as u32;
     let task_timeout = Duration::from_secs_f64(
@@ -837,6 +841,9 @@ pub fn main_with_args(argv: &[String]) -> Result<(), String> {
     let recheck_timeout = Duration::from_secs_f64(
         arg_number(&args, "recheck-timeout", 30.0).max(1.0) * 60.0,
     );
+    let task_interval =
+        Duration::from_millis(arg_number(&args, "task-interval-ms", 1000.0).max(0.0) as u64);
+    let retry_failed = has_arg(&args, "retry-failed");
     // 取值顺序：命令行 > `.env`（LOVART_DEFAULT_*）> 内置默认。与 GUI 设置页同一套兜底。
     let defaults = PromptDefaults {
         model: arg_string(&args, "model", &env_defaults.model),
@@ -1016,6 +1023,9 @@ pub fn main_with_args(argv: &[String]) -> Result<(), String> {
         download_retries: Some(download_retries),
         max_attempts: Some(max_attempts),
         max_busy_retries: Some(max_busy_retries),
+        task_interval: Some(task_interval),
+        rate_limit_backoff_base: None,
+        retry_failed,
         busy_backoff_base: None,
         auto_confirm: Arc::clone(&auto_confirm),
         log: Arc::new(|message: &str| log(message)),

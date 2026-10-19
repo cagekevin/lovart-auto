@@ -27,7 +27,7 @@ use serde_json::Value;
 use super::client::{confirm_thread, get_result, get_status, ClientDeps};
 use super::config::POLL_MAX_INTERVAL_MS;
 use super::contract::{as_json_array, as_string, is_truthy};
-use super::errors::{is_retryable_error, ErrType, LovartError};
+use super::errors::{classify_error, is_retryable_error, ErrorClass, ErrType, LovartError};
 
 /// 「此刻能自动确认吗」的三种答案。
 ///
@@ -172,6 +172,10 @@ pub fn poll_thread(
         let status = match get_status(deps, thread_id) {
             Ok(value) => value,
             Err(error) => {
+                // 429 必须冒到调度层开全局熔断，不能在这里自己退避。
+                if classify_error(&error) == ErrorClass::RateLimit {
+                    return Err(error);
+                }
                 // 排队任务要轮询 1 小时以上，网络抖动是常态：
                 // 瞬态错误退避后继续，**不结束任务**。
                 if !is_transient(&error, deps) {
@@ -199,6 +203,9 @@ pub fn poll_thread(
                 let second = match get_status(deps, thread_id) {
                     Ok(value) => value,
                     Err(error) => {
+                        if classify_error(&error) == ErrorClass::RateLimit {
+                            return Err(error);
+                        }
                         if !is_transient(&error, deps) {
                             return Err(error);
                         }
@@ -211,6 +218,9 @@ pub fn poll_thread(
                     let result = match get_result(deps, thread_id) {
                         Ok(value) => value,
                         Err(error) => {
+                            if classify_error(&error) == ErrorClass::RateLimit {
+                                return Err(error);
+                            }
                             if !is_transient(&error, deps) {
                                 return Err(error);
                             }

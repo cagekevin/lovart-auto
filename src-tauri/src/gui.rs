@@ -21,7 +21,7 @@ use tauri::Manager;
 
 use crate::engine::scheduler::{run_scheduler, AutoConfirm, Batch, SchedulerOptions};
 use crate::engine::state::{
-    clear, is_unfinished, row as status_row, Action, RecordPatch, StateStore, StateStoreOptions,
+    is_unfinished, row as status_row, Action, RecordPatch, StateStore, StateStoreOptions,
     TaskRecord, TaskStatus,
 };
 use crate::engine::text::{read_text, read_text_required};
@@ -671,6 +671,9 @@ fn start_run(
             download_retries: None,
             max_attempts: None,
             max_busy_retries: None,
+            task_interval: None,
+            rate_limit_backoff_base: None,
+            retry_failed: false,
             busy_backoff_base: None,
             auto_confirm,
             log: Arc::clone(&log),
@@ -927,25 +930,7 @@ fn reset_for_retry(state: &tauri::State<'_, GuiState>, id: &str) -> Result<(), S
         return Err("正在跑批，先停止再重跑（重跑要改状态文件，和跑批写的是同一个文件）".to_string());
     }
     let mut store = StateStore::open(&state.state_file()).map_err(|error| error.to_string())?;
-    store
-        .update(
-            id,
-            RecordPatch {
-                status: Some(TaskStatus::Pending),
-                attempts: Some(0),
-                timeout_count: Some(0),
-                busy_retries: Some(0),
-                ready_at: Some(0),
-                thread_id: clear(),
-                submitted_at: clear(),
-                project_id: clear(),
-                artifacts: clear(),
-                files: clear(),
-                error: clear(),
-                // ⚠️ `ref_urls` / `ref_signature` **刻意不动** —— 重跑仍要带垫图。
-                ..Default::default()
-            },
-        )
+    crate::engine::state::reset_for_retry(&mut store, id)
         .map_err(|error| format!("重置失败：{error}"))?;
     Ok(())
 }

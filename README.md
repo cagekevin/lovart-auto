@@ -76,7 +76,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/make-exe.ps1   # �
 | `--ratio <w:h>` | `LOVART_DEFAULT_RATIO` → `3:4` | 默认比例（命令行 > `.env` > 内置） |
 | `--size <1K\|2K\|4K>` | `LOVART_DEFAULT_SIZE` → `2K` | 默认尺寸档位（命令行 > `.env` > 内置），原样透传给上游 |
 | `--max-attempts <n>` | `3` | 可重试失败上限 |
-| `--max-busy-retries <n>` | `60` | 「服务端并发满」排队重投上限（≈1 小时 @60s 封顶） |
+| `--max-busy-retries <n>` | `300` | 402/409（并发满 / thread 忙）重投上限 |
+| `--task-interval-ms <n>` | `1000` | 全局任务提交间隔（ms，含重试）；`0` 关闭 |
+| `--retry-failed` | — | 重置无 threadId 的 Failed 并重跑 |
 | `--max-timeouts <n>` | `3` | 累计超时多少次后**释放槽位**转 `unresolved` |
 | `--download-retries <n>` | `3` | 单张产物下载重试次数（含首次） |
 | `--task-timeout <分钟>` | `90` | 单任务轮询总超时 |

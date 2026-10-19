@@ -424,6 +424,30 @@ pub fn slots_in_use(state: &StateStore) -> usize {
         .count()
 }
 
+/// 把一条记录重置为待提交（重跑）。**保留 `ref_urls` / `ref_signature`** —— 重跑仍要带垫图。
+///
+/// 唯一实现：GUI 的「重跑这一条」与 CLI 的 `--retry-failed` 共用。
+pub fn reset_for_retry(store: &mut StateStore, id: &str) -> Result<TaskRecord, StateError> {
+    store.update(
+        id,
+        RecordPatch {
+            status: Some(TaskStatus::Pending),
+            attempts: Some(0),
+            timeout_count: Some(0),
+            busy_retries: Some(0),
+            ready_at: Some(0),
+            thread_id: clear(),
+            submitted_at: clear(),
+            project_id: clear(),
+            artifacts: clear(),
+            files: clear(),
+            error: clear(),
+            // 刻意不动 ref_urls / ref_signature —— 重跑仍要带垫图。
+            ..Default::default()
+        },
+    )
+}
+
 // ── 记录 ──────────────────────────────────────────────────────────────
 
 /// 一条任务记录（对应 TS `TaskRecord`）。

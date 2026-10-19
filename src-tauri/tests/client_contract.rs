@@ -18,12 +18,12 @@ use serde_json::{json, Value};
 
 use lovart_client::lovart::client::{
     confirm_thread, create_project, get_result, get_status, hmac_sha256_hex, lovart_request,
-    query_mode, send_chat, set_mode, upload_file, ClientDeps, HttpRequest, HttpResponse, Method,
-    RequestBody, Transport,
+    send_chat, set_mode, upload_file, ClientDeps, HttpRequest, HttpResponse, Method, RequestBody,
+    Transport,
 };
 use lovart_client::lovart::contract::{is_truthy, normalize_send_body, SendInput};
 use lovart_client::lovart::errors::{
-    is_busy_error, is_retryable_error, is_retryable_http_status, ErrType, LovartError,
+    classify_error, is_retryable_error, ErrorClass, ErrType, LovartError,
 };
 use lovart_client::engine::scheduler::AutoConfirm;
 use lovart_client::lovart::task::{extract_artifacts, poll_thread, AutoConfirmDecision};
@@ -193,9 +193,10 @@ fn 非_2xx_时解出业务码与可读文案_而不是一坨_json() {
         "Concurrent task limit reached, please retry later",
         "文案要取 error 字段，不是把整个 JSON 塞进 message"
     );
-    assert!(
-        is_busy_error(&error),
-        "并发满必须被判成「排队」，否则会被 maxAttempts 判死"
+    assert_eq!(
+        classify_error(&error),
+        ErrorClass::Concurrency,
+        "并发满必须被判成排队，否则会被 maxAttempts 判死"
     );
 }
 
@@ -224,42 +225,58 @@ fn 传输失败是瞬态() {
     let error = get_status(&deps, "t-1").unwrap_err();
     assert!(matches!(error, LovartError::Transport { .. }));
     assert!(is_retryable_error(&error), "网络抖动必须可重试");
-    assert!(!is_busy_error(&error), "网络错不是「服务端忙」");
+    assert_eq!(classify_error(&error), ErrorClass::Transient, "网络错是瞬态");
 }
 
 // ── 重试性 / 忙码判据 ─────────────────────────────────────────────────
 
 #[test]
-fn 可重试的_http_码被钉死() {
-    for good in [0, 402, 408, 429, 500, 503, 599] {
-        assert!(is_retryable_http_status(good), "{good} 应可重试");
-    }
-    for bad in [400, 401, 403, 404, 409, 422, 600] {
-        assert!(!is_retryable_http_status(bad), "{bad} 不该可重试");
-    }
+fn 错误分类被钉死() {
+    let class = |code: u16| classify_error(&LovartError::upstream("x", code));
+    assert_eq!(class(402), ErrorClass::Concurrency);
+    assert_eq!(class(409), ErrorClass::ThreadBusy);
+    assert_eq!(class(429), ErrorClass::RateLimit);
+    assert_eq!(class(408), ErrorClass::Transient);
+    assert_eq!(class(500), ErrorClass::Transient);
+    assert_eq!(class(404), ErrorClass::Hard);
+    assert_eq!(class(0), ErrorClass::Transient);
+    assert_eq!(class(600), ErrorClass::Hard);
+    assert_eq!(
+        classify_error(&LovartError::transport("x")),
+        ErrorClass::Transient
+    );
+    // 可重试是分类的派生谓词
+    assert!(is_retryable_error(&LovartError::upstream("x", 409)));
+    assert!(!is_retryable_error(&LovartError::upstream("x", 404)));
 }
 
 #[test]
 fn 忙码表被钉死_http_码与业务码两边都查() {
     // 409 / 429 是 HTTP 码；2011 / 2012 / 1429 是信封业务码；402 两边都出现。
-    let cases: Vec<(Option<i64>, Option<i64>)> = vec![
-        (Some(402), None),
-        (Some(409), None),
-        (Some(429), None),
-        (Some(200), Some(2011)),
-        (Some(200), Some(2012)),
-        (Some(200), Some(1429)),
+    let cases: Vec<(Option<i64>, Option<i64>, ErrorClass)> = vec![
+        (Some(402), None, ErrorClass::Concurrency),
+        (Some(409), None, ErrorClass::ThreadBusy),
+        (Some(429), None, ErrorClass::RateLimit),
+        // 回归：上游在 429 响应里塞无关 code:1，不能被 biz_code 盖成 Hard
+        (Some(429), Some(1), ErrorClass::RateLimit),
+        (Some(200), Some(2011), ErrorClass::ThreadBusy),
+        (Some(200), Some(2012), ErrorClass::Concurrency),
+        (Some(200), Some(1429), ErrorClass::RateLimit),
     ];
-    for (http_code, biz_code) in cases {
+    for (http_code, biz_code, expected) in cases {
         let error = LovartError::upstream("busy", http_code.unwrap() as u16)
             .with_biz_code(biz_code);
-        assert!(
-            is_busy_error(&error),
-            "http={http_code:?} biz={biz_code:?} 应判成「排队」"
+        assert_eq!(
+            classify_error(&error),
+            expected,
+            "http={http_code:?} biz={biz_code:?}"
         );
     }
-    // 反例：普通 500 不是忙
-    assert!(!is_busy_error(&LovartError::upstream("boom", 500)));
+    // 反例：普通 500 是瞬态，不是忙
+    assert_eq!(
+        classify_error(&LovartError::upstream("boom", 500)),
+        ErrorClass::Transient
+    );
 }
 
 // ── 请求形状 ──────────────────────────────────────────────────────────
@@ -369,19 +386,6 @@ fn confirm_thread_打_chat_confirm() {
         serde_json::from_str::<Value>(text).unwrap().get("thread_id"),
         Some(&json!("t-7"))
     );
-}
-
-#[test]
-fn query_mode_是_post_带空对象() {
-    let (deps, fake) = deps_ok();
-    query_mode(&deps).unwrap();
-    let request = fake.last();
-    assert_eq!(request.method, Method::Post);
-    assert!(request.url.ends_with("/v1/openapi/mode/query"));
-    let RequestBody::Json(text) = &request.body else {
-        panic!("应为 JSON 体");
-    };
-    assert_eq!(serde_json::from_str::<Value>(text).unwrap(), json!({}));
 }
 
 // ── 上传 ──────────────────────────────────────────────────────────────

@@ -365,6 +365,9 @@ fn run_fixture(fixture: &Fixture) -> String {
             download_retries: Some(1),
             max_attempts,
             max_busy_retries,
+            task_interval: Some(Duration::from_millis(1)),
+            rate_limit_backoff_base: Some(Duration::from_millis(1)),
+            retry_failed: false,
             busy_backoff_base: Some(Duration::from_millis(1)),
             // 黄金用例录的是"默认关闭"的行为：这里必须恒关，否则回放会去真确认。
             auto_confirm: AutoConfirm::disabled(),
@@ -405,7 +408,7 @@ fn fixtures() -> Vec<Fixture> {
 /// ⚠️ **L3（迁移顺序）刻意不比** —— 退避带随机 jitter，并发下顺序天然不可复现，
 /// 比了就是造一个必然 flaky 的测试。
 #[test]
-fn golden_回放_Rust_与_TS_产出一致() {
+fn golden_回放_rust_与_ts_产出一致() {
     let all = fixtures();
     assert!(
         !all.is_empty(),
