@@ -196,11 +196,44 @@ pub fn read_auto_confirm(path: &Path) -> (bool, Option<String>) {
     }
 }
 
+/// 把一个值渲染成 `.env` 里安全的形式。
+///
+/// ⚠️ 不加引号直接写会**破坏下次解析**：`parse_value` 对未加引号的值执行
+/// `find(" #")` 截断，且以 `#` 开头的值会被当成注释。输出目录填 `my #dir`
+/// 就会在保存后被读成 `my`（`docs/plan/07` N9）。
+///
+/// 需要引号的场合：首尾空白、含 `#`、含引号。
+/// 两种引号都出现时无法安全表示 ⇒ `Err`（宁可拒绝，不写坏文件）。
+fn format_env_value(value: &str) -> Result<String, String> {
+    let needs_quotes = value != value.trim()
+        || value.contains('#')
+        || value.contains('"')
+        || value.contains('\'');
+    if !needs_quotes {
+        return Ok(value.to_string());
+    }
+    if !value.contains('"') {
+        return Ok(format!("\"{value}\""));
+    }
+    if !value.contains('\'') {
+        return Ok(format!("'{value}'"));
+    }
+    Err(format!(
+        "值「{value}」同时包含单引号和双引号，无法安全写进 .env"
+    ))
+}
+
 /// 按行更新 `.env` 里的若干键 —— **唯一写入口**（`set_auto_confirm` 与 `save_settings` 共用）。
 ///
 /// 与旧版"解析成 entries 再整体重写"的区别：**注释、空行、其它键、`export` 前缀全部原样保留**。
 /// 同名多行一律改成同一个值（不留歧义）；缺键则追加到末尾。
 pub fn update_env_keys(path: &Path, updates: &[(&str, String)]) -> Result<(), String> {
+    // 先把所有值渲染好：**任何一个写不出来，整次拒绝**，不写半截文件。
+    let prepared: Vec<(&str, String)> = updates
+        .iter()
+        .map(|(key, value)| format_env_value(value).map(|rendered| (*key, rendered)))
+        .collect::<Result<_, _>>()?;
+
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -214,7 +247,7 @@ pub fn update_env_keys(path: &Path, updates: &[(&str, String)]) -> Result<(), St
             .collect()
     };
 
-    for (key, value) in updates {
+    for (key, value) in &prepared {
         let mut found = false;
         for line in &mut lines {
             if env_line_key(line).as_deref() != Some(*key) {
@@ -323,14 +356,21 @@ pub fn resolve_connection() -> Result<Connection, String> {
 }
 
 /// 由连接构造客户端依赖。
+///
+/// 轮询参数在这里从设置填入 —— `ClientDeps::new` 保持**纯构造**（不读环境），
+/// 因为三处测试直接调它，读了 env 就依赖开发机的 `.env`。
 pub fn to_client_deps(connection: &Connection) -> Result<ClientDeps, String> {
     let transport = ReqwestTransport::new()?;
-    Ok(ClientDeps::new(
+    let mut deps = ClientDeps::new(
         connection.base_url.clone(),
         connection.access_key.clone(),
         connection.secret_key.clone(),
         std::sync::Arc::new(transport),
-    ))
+    );
+    let (settings, _) = crate::engine::settings::Settings::from_env();
+    deps.poll_interval = settings.poll_interval();
+    deps.poll_max_interval = settings.poll_max_interval();
+    Ok(deps)
 }
 
 #[cfg(test)]
@@ -468,6 +508,36 @@ mod tests {
         let text = text_of(&path);
         assert!(text.starts_with("# LOVART_AUTO_CONFIRM=true\n"));
         assert!(text.contains("\nLOVART_AUTO_CONFIRM=false"));
+    }
+
+    #[test]
+    fn e15_含井号的值加引号且能回读() {
+        let path = temp_env(Some("LOVART_ACCESS_KEY=ak\n"));
+        update_env_keys(&path, &[("LOVART_OUTPUT_DIR", "my #dir".to_string())]).unwrap();
+        let parsed = parse_dot_env(&text_of(&path));
+        let entry = parsed
+            .entries
+            .iter()
+            .find(|entry| entry.key == "LOVART_OUTPUT_DIR")
+            .expect("键应存在");
+        assert_eq!(entry.value, "my #dir", "加引号后必须原样回读");
+    }
+
+    #[test]
+    fn e16_无特殊字符不加引号() {
+        let path = temp_env(Some("LOVART_ACCESS_KEY=ak\n"));
+        update_env_keys(&path, &[("LOVART_OUTPUT_DIR", "output2".to_string())]).unwrap();
+        assert!(text_of(&path).contains("LOVART_OUTPUT_DIR=output2"));
+    }
+
+    #[test]
+    fn e17_两种引号都有则整次拒绝且不动文件() {
+        let path = temp_env(Some("LOVART_ACCESS_KEY=ak\n"));
+        let before = text_of(&path);
+        let error = update_env_keys(&path, &[("LOVART_OUTPUT_DIR", "a'b\"c".to_string())])
+            .expect_err("无法安全表示时必须拒绝");
+        assert!(error.contains("引号"), "{error}");
+        assert_eq!(text_of(&path), before, "拒绝时一个字节都不许改");
     }
 
     #[test]

@@ -32,7 +32,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use lovart_client::engine::scheduler::{
-    run_scheduler, AutoConfirm, Batch, Ports, RealPorts, SchedulerOptions,
+    run_scheduler, AutoConfirm, Batch, Ports, RealPorts, SchedulerOptions, SchedulerTuning,
 };
 use lovart_client::engine::state::{normalize_state_text, StateStore};
 use lovart_client::engine::download::DownloadedFile;
@@ -350,25 +350,37 @@ fn run_fixture(fixture: &Fixture) -> String {
             request_timeout: Duration::from_millis(5_000),
             task_timeout,
             poll_interval: Duration::from_millis(1),
+            poll_max_interval: Duration::from_millis(1),
             done_recheck: Duration::from_millis(1),
         };
+
+        // 回放要的是**确定值**：从 `SchedulerTuning::default()` 出发再逐项覆盖，
+        // 不读 `.env`（否则同一份黄金在不同机器上结果不同）。
+        let mut tuning = SchedulerTuning::default();
+        tuning.concurrency = concurrency;
+        tuning.task_timeout = task_timeout;
+        tuning.recheck_timeout = Duration::from_millis(1);
+        if let Some(value) = max_timeouts {
+            tuning.max_timeouts = value;
+        }
+        tuning.download_retries = 1;
+        if let Some(value) = max_attempts {
+            tuning.max_attempts = value;
+        }
+        if let Some(value) = max_busy_retries {
+            tuning.max_busy_retries = value;
+        }
+        tuning.task_interval = Duration::from_millis(1);
+        tuning.rate_limit_backoff_base = Duration::from_millis(1);
+        tuning.busy_backoff_base = Duration::from_millis(1);
 
         let _ = run_scheduler(SchedulerOptions {
             deps,
             batch: Batch::Declared(parsed.tasks.clone()),
             state,
             output_dir: temp.join("out"),
-            concurrency,
-            task_timeout: Some(task_timeout),
-            recheck_timeout: Some(Duration::from_millis(1)),
-            max_timeouts,
-            download_retries: Some(1),
-            max_attempts,
-            max_busy_retries,
-            task_interval: Some(Duration::from_millis(1)),
-            rate_limit_backoff_base: Some(Duration::from_millis(1)),
+            tuning,
             retry_failed: false,
-            busy_backoff_base: Some(Duration::from_millis(1)),
             // 黄金用例录的是"默认关闭"的行为：这里必须恒关，否则回放会去真确认。
             auto_confirm: AutoConfirm::disabled(),
             log: Arc::new(|_message: &str| {}),

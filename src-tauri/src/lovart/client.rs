@@ -143,6 +143,8 @@ pub struct ClientDeps {
     pub task_timeout: Duration,
     /// 轮询起始间隔。
     pub poll_interval: Duration,
+    /// 轮询退避封顶。**必须 ≥ `poll_interval`**（`poll_thread` 里还有一层防御）。
+    pub poll_max_interval: Duration,
     /// done 后复核等待。
     pub done_recheck: Duration,
 }
@@ -156,8 +158,11 @@ impl ClientDeps {
             transport,
             cancelled: Arc::new(AtomicBool::new(false)),
             request_timeout: Duration::from_millis(REQUEST_TIMEOUT_MS),
+            // ⚠️ 这两个是**内置默认**，真实值由 `to_client_deps` 从设置填入。
+            // 别在这里读环境：「纯构造」是测试确定性的前提。
             task_timeout: Duration::from_millis(super::config::TASK_TIMEOUT_MS),
             poll_interval: Duration::from_millis(super::config::POLL_INTERVAL_MS),
+            poll_max_interval: Duration::from_millis(super::config::POLL_MAX_INTERVAL_MS),
             done_recheck: Duration::from_millis(super::config::DONE_RECHECK_MS),
         }
     }

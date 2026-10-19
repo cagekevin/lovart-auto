@@ -76,18 +76,21 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/make-exe.ps1   # �
 | `--ref <路径\|URL\|data:>` | — | 参考图（图生图），可重复或用逗号分隔 |
 | `--refs-cache <file>` | `var/refs-cache.json` | 参考图 CDN 缓存（按内容哈希去重） |
 | `--no-refs-cache` | — | 不读写参考图缓存 |
-| `--concurrency <n>` | `7` | 并发任务数，**硬上限 8** |
+| `--concurrency <n>` | `LOVART_CONCURRENCY` → `7` | 并发任务数，**硬上限 8** |
 | `--model <alias>` | `LOVART_DEFAULT_MODEL` → `nano-bn-2` | 默认模型（命令行 > `.env` > 内置） |
 | `--ratio <w:h>` | `LOVART_DEFAULT_RATIO` → `3:4` | 默认比例（命令行 > `.env` > 内置） |
 | `--size <1K\|2K\|4K>` | `LOVART_DEFAULT_SIZE` → `2K` | 默认尺寸档位（命令行 > `.env` > 内置），原样透传给上游 |
-| `--max-attempts <n>` | `3` | 可重试失败上限 |
-| `--max-busy-retries <n>` | `300` | 402/409（并发满 / thread 忙）重投上限 |
-| `--task-interval-ms <n>` | `LOVART_TASK_INTERVAL_MS` → `5000` | 全局任务提交间隔（ms，含重试）；`0` 关闭。GUI「设置 → 提交间隔」改的就是它 |
+| `--max-attempts <n>` | `LOVART_MAX_ATTEMPTS` → `3` | 可重试失败上限 |
+| `--max-busy-retries <n>` | `LOVART_MAX_BUSY_RETRIES` → `300` | 402/409（并发满 / thread 忙）重投上限 |
+| `--task-interval-ms <n>` | `LOVART_TASK_INTERVAL_MS` → `5000` | 全局任务提交间隔（ms，含重试）；`0` 关闭。**上限 600000**。GUI「设置 → 提交间隔」改的就是它 |
 | `--retry-failed` | — | 重置无 threadId 的 Failed 并重跑 |
-| `--max-timeouts <n>` | `3` | 累计超时多少次后**释放槽位**转 `unresolved` |
-| `--download-retries <n>` | `3` | 单张产物下载重试次数（含首次） |
-| `--task-timeout <分钟>` | `90` | 单任务轮询总超时 |
-| `--recheck-timeout <分钟>` | `30` | 复查已超时任务时的轮询超时 |
+| `--max-timeouts <n>` | `LOVART_MAX_TIMEOUTS` → `3` | 累计超时多少次后**释放槽位**转 `unresolved` |
+| `--download-retries <n>` | `LOVART_DOWNLOAD_RETRIES` → `3` | 单张产物下载重试次数（含首次） |
+| `--task-timeout <分钟>` | `LOVART_TASK_TIMEOUT_MS` → `90` | 单任务轮询总超时 |
+| `--recheck-timeout <分钟>` | `LOVART_RECHECK_TIMEOUT_MS` → `30` | 复查已超时任务时的轮询超时 |
+
+> 上面这些键的**唯一读取点**是 `engine::settings`：GUI 设置页、CLI、调度器都从
+> 同一份 `Settings` 取默认值。`.env` 缺键用内置默认；值非法/越界 ⇒ 回退默认 + 告警。
 | `--allow-unknown-model` | — | 未知模型名只警告不终止（**默认终止**，防整批静默跑错模型） |
 | `--auto-confirm` | — | 自动确认高成本操作（**会扣积分**；每任务每批最多一次，失败转人工不重试） |
 | `--no-auto-confirm` | — | 关闭自动确认（覆盖 `.env` 的 `LOVART_AUTO_CONFIRM`） |
@@ -199,7 +202,9 @@ lovart-client --list-models            # 权威别名表，不会像文档那样
 6. **尺寸只给档位标签，不给像素。** 提示词里只写 `resolution: 2K, aspect_ratio: 3:4`，
    输出尺寸由模型自己决定。代价是**实际出图尺寸可能和档位不完全一致**（实测 `3:4 + 2K` 出 1792x2400）。
 7. **槽位必须能降下来，否则并发会被拖死。** 本地给「超时保留」设上限（`--max-timeouts`，
-   默认 3 次 = 90+30+30 分钟）就释放槽位转 `unresolved`，交给收尾兜底复查。
+   默认 3 次 = `90 + 30×3` 分钟：首次轮询 90 分 + 3 次复查各 30 分，其中收尾那次不计入
+   `timeout_count`）就释放槽位转 `unresolved`，交给收尾兜底复查。
+   **这只是「单轮」上限**：`unresolved` 会在下次运行时继续查，跨运行没有硬上限。
 8. **下载失败 ≠ 重新生成。** 生成成功时服务端槽位就已释放，此时下载失败只是网络问题：
    立即释放本地槽位，把产物 URL 记进 `state`，收尾和下次**只补下载**。
    补下载幂等（同名同大小直接复用），且**绝不覆盖**已有图（重名加 `_rN`）。

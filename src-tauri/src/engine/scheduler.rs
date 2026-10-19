@@ -63,9 +63,6 @@ const BUSY_BACKOFF_BASE_MS: u64 = 5_000;
 /// 402/409 退避封顶（ms）。
 const BUSY_BACKOFF_MAX_MS: u64 = 60_000;
 
-/// 全局任务间隔默认值（ms）。1s 对上游偏密（429 明显变多），默认放到 5s。
-pub(crate) const TASK_INTERVAL_DEFAULT_MS: u64 = 5_000;
-
 /// 429 熔断基数 / 封顶（ms）。
 const RATE_LIMIT_BACKOFF_BASE_MS: u64 = 60_000;
 const RATE_LIMIT_BACKOFF_MAX_MS: u64 = 900_000;
@@ -255,23 +252,64 @@ impl AutoConfirm {
     }
 }
 
+/// 调度器的全部可调数值 —— **一处定义，两个入口共用**。
+///
+/// 为什么不是一个字段一个字段地摊在 [`SchedulerOptions`] 里：
+/// 原先 `run.rs` 与 `gui.rs` 各写一份
+/// `SchedulerOptions { task_timeout: …, recheck_timeout: …, /* ×11 */ }`，
+/// 加字段必漏一边（`docs/plan/07` R1-6）。收进一个结构体后，构造点只多一行 `tuning`。
+///
+/// ⚠️ 不要给它加 `Default` 就顺手给 `SchedulerOptions` 也加 —— 后者有
+/// `state` / `batch` / `deps`，没有合理默认值，加了就会有人跑出一个空批次。
+#[derive(Debug, Clone)]
+pub struct SchedulerTuning {
+    pub concurrency: usize,
+    pub task_timeout: Duration,
+    pub recheck_timeout: Duration,
+    pub max_timeouts: u32,
+    pub download_retries: u32,
+    pub max_attempts: u32,
+    pub max_busy_retries: u32,
+    /// 全局任务间隔（提交，含重试）。
+    pub task_interval: Duration,
+    /// 「服务端并发满 / thread 忙」的退避基数（测试缝）。
+    pub busy_backoff_base: Duration,
+    /// 429 熔断基数（测试缝）。
+    pub rate_limit_backoff_base: Duration,
+}
+
+impl Default for SchedulerTuning {
+    fn default() -> Self {
+        // 用 `Settings::default()` 而不是读环境：测试要确定，生产走 `from_settings`。
+        Self::from_settings(&crate::engine::settings::Settings::default())
+    }
+}
+
+impl SchedulerTuning {
+    /// 从一份**已解析**的设置得到调参。测试可传构造出来的 `Settings`，不碰真实 `.env`。
+    pub fn from_settings(settings: &crate::engine::settings::Settings) -> Self {
+        Self {
+            concurrency: settings.concurrency,
+            task_timeout: settings.task_timeout(),
+            recheck_timeout: settings.recheck_timeout(),
+            max_timeouts: settings.max_timeouts,
+            download_retries: settings.download_retries,
+            max_attempts: settings.max_attempts,
+            max_busy_retries: settings.max_busy_retries,
+            task_interval: settings.task_interval(),
+            busy_backoff_base: Duration::from_millis(BUSY_BACKOFF_BASE_MS),
+            rate_limit_backoff_base: Duration::from_millis(RATE_LIMIT_BACKOFF_BASE_MS),
+        }
+    }
+}
+
 pub struct SchedulerOptions {
     pub deps: ClientDeps,
     pub batch: Batch,
     pub state: StateStore,
     pub output_dir: PathBuf,
-    pub concurrency: usize,
-    pub task_timeout: Option<Duration>,
-    pub recheck_timeout: Option<Duration>,
-    pub max_timeouts: Option<u32>,
-    pub download_retries: Option<u32>,
-    pub max_attempts: Option<u32>,
-    pub max_busy_retries: Option<u32>,
-    pub busy_backoff_base: Option<Duration>,
-    /// 全局任务间隔（提交，含重试）。缺省 5000ms。
-    pub task_interval: Option<Duration>,
-    /// 429 熔断基数（测试缝）。缺省 60s。
-    pub rate_limit_backoff_base: Option<Duration>,
+    /// 全部可调数值（并发 / 超时 / 次数 / 退避基数）。
+    pub tuning: SchedulerTuning,
     /// 重置无 threadId 的 Failed 并重跑。
     pub retry_failed: bool,
     /// 自动确认策略（全局开关 + 本批计数 + 本批许可）。
@@ -1429,6 +1467,15 @@ pub fn run_scheduler(options: SchedulerOptions) -> Result<SchedulerSummary, Lova
         batch,
         mut state,
         output_dir,
+        tuning,
+        retry_failed,
+        auto_confirm,
+        log,
+        ports,
+    } = options;
+
+    // 解构进 `Ctx` 的扁平字段：`ctx.task_timeout` 那十几处引用一行都不用改。
+    let SchedulerTuning {
         concurrency,
         task_timeout,
         recheck_timeout,
@@ -1439,11 +1486,7 @@ pub fn run_scheduler(options: SchedulerOptions) -> Result<SchedulerSummary, Lova
         busy_backoff_base,
         task_interval,
         rate_limit_backoff_base,
-        retry_failed,
-        auto_confirm,
-        log,
-        ports,
-    } = options;
+    } = tuning;
 
     let mut queue: Vec<String> = Vec::new();
     let mut param_changed = 0usize;
@@ -1606,22 +1649,18 @@ pub fn run_scheduler(options: SchedulerOptions) -> Result<SchedulerSummary, Lova
         state,
         output_dir,
         concurrency,
-        task_timeout: task_timeout.unwrap_or(Duration::from_millis(
-            crate::lovart::config::TASK_TIMEOUT_MS,
-        )),
-        recheck_timeout: recheck_timeout.unwrap_or(Duration::from_secs(30 * 60)),
-        max_timeouts: max_timeouts.unwrap_or(3).max(1),
-        download_retries: download_retries.unwrap_or(3).max(1),
-        max_attempts: max_attempts.unwrap_or(3),
-        max_busy_retries: max_busy_retries.unwrap_or(300).max(1),
-        busy_backoff_base: busy_backoff_base
-            .unwrap_or(Duration::from_millis(BUSY_BACKOFF_BASE_MS)),
+        // 值已由 `SchedulerTuning` 兜过底（Settings 层 + Default），这里不再 unwrap_or：
+        // 多一层兜底 = 多一份默认值 = 迟早和上面对不上。
+        task_timeout,
+        recheck_timeout,
+        max_timeouts: max_timeouts.max(1),
+        download_retries: download_retries.max(1),
+        max_attempts,
+        max_busy_retries: max_busy_retries.max(1),
+        busy_backoff_base,
         task_by_id,
         queue,
-        gate: SubmitGate::new(
-            task_interval.unwrap_or(Duration::from_millis(TASK_INTERVAL_DEFAULT_MS)),
-            rate_limit_backoff_base.unwrap_or(Duration::from_millis(RATE_LIMIT_BACKOFF_BASE_MS)),
-        ),
+        gate: SubmitGate::new(task_interval, rate_limit_backoff_base),
         mode_ready: false,
     };
     let queue_len = ctx.queue.len();

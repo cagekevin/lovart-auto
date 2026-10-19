@@ -29,6 +29,7 @@ use serde_json::{json, Value};
 use lovart_client::engine::download::DownloadedFile;
 use lovart_client::engine::scheduler::{
     run_scheduler, AutoConfirm, Batch, Ports, RealPorts, SchedulerOptions, SchedulerSummary,
+    SchedulerTuning,
 };
 use lovart_client::engine::state::{normalize_state_text, NormalizedState, StateStore};
 use lovart_client::lovart::client::{ClientDeps, HttpRequest, HttpResponse, Transport};
@@ -427,24 +428,38 @@ pub fn run_fixture(dir: &Path) -> FixtureRun {
                 batch: Batch::Declared(tasks.clone()),
                 state,
                 output_dir: output_dir.clone(),
-                // 缺省 1：顺序执行 ⇒ 完全可复现。要测并发才调大。
-                concurrency: script.concurrency.unwrap_or(1),
-                task_timeout: script.task_timeout_ms.map(Duration::from_millis),
-                recheck_timeout: Some(Duration::from_millis(1)),
-                max_timeouts: script.max_timeouts,
-                download_retries: Some(1),
-                max_attempts: script.max_attempts,
-                max_busy_retries: script.max_busy_retries,
-                task_interval: script
-                    .task_interval_ms
-                    .map(Duration::from_millis)
-                    .or(Some(Duration::from_millis(1))),
-                rate_limit_backoff_base: script
-                    .rate_limit_backoff_ms
-                    .map(Duration::from_millis)
-                    .or(Some(Duration::from_millis(1))),
+                tuning: {
+                    // 从确定默认出发，再按脚本逐项覆盖；**不读 `.env`**，
+                    // 否则同一份脚本在不同机器上结果不同。
+                    let mut tuning = SchedulerTuning::default();
+                    // 缺省 1：顺序执行 ⇒ 完全可复现。要测并发才调大。
+                    tuning.concurrency = script.concurrency.unwrap_or(1);
+                    if let Some(ms) = script.task_timeout_ms {
+                        tuning.task_timeout = Duration::from_millis(ms);
+                    }
+                    tuning.recheck_timeout = Duration::from_millis(1);
+                    if let Some(value) = script.max_timeouts {
+                        tuning.max_timeouts = value;
+                    }
+                    tuning.download_retries = 1;
+                    if let Some(value) = script.max_attempts {
+                        tuning.max_attempts = value;
+                    }
+                    if let Some(value) = script.max_busy_retries {
+                        tuning.max_busy_retries = value;
+                    }
+                    tuning.task_interval = script
+                        .task_interval_ms
+                        .map(Duration::from_millis)
+                        .unwrap_or(Duration::from_millis(1));
+                    tuning.rate_limit_backoff_base = script
+                        .rate_limit_backoff_ms
+                        .map(Duration::from_millis)
+                        .unwrap_or(Duration::from_millis(1));
+                    tuning.busy_backoff_base = Duration::from_millis(1);
+                    tuning
+                },
                 retry_failed: script.retry_failed.unwrap_or(false),
-                busy_backoff_base: Some(Duration::from_millis(1)),
                 auto_confirm: AutoConfirm::disabled(),
                 log: Arc::clone(&log),
                 ports: Some(Arc::clone(&ports)),

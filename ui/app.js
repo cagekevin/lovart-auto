@@ -1629,46 +1629,101 @@ function renderDefaultSelects(value) {
   sizeBox.value = value.defaultSize || SIZES[0];
 }
 
+/**
+ * 设置项里的数字：**留空发 `null`**，不替用户补默认。
+ *
+ * 后端对 `null` 返回「不能为空」；前端悄悄补 7 / 5000 / "output" 会让
+ * 「并发填 0 却变成 7」这类静默改写永远无法被用户发现（docs/plan/07 N11）。
+ * 非数字发原串，让后端报「必须是整数」——比前端猜一个数诚实。
+ */
+function numberOrNull(input) {
+  const raw = input.value.trim();
+  if (raw === '') return null;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : raw;
+}
+
+/**
+ * 只读提示 + 告警。**文本与数字全部来自后端**（含 `maxWallClockMin`）：
+ * 前端不做 `timeout + recheck * n` 这种时间算术（06 契约 2.1 同一口径）。
+ *
+ * 用 `textContent` 而不是 `innerHTML`：告警里可能带 `.env` 原文（用户填的值），
+ * 拼进 HTML 就是注入。
+ */
+function renderSettingsNote(warnings, maxWallClockMin) {
+  const lines = [];
+  if (Number.isFinite(maxWallClockMin)) {
+    lines.push(
+      `新任务单轮上限 ≈ ${maxWallClockMin} 分（单任务超时 + 复查超时 × 超时次数）。` +
+        '超时不会重新提交，也不会重复扣费。',
+    );
+  }
+  for (const warning of warnings || []) {
+    lines.push(`⚠️ ${warning}`);
+  }
+  const box = $('settingsNote');
+  box.textContent = lines.join('\n');
+  box.hidden = lines.length === 0;
+}
+
 async function openSettings() {
   const value = await loadSettings();
   if (value) {
+    // 后端给的都是**已换算好的显示单位**（秒 / 分钟 / 次），这里直接填。
     $('setAccessKey').value = value.accessKey || '';
     $('setSecretKey').value = value.secretKey || '';
-    $('setConcurrency').value = value.concurrency || 7;
-    // 后端以毫秒为准，界面按秒显示（保留一位小数，1.5s 不会被抹成 2s）。
-    const intervalMs = Number.isFinite(value.taskIntervalMs) ? value.taskIntervalMs : 5000;
-    $('setTaskInterval').value = Math.round(intervalMs / 100) / 10;
-    $('setOutput').value = value.outputDir || 'output';
+    $('setConcurrency').value = value.concurrency;
+    $('setTaskInterval').value = value.taskIntervalSec;
+    $('setOutput').value = value.outputDir || '';
+    $('setTaskTimeout').value = value.taskTimeoutMin;
+    $('setRecheckTimeout').value = value.recheckTimeoutMin;
+    $('setMaxAttempts').value = value.maxAttempts;
+    $('setMaxTimeouts').value = value.maxTimeouts;
+    $('setMaxBusyRetries').value = value.maxBusyRetries;
+    $('setDownloadRetries').value = value.downloadRetries;
+    $('setPollInterval').value = value.pollIntervalSec;
+    $('setPollMaxInterval').value = value.pollMaxIntervalSec;
     renderDefaultSelects(value);
+    renderSettingsNote(value.warnings, value.maxWallClockMin);
   }
   openMask('maskSettings');
 }
 
 async function saveSettings() {
-  // 间隔留空 ⇒ 用默认 5s（而不是悄悄变成 0 = 关闭节流）。
-  const intervalRaw = $('setTaskInterval').value.trim();
-  const intervalSeconds = intervalRaw === '' ? 5 : Number(intervalRaw);
   const payload = {
     accessKey: $('setAccessKey').value.trim(),
     secretKey: $('setSecretKey').value.trim(),
-    concurrency: Number($('setConcurrency').value) || 7,
-    taskIntervalMs: Number.isFinite(intervalSeconds)
-      ? Math.round(Math.max(0, intervalSeconds) * 1000)
-      : 5000,
-    outputDir: $('setOutput').value.trim() || 'output',
+    concurrency: numberOrNull($('setConcurrency')),
+    taskIntervalSec: numberOrNull($('setTaskInterval')),
+    outputDir: $('setOutput').value.trim(),
+    taskTimeoutMin: numberOrNull($('setTaskTimeout')),
+    recheckTimeoutMin: numberOrNull($('setRecheckTimeout')),
+    maxAttempts: numberOrNull($('setMaxAttempts')),
+    maxTimeouts: numberOrNull($('setMaxTimeouts')),
+    maxBusyRetries: numberOrNull($('setMaxBusyRetries')),
+    downloadRetries: numberOrNull($('setDownloadRetries')),
+    pollIntervalSec: numberOrNull($('setPollInterval')),
+    pollMaxIntervalSec: numberOrNull($('setPollMaxInterval')),
     defaultModel: $('setDefaultModel').value,
     defaultRatio: $('setDefaultRatio').value.trim(),
     defaultSize: $('setDefaultSize').value,
   };
+  let result;
   try {
-    await invoke('save_settings', { payload });
+    result = await invoke('save_settings', { payload });
   } catch (error) {
-    // 校验失败（非法模型/比例/尺寸）原样透传：**不落盘、界面不变**，用户看得见原因。
+    // 校验失败原样透传：**不落盘、界面不变**，用户看得见原因。
     notice(`保存失败：${error}`);
     return;
   }
-  // 保存成功后立刻把兜底参数用起来（后端已 `reload_dot_env`，无需重启）。
+  // 后端已 `reload_dot_env`：兜底参数立刻用起来，无需重启。
   applyDefaultSettings(payload);
+  // 保存成功但带告警（reload 失败 / 已修复非法值）⇒ **不关面板**，就地说明。
+  if (result && Array.isArray(result.warnings) && result.warnings.length > 0) {
+    renderSettingsNote(result.warnings, result.maxWallClockMin);
+    notice('设置已保存，但有告警需要看一眼');
+    return;
+  }
   closeMask('maskSettings');
 }
 

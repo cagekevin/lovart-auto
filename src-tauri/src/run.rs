@@ -44,9 +44,12 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::cli::{arg_list, arg_number, arg_string, has_arg, parse_args, ParsedArgs};
+use crate::cli::{arg_list, arg_number_opt, arg_string, has_arg, parse_args, ParsedArgs};
 use crate::engine::refs::{load_refs_cache, read_ref_inputs, refs_signature, save_refs_cache};
-use crate::engine::scheduler::{run_scheduler, AutoConfirm, SchedulerOptions, SchedulerSummary};
+use crate::engine::scheduler::{
+    run_scheduler, AutoConfirm, SchedulerOptions, SchedulerSummary, SchedulerTuning,
+};
+use crate::engine::settings::{self, Settings};
 use crate::engine::state::{
     is_not_done, row as status_row, Action, StateStore, TaskRecord, TaskStatus, STATUS_TABLE,
 };
@@ -55,9 +58,6 @@ use crate::lovart::client::{query_mode, set_mode, ClientDeps};
 use crate::lovart::connection::{load_dot_env, read_auto_confirm, resolve_connection, to_client_deps};
 use crate::lovart::models::MODEL_SPECS;
 use crate::lovart::prompt::{parse_prompts, ParseOptions, PromptDefaults, PromptTask};
-
-/// 服务端最多同时 8 个任务；硬编码上限，避免配错把自己打死。
-const HARD_MAX_CONCURRENCY: usize = 8;
 
 /// 允许的参数名。**必须与文件头的用法注释一致** ——
 /// 多写会放过拼错的参数，少写会把合法参数当未知而报错。
@@ -889,44 +889,56 @@ pub fn main_with_args(argv: &[String]) -> Result<(), String> {
     // 因此它们**仍然不需要** `.env`；`--check` / `--dry-run` 会读，因为它们要报告
     // "真正会用的默认值" —— 报告内置值而实际跑 `.env` 值，等于让自检结果说谎。
     load_dot_env(&cwd.join(".env"))?;
-    let (env_defaults, default_warnings) = PromptDefaults::from_env();
-    for warning in &default_warnings {
+    // **唯一读取点**：数值设置与兜底参数一次读完（`.env` 已在本函数前半段载入）。
+    let (current, settings_warnings) = Settings::from_env();
+    for warning in &settings_warnings {
         eprintln!("⚠️ {warning}");
     }
 
-    let concurrency = arg_number(&args, "concurrency", 7.0).floor();
-    if !(1.0..=HARD_MAX_CONCURRENCY as f64).contains(&concurrency) {
-        return Err(format!(
-            "--concurrency 必须在 1..{HARD_MAX_CONCURRENCY} 之间（服务端最多同时 {HARD_MAX_CONCURRENCY} 个任务）"
-        ));
+    // 调参：默认全部来自设置；命令行只覆盖**显式给出**的项。
+    // 不再写 `arg_number(&args, key, 3.0)` —— 那等于把默认值搬进 CLI 层。
+    let mut tuning = SchedulerTuning::from_settings(&current);
+    if let Some(value) = arg_number_opt(&args, "concurrency") {
+        let value = value.floor();
+        if !(1.0..=settings::MAX_CONCURRENCY as f64).contains(&value) {
+            return Err(format!(
+                "--concurrency 必须在 1..{} 之间（服务端最多同时 {} 个任务）",
+                settings::MAX_CONCURRENCY, settings::MAX_CONCURRENCY
+            ));
+        }
+        tuning.concurrency = value as usize;
     }
-    let concurrency = concurrency as usize;
-    let max_attempts = arg_number(&args, "max-attempts", 3.0).floor().max(1.0) as u32;
-    let max_busy_retries = arg_number(&args, "max-busy-retries", 300.0).floor().max(1.0) as u32;
-    let max_timeouts = arg_number(&args, "max-timeouts", 3.0).floor().max(1.0) as u32;
-    let download_retries = arg_number(&args, "download-retries", 3.0).floor().max(1.0) as u32;
-    let task_timeout = Duration::from_secs_f64(
-        arg_number(&args, "task-timeout", 90.0).max(1.0) * 60.0,
-    );
-    let recheck_timeout = Duration::from_secs_f64(
-        arg_number(&args, "recheck-timeout", 30.0).max(1.0) * 60.0,
-    );
-    // 缺省跟随设置（`.env` 的 LOVART_TASK_INTERVAL_MS），再退到内置默认。
-    // `.env` 已在本函数前半段载入 ⇒ 这里读到的就是设置页保存的值。
-    let env_interval_ms = std::env::var("LOVART_TASK_INTERVAL_MS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|value| *value <= 600_000)
-        .unwrap_or(crate::engine::scheduler::TASK_INTERVAL_DEFAULT_MS);
-    let task_interval = Duration::from_millis(
-        arg_number(&args, "task-interval-ms", env_interval_ms as f64).max(0.0) as u64,
-    );
+    if let Some(value) = arg_number_opt(&args, "max-attempts") {
+        tuning.max_attempts = value.floor().max(1.0) as u32;
+    }
+    if let Some(value) = arg_number_opt(&args, "max-busy-retries") {
+        tuning.max_busy_retries = value.floor().max(1.0) as u32;
+    }
+    if let Some(value) = arg_number_opt(&args, "max-timeouts") {
+        tuning.max_timeouts = value.floor().max(1.0) as u32;
+    }
+    if let Some(value) = arg_number_opt(&args, "download-retries") {
+        tuning.download_retries = value.floor().max(1.0) as u32;
+    }
+    // CLI 对外以「分钟」为单位（`--task-timeout 90`），运行时/落盘统一用 ms。
+    if let Some(value) = arg_number_opt(&args, "task-timeout") {
+        tuning.task_timeout = Duration::from_secs_f64(value.max(1.0) * 60.0);
+    }
+    if let Some(value) = arg_number_opt(&args, "recheck-timeout") {
+        tuning.recheck_timeout = Duration::from_secs_f64(value.max(1.0) * 60.0);
+    }
+    if let Some(value) = arg_number_opt(&args, "task-interval-ms") {
+        // 与设置页同一道上限（R2-4：原先 CLI 没有上限，和 GUI 已经漂移）。
+        tuning.task_interval = Duration::from_millis(
+            (value.max(0.0) as u64).min(settings::MAX_TASK_INTERVAL_MS),
+        );
+    }
     let retry_failed = has_arg(&args, "retry-failed");
     // 取值顺序：命令行 > `.env`（LOVART_DEFAULT_*）> 内置默认。与 GUI 设置页同一套兜底。
     let defaults = PromptDefaults {
-        model: arg_string(&args, "model", &env_defaults.model),
-        aspect_ratio: arg_string(&args, "ratio", &env_defaults.aspect_ratio),
-        image_size: arg_string(&args, "size", &env_defaults.image_size),
+        model: arg_string(&args, "model", &current.default_model),
+        aspect_ratio: arg_string(&args, "ratio", &current.default_ratio),
+        image_size: arg_string(&args, "size", &current.default_size),
     };
 
     // 1. 提示词（dry-run 不需要凭据，所以放在最前面）
@@ -1026,13 +1038,14 @@ pub fn main_with_args(argv: &[String]) -> Result<(), String> {
         "===== 批次开始：{}（{} 条，并发 {}）=====",
         prompts_file.display(),
         tasks.len(),
-        concurrency
+        tuning.concurrency
     ));
     log(&format!(
         "单任务超时 {} 分，复查超时 {} 分，重试上限 {} 次；日志 {}",
-        task_timeout.as_secs() / 60,
-        recheck_timeout.as_secs() / 60,
-        max_attempts,
+        // 保留一位小数：`--task-timeout 90.5` 不能被显示成 90。
+        tuning.task_timeout.as_secs_f64() / 60.0,
+        tuning.recheck_timeout.as_secs_f64() / 60.0,
+        tuning.max_attempts,
         log_file.display()
     ));
 
@@ -1094,17 +1107,8 @@ pub fn main_with_args(argv: &[String]) -> Result<(), String> {
         batch: crate::engine::scheduler::Batch::Declared(tasks.clone()),
         state,
         output_dir: output_dir.clone(),
-        concurrency,
-        task_timeout: Some(task_timeout),
-        recheck_timeout: Some(recheck_timeout),
-        max_timeouts: Some(max_timeouts),
-        download_retries: Some(download_retries),
-        max_attempts: Some(max_attempts),
-        max_busy_retries: Some(max_busy_retries),
-        task_interval: Some(task_interval),
-        rate_limit_backoff_base: None,
+        tuning,
         retry_failed,
-        busy_backoff_base: None,
         auto_confirm: Arc::clone(&auto_confirm),
         log: Arc::new(|message: &str| log(message)),
         ports: None,

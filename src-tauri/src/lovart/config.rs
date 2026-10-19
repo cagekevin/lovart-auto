@@ -28,6 +28,10 @@ pub const DONE_RECHECK_MS: u64 = 5_000;
 /// ⚠️ **超时 ≠ 失败**：调度层会释放 worker、把任务记为 `timeout` 留待复查，
 /// **绝不重新提交**。排队任务通常 30 分钟以上、最长不超过 1.5 小时，
 /// 所以取上限本身，不留缓冲（留了也只是让 worker 干等）。
+///
+/// ⚠️ 这只是 `ClientDeps::new` 的**内置默认**（纯构造，不读环境）。
+/// 真正生效的值在 `engine::settings`（`LOVART_TASK_TIMEOUT_MS`），
+/// 经 `SchedulerOptions.tuning` 传入调度器 —— 别在这里改它来调超时。
 pub const TASK_TIMEOUT_MS: u64 = 90 * 60 * 1000;
 
 /// 单次 HTTP 请求超时（ms）：60 秒。与任务总超时分离，避免一次查询挂住整个任务。

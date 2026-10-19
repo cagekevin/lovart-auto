@@ -25,7 +25,6 @@ use std::time::Duration;
 use serde_json::Value;
 
 use super::client::{confirm_thread, get_result, get_status, ClientDeps};
-use super::config::POLL_MAX_INTERVAL_MS;
 use super::contract::{as_json_array, as_string, is_truthy};
 use super::errors::{classify_error, is_retryable_error, ErrorClass, ErrType, LovartError};
 
@@ -164,7 +163,9 @@ pub fn poll_thread(
     allow: &dyn Fn() -> AutoConfirmDecision,
     confirmed: &AtomicUsize,
 ) -> Result<Value, LovartError> {
-    let max_interval = Duration::from_millis(POLL_MAX_INTERVAL_MS);
+    // 运行层防御：配置层已经把倒挂抬平，但 `ClientDeps` 是 pub，测试/未来调用方
+    // 可能直接构造出 `max < interval` ⇒ 退避永远不增长（`09` 契约 N12）。
+    let max_interval = deps.poll_max_interval.max(deps.poll_interval);
     let deadline = std::time::Instant::now() + deps.task_timeout;
     let mut interval = deps.poll_interval;
 

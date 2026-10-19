@@ -1418,6 +1418,54 @@ select:focus { border-color: var(--ink); }
 
 .form-input:focus { border-color: var(--ink); background: var(--bg); }
 
+/* ── 设置面板分组 ────────────────────────────────────────────────────
+   18 项平铺会让「保存」被顶出屏幕；分四组 + 高级折叠 + 可滚动。
+   分组标题占满整行（`.form` 是两列 grid）。 */
+.form-section {
+  grid-column: 1 / -1;
+  margin-top: var(--sp-3);
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--line);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--ink-2);
+}
+
+.form-section:first-child {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
+/* 字段下方的补充说明（输出目录那条） */
+.form-hint {
+  grid-column: 1 / -1;
+  margin: calc(-1 * var(--sp-2)) 0 0;
+}
+
+.form-advanced {
+  grid-column: 1 / -1;
+  border-top: 1px dashed var(--line);
+  padding-top: var(--sp-2);
+}
+
+.form-advanced > summary {
+  cursor: pointer;
+  font-size: var(--fs-xs);
+  color: var(--ink-3);
+  padding: var(--sp-1) 0;
+}
+
+.form-advanced[open] > summary { margin-bottom: var(--sp-2); }
+
+#maskSettings .dialog-body {
+  max-height: 62vh;
+  overflow-y: auto;
+}
+
+/* 告警多行显示；用 textContent 写入，不解析 HTML */
+#settingsNote { white-space: pre-line; }
+
 /* 设置里的下拉：占满整行。全局 `select` 规则带 148–220px 的宽度上下限
    （那是给工具栏用的，防止长模型名把一行顶开），表单里必须放开。 */
 .form select.form-input {

@@ -124,6 +124,30 @@ pub fn arg_number(args: &ParsedArgs, key: &str, fallback: f64) -> f64 {
     }
 }
 
+/// 只在**显式给出且合法**时返回 `Some`；没写 / 写错都是 `None`。
+///
+/// 为什么需要它：`arg_number(args, key, 默认值)` 一定返回一个数，
+/// 调用方为了拿默认值就得在 CLI 层再写一份默认值 —— 那正是
+/// 「GUI 一套、CLI 一套」的重复来源（`docs/plan/07` R1-6）。
+/// 用本函数 + `SchedulerTuning::from_settings()`，默认值只在设置层存在。
+///
+/// 写错（`--task-timeout abc`）会往 stderr 打一条告警：**不阻断**（与既有
+/// `arg_number` 的宽容一致），但不再无声。
+pub fn arg_number_opt(args: &ParsedArgs, key: &str) -> Option<f64> {
+    let raw = args.values.get(key)?.last()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match trimmed.parse::<f64>() {
+        Ok(parsed) if parsed.is_finite() => Some(parsed),
+        _ => {
+            eprintln!("⚠️ --{key} 的值「{trimmed}」不是数字，已忽略（改用 .env / 内置默认）");
+            None
+        }
+    }
+}
+
 /// 展平一个**可重复**的参数，并支持逗号分隔：`--ref a,b --ref c` → `['a','b','c']`。
 ///
 /// 去空、去重（保序）—— 参考图重复给出没有意义，还会白白多算一次上传。

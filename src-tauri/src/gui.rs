@@ -19,7 +19,10 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 use tauri::Manager;
 
-use crate::engine::scheduler::{run_scheduler, AutoConfirm, Batch, SchedulerOptions};
+use crate::engine::scheduler::{
+    run_scheduler, AutoConfirm, Batch, SchedulerOptions, SchedulerTuning,
+};
+use crate::engine::settings::{self, Settings};
 use crate::engine::state::{
     is_unfinished, row as status_row, Action, RecordPatch, StateStore, StateStoreOptions,
     TaskRecord, TaskStatus,
@@ -29,10 +32,7 @@ use crate::lovart::connection::{
     load_dot_env, read_auto_confirm, reload_dot_env, resolve_connection, to_client_deps,
     update_env_keys, AUTO_CONFIRM_KEY,
 };
-use crate::lovart::prompt::{
-    parse_prompts, ParseOptions, PromptDefaults, DEFAULT_MODEL_KEY, DEFAULT_RATIO_KEY,
-    DEFAULT_SIZE_KEY,
-};
+use crate::lovart::prompt::{parse_prompts, ParseOptions, PromptDefaults};
 use crate::run::build_status_json;
 
 /// 运行中的一个批次。
@@ -188,38 +188,6 @@ pub struct GuiState {
     alerts: Mutex<Vec<String>>,
 }
 
-/// 输出文件夹名（设置里可改，住在 `.env`）。
-fn output_dir_name() -> String {
-    std::env::var("LOVART_OUTPUT_DIR")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "output".to_string())
-}
-
-/// 并发数（设置里可改）。
-///
-/// 硬上限 **8** —— 服务端最多同时 8 个任务，配大了只会换来 402。
-fn concurrency() -> usize {
-    std::env::var("LOVART_CONCURRENCY")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| (1..=8).contains(value))
-        .unwrap_or(7)
-}
-
-/// 全局提交间隔（设置里可改，毫秒）。`0` = 关闭间隔。
-///
-/// 默认 5s：1s 对上游偏密，429 明显变多。上限 10 分钟，避免误填一个巨大的数
-/// 让整批看起来"卡死"。
-fn task_interval_ms() -> u64 {
-    std::env::var("LOVART_TASK_INTERVAL_MS")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|value| *value <= 600_000)
-        .unwrap_or(crate::engine::scheduler::TASK_INTERVAL_DEFAULT_MS)
-}
-
 impl GuiState {
     pub fn new(cwd: PathBuf) -> Self {
         // 自动确认开关只认 `.env`（不读进程环境变量）。非法值 / 读失败 ⇒ 关 + 一条告警。
@@ -243,9 +211,10 @@ impl GuiState {
         if let Some(warning) = auto_confirm_warning {
             state.push_alert(&warning);
         }
-        // 兜底参数（模型/比例/尺寸）的非法值：**启动就说**，否则用户会以为设置生效了。
-        let (_, default_warnings) = PromptDefaults::from_env();
-        for warning in default_warnings {
+        // 设置里的非法值（兜底参数 + 新增的 8 个键）：**启动就说**，
+        // 否则用户会以为设置生效了。此刻 `from_env` ≈ 文件（`load_dot_env` 刚跑完）。
+        let (_, settings_warnings) = Settings::from_env();
+        for warning in settings_warnings {
             state.push_alert(&warning);
         }
         state
@@ -305,7 +274,10 @@ impl GuiState {
     }
 
     fn output_dir(&self) -> PathBuf {
-        self.cwd.join(output_dir_name())
+        // 1Hz 的 `get_state` 会调它：读环境（微秒级），不读盘。
+        // 手改 `.env` 的目录要等点「开始」才统一（N19）—— 这里刻意不跟文件，
+        // 否则每秒做一次磁盘 I/O。
+        self.cwd.join(Settings::from_env().0.output_dir)
     }
 
     /// 记一条**批次级**告警（用户必须看到的事）。
@@ -531,7 +503,12 @@ fn start_run(
         }
     };
 
-    load_dot_env(&state.cwd.join(".env"))?;
+    // ⚠️ 必须是 `reload_dot_env`（覆盖语义）：`load_dot_env` 对已经载入过的键是**空操作**，
+    // 用户手改 `.env` 后点「开始」仍会用旧值（`docs/plan/07` N1）。
+    reload_dot_env(&state.cwd.join(".env"))?;
+    // 设置以**文件**为准，与设置页同一个入口（N7）。本批用一个快照，跑批中不再读。
+    let (current_settings, settings_warnings) = Settings::from_file(&state.cwd.join(".env"))
+        .map_err(|error| format!("读不了 .env：{error}"))?;
     let connection = resolve_connection()?;
     let deps = to_client_deps(&connection)?;
     let cancelled = Arc::clone(&deps.cancelled);
@@ -558,7 +535,7 @@ fn start_run(
     crate::engine::runlog::line(&format!(
         "===== 批次开始：{label}（{} 条，并发 {}）=====",
         ids.len(),
-        concurrency()
+        current_settings.concurrency
     ));
 
     {
@@ -580,7 +557,8 @@ fn start_run(
     let app_for_thread = app.clone();
     std::thread::spawn(move || {
         let state_file = cwd.join("var/state.jsonl");
-        let output_dir = cwd.join(output_dir_name());
+        // 用本批的**设置快照**，不重新读环境：跑批中途改设置不该影响当前批次。
+        let output_dir = cwd.join(&current_settings.output_dir);
         let report_file = cwd.join("var/report.csv");
 
         // 参考图：与 CLI **同一条路径**（本机路径读盘 → CDN → 写回 task.refs）。
@@ -670,23 +648,19 @@ fn start_run(
         };
 
         let auto_for_count = Arc::clone(&auto_confirm);
+        // `.env` 的告警在跑批日志里也说一遍：手改坏了但没重启时，这是唯一的线索。
+        for warning in &settings_warnings {
+            log(&format!("⚠️ {warning}"));
+        }
         let result = run_scheduler(SchedulerOptions {
             deps,
             batch,
             state: state_store,
             // 留一份给收尾的 `write_report`（它要把记录里的相对路径拼成绝对路径）
             output_dir: output_dir.clone(),
-            concurrency: concurrency(),
-            task_timeout: None,
-            recheck_timeout: None,
-            max_timeouts: None,
-            download_retries: None,
-            max_attempts: None,
-            max_busy_retries: None,
-            task_interval: Some(std::time::Duration::from_millis(task_interval_ms())),
-            rate_limit_backoff_base: None,
+            // 本批的全部可调数值：**一次性**从设置快照来，跑批中不再读环境。
+            tuning: SchedulerTuning::from_settings(&current_settings),
             retry_failed: false,
-            busy_backoff_base: None,
             auto_confirm,
             log: Arc::clone(&log),
             ports: None,
@@ -1349,30 +1323,31 @@ fn open_output_dir(state: tauri::State<'_, GuiState>) -> Result<(), String> {
 /// 用户以为密钥丢了（DEBT TD-05-19）。
 #[tauri::command]
 fn get_settings(state: tauri::State<'_, GuiState>) -> Result<Value, String> {
-    let text = read_text(&state.cwd.join(".env"))
-        .map_err(|error| format!("读不了 .env：{error}"))?
-        .unwrap_or_default();
-    let parsed = crate::lovart::connection::parse_dot_env(&text);
-    let find = |key: &str| {
-        parsed
-            .entries
-            .iter()
-            .find(|entry| entry.key == key)
-            .map(|entry| entry.value.clone())
-            .unwrap_or_default()
-    };
-    // 兜底参数给**生效值**（缺键/非法值已经在内置默认上兜过），不是 `.env` 里的原文：
-    // 设置页显示的就是"下一次解析真正会用到的值"。
-    let (defaults, _) = PromptDefaults::from_env();
+    // **读文件**，不读进程环境（`docs/plan/07` N7）：
+    // 手改 `.env` 后打开设置页，若读环境会显示旧值，用户一点保存就把手改覆盖掉。
+    // 设置页显示 = 文件内容 = 点「开始」后的生效值（`start_run` 会 reload）。
+    let (current, warnings) = Settings::from_file(&state.cwd.join(".env"))?;
     Ok(json!({
-        "accessKey": find("LOVART_ACCESS_KEY"),
-        "secretKey": find("LOVART_SECRET_KEY"),
-        "concurrency": concurrency(),
-        "taskIntervalMs": task_interval_ms(),
-        "outputDir": output_dir_name(),
-        "defaultModel": defaults.model,
-        "defaultRatio": defaults.aspect_ratio,
-        "defaultSize": defaults.image_size,
+        "accessKey": current.access_key,
+        "secretKey": current.secret_key,
+        "concurrency": current.concurrency,
+        // 秒/分钟是**后端换算好**的：前端不做任何 `*1000` / `*60`。
+        "taskIntervalSec": settings::ms_to_seconds(current.task_interval_ms),
+        "outputDir": current.output_dir,
+        "taskTimeoutMin": settings::ms_to_minutes(current.task_timeout_ms),
+        "recheckTimeoutMin": settings::ms_to_minutes(current.recheck_timeout_ms),
+        "maxAttempts": current.max_attempts,
+        "maxTimeouts": current.max_timeouts,
+        "maxBusyRetries": current.max_busy_retries,
+        "downloadRetries": current.download_retries,
+        "pollIntervalSec": current.poll_interval_ms / 1000,
+        "pollMaxIntervalSec": current.poll_max_interval_ms / 1000,
+        "defaultModel": current.default_model,
+        "defaultRatio": current.default_ratio,
+        "defaultSize": current.default_size,
+        // 「单轮最长」也由后端算：前端插值显示即可。
+        "maxWallClockMin": current.max_wall_clock_min(),
+        "warnings": warnings,
     }))
 }
 
@@ -1380,69 +1355,45 @@ fn get_settings(state: tauri::State<'_, GuiState>) -> Result<Value, String> {
 ///
 /// ⚠️ 读失败**绝不能兜底成空**：那会把用户的配置整个冲掉（DEBT TD-05-19）。
 #[tauri::command]
-fn save_settings(state: tauri::State<'_, GuiState>, payload: Value) -> Result<(), String> {
+fn save_settings(state: tauri::State<'_, GuiState>, payload: Value) -> Result<Value, String> {
     let path = state.cwd.join(".env");
     let _guard = state
         .env_lock
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let mut updates: Vec<(&str, String)> = Vec::new();
-    if let Some(value) = payload.get("accessKey").and_then(Value::as_str) {
-        updates.push(("LOVART_ACCESS_KEY", value.trim().to_string()));
+
+    // 先读**文件当前值**：差异写靠它（N8），非法键修复也靠它（N16）。
+    let (current, file_warnings) = Settings::from_file(&path)?;
+    // 校验先行：任何一项非法 ⇒ `Err`，下面一个字都不写（不做部分保存）。
+    let updates = settings::save_updates(&payload, &current)?;
+    if !updates.is_empty() {
+        let borrowed: Vec<(&str, String)> = updates
+            .iter()
+            .map(|(key, value)| (*key, value.clone()))
+            .collect();
+        update_env_keys(&path, &borrowed)?;
     }
-    if let Some(value) = payload.get("secretKey").and_then(Value::as_str) {
-        updates.push(("LOVART_SECRET_KEY", value.trim().to_string()));
-    }
-    // 并发数 / 输出文件夹也落进 `.env` —— 它们是**真在用的**（见 `concurrency()` / `output_dir_name()`），
-    // 不是只显示不生效的装饰。
-    if let Some(value) = payload.get("concurrency").and_then(Value::as_u64) {
-        updates.push(("LOVART_CONCURRENCY", value.clamp(1, 8).to_string()));
-    }
-    // 提交间隔：0 允许（= 关闭），上限 10 分钟。与 `task_interval_ms()` 的过滤范围一致。
-    if let Some(value) = payload.get("taskIntervalMs").and_then(Value::as_u64) {
-        updates.push((
-            "LOVART_TASK_INTERVAL_MS",
-            value.min(600_000).to_string(),
+
+    // ⚠️ 必须是 `reload_dot_env` 而不是 `load_dot_env`：后者是「不覆盖」语义，
+    // 而 `GuiState::new` 启动时已经载入过一次 ⇒ 用它会**整段跳过**
+    // —— 文件改了、运行时还用旧值（DEBT TD-05-11）。
+    //
+    // reload 失败**不回滚、不返回 Err**：盘已经改了，报错会让用户以为没保存而反复点。
+    let mut warnings = file_warnings;
+    if let Err(error) = reload_dot_env(&path) {
+        warnings.push(format!(
+            "已写入 .env，但重新载入失败：{error}；请重启后再跑"
         ));
     }
-    if let Some(value) = payload.get("outputDir").and_then(Value::as_str) {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            updates.push(("LOVART_OUTPUT_DIR", trimmed.to_string()));
-        }
-    }
-    // 兜底参数：三个一组。**先校验、后写盘** —— 非法值一旦落进 `.env`，
-    // 解析器只会退回内置默认并告警，用户会以为"设置保存成功但没生效"。
-    if ["defaultModel", "defaultRatio", "defaultSize"]
-        .iter()
-        .any(|key| payload.get(*key).is_some())
-    {
-        let (current, _) = PromptDefaults::from_env();
-        let text_of = |key: &str, fallback: &str| {
-            payload
-                .get(key)
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or(fallback)
-                .to_string()
-        };
-        let validated = PromptDefaults::validated(
-            &text_of("defaultModel", &current.model),
-            &text_of("defaultRatio", &current.aspect_ratio),
-            &text_of("defaultSize", &current.image_size),
-        )?;
-        updates.push((DEFAULT_MODEL_KEY, validated.model));
-        updates.push((DEFAULT_RATIO_KEY, validated.aspect_ratio));
-        updates.push((DEFAULT_SIZE_KEY, validated.image_size));
-    }
-    update_env_keys(&path, &updates)?;
-    // 写回后立刻**重载**（覆盖），免得这一轮还用着旧凭据。
-    // ⚠️ 必须是 `reload_dot_env` 而不是 `load_dot_env`：后者是「不覆盖」语义
-    // （刻意让真实环境变量优先），而 `GuiState::new` 启动时已经载入过一次
-    // ⇒ 用它会**整段跳过** —— 文件改了、运行时还用旧密钥（DEBT TD-05-11）。
-    reload_dot_env(&path)?;
-    Ok(())
+    // 保存后重算「单轮上限」：前端据此刷新只读提示，**不让前端自己算**（N17）。
+    let max_wall_clock_min = Settings::from_file(&path)
+        .map(|(saved, _)| saved.max_wall_clock_min())
+        .unwrap_or_else(|_| current.max_wall_clock_min());
+    Ok(json!({
+        "warnings": warnings,
+        "updated": updates.len(),
+        "maxWallClockMin": max_wall_clock_min,
+    }))
 }
 
 /// 切换全局自动确认开关 —— **唯一的写入口**（顶栏 chip 用它）。
