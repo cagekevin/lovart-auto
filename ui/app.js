@@ -18,7 +18,22 @@ const { invoke } = window.__TAURI__.core;
 
 // ── 常量 ─────────────────────────────────────────────────────────────
 
+// 主界面分段控件：只放最常用的四个，再多会把工具条挤到换行。
 const RATIOS = ['1:1', '3:4', '4:3', '16:9'];
+// 设置页兜底比例的下拉候选：横竖版都覆盖。解析器本身接受任意 `w:h`，
+// 这里只是把常用值列全，省得用户去猜能填什么。
+const RATIO_CHOICES = [
+  '1:1',
+  '4:3',
+  '3:4',
+  '16:9',
+  '9:16',
+  '3:2',
+  '2:3',
+  '21:9',
+  '5:4',
+  '4:5',
+];
 const SIZES = ['1K', '2K', '4K'];
 
 /**
@@ -338,10 +353,11 @@ async function refreshBoard() {
 
   const signature = boardSignature(data);
   if (signature === lastSignature) {
-    // 结构没变 ⇒ 只把「已跑多久」原地改掉
+    // 结构没变 ⇒ 只把「已跑多久」原地改掉。
+    // `stateSinceText` 只有生产中的任务才有值；变 null 时靠签名（含 status）重建整卡。
     for (const node of document.querySelectorAll('[data-elapsed]')) {
       const task = (data.tasks || []).find((item) => item.id === node.dataset.elapsed);
-      if (task) node.textContent = `已持续 ${task.stateSinceText || '—'}`;
+      if (task && task.stateSinceText) node.textContent = `已持续 ${task.stateSinceText}`;
     }
     return;
   }
@@ -528,11 +544,10 @@ function taskCard(task) {
   actions.appendChild(moreButton(task, first ? first.file : null));
   head.appendChild(actions);
 
-  // 右侧一列：状态行 + 提示词 + 时间（+「已跑多久」）。
+  // 右侧一列：状态行 + 提示词（时间统一由下面的「事实行」说，不再单开一行）。
   const main = el('div', 'task-main');
   main.appendChild(head);
   main.appendChild(el('div', 'task-prompt', task.prompt));
-  main.appendChild(el('div', 'task-time', formatTime(task.submittedAt || task.updatedAt)));
 
   // ── 事实行：这一条任务的**真实数据** ────────────────────────────────
   //
@@ -543,18 +558,18 @@ function taskCard(task) {
   //    转的永远不是进度，只会看着像卡住。单条能给的真话是下面这几格。
   const facts = el('div', 'task-facts');
 
-  // ① 时间 —— **只有没结束的才"走"**。
+  // ① 时间 —— **只有正在生产（`active`）才"走"**。
   //
-  // ⚠️ 原先不问状态一律显示 `已持续 X`：已完成的任务照样一分一秒往上加，
-  //    看起来像「还在跑」（2026-10-01 实测反馈）。
-  //    `已持续` 的含义是"这条**当前状态**从何时开始" —— 对终态就是"结束到现在多久"，
-  //    那不是用户要的信息。终态给**静态的结束时刻**。
-  //    判据用 Rust 下发的 `group`（`finished` = 终态），前端不判状态。
+  // ⚠️ `stateSinceText` 由 Rust 按 `task_group` 派生：active 才有值，其余是 null。
+  //    前端不再判 `'—'`，也不判"哪些状态该计时" —— 那两份判断都在 `run.rs` 一处。
+  // · active   ⇒ `已持续 X`（每秒原地更新，见 `[data-elapsed]`）
+  // · finished ⇒ `结束 MM-DD HH:MM`（静态绝对时刻）
+  // · queued / waiting ⇒ 无时间格（没开始生产 / 停住等人，都不该有"持续"）
   if (task.group === 'finished') {
     if (task.stateSince) {
       facts.appendChild(el('span', 'fact', `结束 ${formatTime(task.stateSince)}`));
     }
-  } else if (task.stateSinceText && task.stateSinceText !== '—') {
+  } else if (task.stateSinceText) {
     const since = el('span', 'fact', `已持续 ${task.stateSinceText}`);
     // data-elapsed：刷新时**原地**改这一格，不必重建整块 DOM
     since.dataset.elapsed = task.id;
@@ -879,9 +894,11 @@ async function copyPrompt(text) {
 function formatTime(iso) {
   if (!iso) return '';
   const date = new Date(iso);
-  if (Number.isNaN(date.getTime())) return String(iso);
+  // 与 CLI 的 `format_clock` 同口径：解析不了就写「未知」，不把原始串丢给用户。
+  if (Number.isNaN(date.getTime())) return '未知';
   const pad = (value) => String(value).padStart(2, '0');
-  return `${date.getMonth() + 1}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  // 与 CLI 的 `format_clock` 同格式：`MM-DD HH:MM`（月份也补零）。
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
 /**
@@ -1587,15 +1604,20 @@ function renderDefaultSelects(value) {
   const model = value.defaultModel || models[0]?.alias || '';
   modelBox.value = model;
 
-  // 比例：自由输入 + 常用值建议（解析器接受任意 w:h，下拉会把用户锁死在四种里）。
-  const ratioOptions = $('ratioOptions');
-  clear(ratioOptions);
-  for (const ratio of RATIOS) {
-    const option = el('option');
+  // 比例：与模型/尺寸同款下拉。`.env` 里手改的非常用值（如 7:5）补一项，
+  // 否则下拉会"跳回第一个"，看起来像设置丢了。
+  const ratioBox = $('setDefaultRatio');
+  clear(ratioBox);
+  const currentRatio = value.defaultRatio || draft.ratio;
+  const ratioChoices = RATIO_CHOICES.includes(currentRatio)
+    ? RATIO_CHOICES
+    : [...RATIO_CHOICES, currentRatio];
+  for (const ratio of ratioChoices) {
+    const option = el('option', '', ratio);
     option.value = ratio;
-    ratioOptions.appendChild(option);
+    ratioBox.appendChild(option);
   }
-  $('setDefaultRatio').value = value.defaultRatio || draft.ratio;
+  ratioBox.value = currentRatio;
 
   const sizeBox = $('setDefaultSize');
   clear(sizeBox);
@@ -1613,6 +1635,9 @@ async function openSettings() {
     $('setAccessKey').value = value.accessKey || '';
     $('setSecretKey').value = value.secretKey || '';
     $('setConcurrency').value = value.concurrency || 7;
+    // 后端以毫秒为准，界面按秒显示（保留一位小数，1.5s 不会被抹成 2s）。
+    const intervalMs = Number.isFinite(value.taskIntervalMs) ? value.taskIntervalMs : 5000;
+    $('setTaskInterval').value = Math.round(intervalMs / 100) / 10;
     $('setOutput').value = value.outputDir || 'output';
     renderDefaultSelects(value);
   }
@@ -1620,10 +1645,16 @@ async function openSettings() {
 }
 
 async function saveSettings() {
+  // 间隔留空 ⇒ 用默认 5s（而不是悄悄变成 0 = 关闭节流）。
+  const intervalRaw = $('setTaskInterval').value.trim();
+  const intervalSeconds = intervalRaw === '' ? 5 : Number(intervalRaw);
   const payload = {
     accessKey: $('setAccessKey').value.trim(),
     secretKey: $('setSecretKey').value.trim(),
     concurrency: Number($('setConcurrency').value) || 7,
+    taskIntervalMs: Number.isFinite(intervalSeconds)
+      ? Math.round(Math.max(0, intervalSeconds) * 1000)
+      : 5000,
     outputDir: $('setOutput').value.trim() || 'output',
     defaultModel: $('setDefaultModel').value,
     defaultRatio: $('setDefaultRatio').value.trim(),

@@ -208,6 +208,18 @@ fn concurrency() -> usize {
         .unwrap_or(7)
 }
 
+/// 全局提交间隔（设置里可改，毫秒）。`0` = 关闭间隔。
+///
+/// 默认 5s：1s 对上游偏密，429 明显变多。上限 10 分钟，避免误填一个巨大的数
+/// 让整批看起来"卡死"。
+fn task_interval_ms() -> u64 {
+    std::env::var("LOVART_TASK_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value <= 600_000)
+        .unwrap_or(crate::engine::scheduler::TASK_INTERVAL_DEFAULT_MS)
+}
+
 impl GuiState {
     pub fn new(cwd: PathBuf) -> Self {
         // 自动确认开关只认 `.env`（不读进程环境变量）。非法值 / 读失败 ⇒ 关 + 一条告警。
@@ -671,7 +683,7 @@ fn start_run(
             download_retries: None,
             max_attempts: None,
             max_busy_retries: None,
-            task_interval: None,
+            task_interval: Some(std::time::Duration::from_millis(task_interval_ms())),
             rate_limit_backoff_base: None,
             retry_failed: false,
             busy_backoff_base: None,
@@ -1356,6 +1368,7 @@ fn get_settings(state: tauri::State<'_, GuiState>) -> Result<Value, String> {
         "accessKey": find("LOVART_ACCESS_KEY"),
         "secretKey": find("LOVART_SECRET_KEY"),
         "concurrency": concurrency(),
+        "taskIntervalMs": task_interval_ms(),
         "outputDir": output_dir_name(),
         "defaultModel": defaults.model,
         "defaultRatio": defaults.aspect_ratio,
@@ -1384,6 +1397,13 @@ fn save_settings(state: tauri::State<'_, GuiState>, payload: Value) -> Result<()
     // 不是只显示不生效的装饰。
     if let Some(value) = payload.get("concurrency").and_then(Value::as_u64) {
         updates.push(("LOVART_CONCURRENCY", value.clamp(1, 8).to_string()));
+    }
+    // 提交间隔：0 允许（= 关闭），上限 10 分钟。与 `task_interval_ms()` 的过滤范围一致。
+    if let Some(value) = payload.get("taskIntervalMs").and_then(Value::as_u64) {
+        updates.push((
+            "LOVART_TASK_INTERVAL_MS",
+            value.min(600_000).to_string(),
+        ));
     }
     if let Some(value) = payload.get("outputDir").and_then(Value::as_str) {
         let trimmed = value.trim();

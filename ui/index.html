@@ -17,7 +17,8 @@
   编一个百分比就是把不知道的数字写成肯定句。
   也**不留任何"转圈"式装饰动画**：转的永远不是进度，只会看着像卡住。
   单条能回答的是**事实行**（见 `app.js` 的 `.task-facts`）：现在在哪一步、
-  这个状态已持续多久、试了几次、产物叫什么 —— 全是真值，一个猜的数字都没有。
+  正在生产的那几条跑了多久（排队/待确认不计时）、试了几次、产物叫什么
+  —— 全是真值，一个猜的数字都没有。
 -->
 <svg class="svg-defs" aria-hidden="true">
   <symbol id="i-img" viewBox="0 0 24 24">
@@ -265,6 +266,10 @@
         <input class="form-input" id="setSecretKey" type="password" autocomplete="off" />
         <label class="form-label" for="setConcurrency">并发数</label>
         <input class="form-input" id="setConcurrency" type="number" min="1" max="8" />
+        <label class="form-label" for="setTaskInterval">提交间隔（秒）</label>
+        <!-- 全局节流：任意两次提交（含重试）至少隔这么久。0 = 不间隔；
+             改完对**下一次开始**生效（正在跑的批次不打断）。 -->
+        <input class="form-input" id="setTaskInterval" type="number" min="0" max="600" step="0.1" />
         <label class="form-label" for="setOutput">输出文件夹</label>
         <input class="form-input" id="setOutput" />
         <!-- 兜底参数：提示词没写 model / ratio / size 时才用（判定只有一个地方：
@@ -272,16 +277,15 @@
         <label class="form-label" for="setDefaultModel">兜底模型</label>
         <select class="form-input" id="setDefaultModel"></select>
         <label class="form-label" for="setDefaultRatio">兜底比例</label>
-        <!-- 用 input + datalist 而不是 select：解析器接受任意 `w:h`（如 9:16 / 2:3），
-             下拉只列常用的几个会把用户锁死在四种里。非法值由保存时的后端校验拦下。 -->
-        <input class="form-input" id="setDefaultRatio" list="ratioOptions" placeholder="3:4" />
-        <datalist id="ratioOptions"></datalist>
+        <!-- 与模型/尺寸同款下拉（外观一致）：候选是常用比例；`.env` 里手改的非常用值
+             由 `renderDefaultSelects` 补一项，不会被吞掉。 -->
+        <select class="form-input" id="setDefaultRatio"></select>
         <label class="form-label" for="setDefaultSize">兜底尺寸</label>
         <select class="form-input" id="setDefaultSize"></select>
       </div>
       <p class="note">
         提示词里没写 model / ratio / size 时，用上面三个值兜底；命令行 --model / --ratio /
-        --size 仍然优先。
+        --size 仍然优先。提交间隔改完对下一次开始生效（正在跑的批次不受影响）。
       </p>
       <p class="note" id="settingsNote" hidden></p>
     </div>

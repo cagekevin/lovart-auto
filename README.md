@@ -42,7 +42,12 @@ make app                    # → 仓库根目录下的 lovart.app
 
 **Windows 上的正式交付形态是仓库根下的 `lovart-client.exe`**（`scripts/make-exe.ps1` 生成）：
 
+**一键打包（推荐）**：双击仓库根的 `build-win.bat`。它会先检查 `lovart-client.exe` 是否还在运行
+（占用时提示先关闭，**不替你杀进程**，免得中断正在跑的任务），再调用同一个 `make-exe.ps1`；
+失败时窗口停住，错误不会一闪而过。
+
 ```powershell
+.\build-win.bat                                                              # 双击等价
 powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/make-exe.ps1   # 或：make win
 ```
 
@@ -77,7 +82,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/make-exe.ps1   # �
 | `--size <1K\|2K\|4K>` | `LOVART_DEFAULT_SIZE` → `2K` | 默认尺寸档位（命令行 > `.env` > 内置），原样透传给上游 |
 | `--max-attempts <n>` | `3` | 可重试失败上限 |
 | `--max-busy-retries <n>` | `300` | 402/409（并发满 / thread 忙）重投上限 |
-| `--task-interval-ms <n>` | `1000` | 全局任务提交间隔（ms，含重试）；`0` 关闭 |
+| `--task-interval-ms <n>` | `LOVART_TASK_INTERVAL_MS` → `5000` | 全局任务提交间隔（ms，含重试）；`0` 关闭。GUI「设置 → 提交间隔」改的就是它 |
 | `--retry-failed` | — | 重置无 threadId 的 Failed 并重跑 |
 | `--max-timeouts <n>` | `3` | 累计超时多少次后**释放槽位**转 `unresolved` |
 | `--download-retries <n>` | `3` | 单张产物下载重试次数（含首次） |
@@ -214,6 +219,7 @@ lovart-client --list-models            # 权威别名表，不会像文档那样
 lovart 自动/
 ├── lovart.app/           macOS 应用包（`make app` 生成，**不进版本库**）
 ├── lovart-client.exe     Windows 单文件交付（`make win` 生成，**不进版本库**）
+├── build-win.bat         一键打包（双击即用；调用 scripts/make-exe.ps1）
 ├── src-tauri/            唯一实现（Rust）：GUI 与无头 CLI 是**同一个二进制**
 │   ├── src/
 │   │   ├── main.rs             双击 = GUI；带参数 = 无头 CLI

@@ -17,7 +17,7 @@
 //!   --size <1K|2K|4K>        默认尺寸（默认 2K）
 //!   --max-attempts <n>       可重试失败上限（默认 3）
 //!   --max-busy-retries <n>   402/409 重投上限（默认 300）
-//!   --task-interval-ms <n>   全局任务间隔（ms，默认 1000；0 关闭）
+//!   --task-interval-ms <n>   全局任务间隔（ms，缺省跟随 .env / 设置页，兜底 5000；0 关闭）
 //!   --retry-failed           重置无 threadId 的 Failed 并重跑
 //!   --max-timeouts <n>       累计超时多少次后释放槽位（默认 3）
 //!   --download-retries <n>   单张产物下载重试次数（默认 3）
@@ -48,8 +48,7 @@ use crate::cli::{arg_list, arg_number, arg_string, has_arg, parse_args, ParsedAr
 use crate::engine::refs::{load_refs_cache, read_ref_inputs, refs_signature, save_refs_cache};
 use crate::engine::scheduler::{run_scheduler, AutoConfirm, SchedulerOptions, SchedulerSummary};
 use crate::engine::state::{
-    is_not_done, is_unfinished, row as status_row, Action, StateStore, TaskRecord, TaskStatus,
-    STATUS_TABLE,
+    is_not_done, row as status_row, Action, StateStore, TaskRecord, TaskStatus, STATUS_TABLE,
 };
 use crate::lovart::attachments::resolve_attachments;
 use crate::lovart::client::{query_mode, set_mode, ClientDeps};
@@ -133,10 +132,6 @@ fn log(message: &str) {
     // 同一条文案同时进 `var/run.log`（未绑定时是空操作）。
     // **终端会消失，文件不会** —— 挂机排查靠的就是后者。
     crate::engine::runlog::line(message);
-}
-
-fn now_iso() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 /// 启动 SIGINT 处理器：置全局标志，由 watcher 同步给调度器。
@@ -350,6 +345,37 @@ pub(crate) fn is_board_open(status: TaskStatus) -> bool {
     task_group(status) != "finished"
 }
 
+/// 「**正在生产**已持续多久」—— 只有 `active` 组才有值。
+///
+/// ── 为什么必须收在这里 ────────────────────────────────────────────
+/// 界面要的是「这条开始动了多久」，而 `stateSinceText` 原先对**所有**状态都下发
+/// ⇒ 排队中（还没提交）也在跳秒，完成后还在涨。判据就是 [`task_group`]，
+/// **不另写状态清单**，也不在 JS/CLI 各判一次。
+///
+/// 旧记录没有 `stateSince` ⇒ `format_elapsed` 返回 `"—"` ⇒ 这里转成 `None`（不显示），
+/// 而不是让界面显示「已持续 —」。
+fn elapsed_text(status: TaskStatus, state_since: Option<&str>) -> Option<String> {
+    if task_group(status) != "active" {
+        return None;
+    }
+    let text = format_elapsed(state_since);
+    (text != "—").then_some(text)
+}
+
+/// 绝对时刻 `MM-DD HH:MM`（与前端 `formatTime` 同格式）；解析不了 ⇒ `未知`。
+fn format_clock(value: Option<&str>) -> String {
+    let Some(value) = value else {
+        return "未知".to_string();
+    };
+    match chrono::DateTime::parse_from_rfc3339(value) {
+        Ok(parsed) => parsed
+            .with_timezone(&chrono::Local)
+            .format("%m-%d %H:%M")
+            .to_string(),
+        Err(_) => "未知".to_string(),
+    }
+}
+
 /// 异常状态 → 界面要用的两件套：`(色调, 一句人话)`。**读表**（`abnormal` 列）。
 ///
 /// ⚠️ 文案里**不许出现实现黑话**（槽位 / 目录 / 500…），也不许口语化。
@@ -372,8 +398,9 @@ pub fn is_retryable(status: TaskStatus) -> bool {
 /// 板面顺序 —— **终端看板与窗口共用这一份**。
 ///
 /// ── 规则 ──────────────────────────────────────────────────────────
-/// · **未结束**（处理中 / 排队）：按**先后顺序**（提示词行号 `line`）升序 —— 先发的在上；
-/// · **已结束**：按**完成时间**（`stateSince`，进终态那一刻）**倒序** —— 最晚完成在最上。
+/// 先按 [`task_group`] 分档：`active` → `queued` → `waiting` → `finished`；
+/// · `active` / `queued`：按**先后顺序**（提示词行号 `line`）升序 —— 先发的在上；
+/// · `waiting` / `finished`：按**进入该状态的时刻**（`stateSince`）**倒序** —— 最近的在最上。
 ///
 /// ── 为什么必须有它 ────────────────────────────────────────────────
 /// `StateStore::all()` 返回的是 `BTreeMap` 的**键序**，而键是**内容哈希 id**
@@ -387,18 +414,69 @@ pub fn is_retryable(status: TaskStatus) -> bool {
 /// ⚠️ 旧记录没有 `stateSince`（TS 时代写的）⇒ 完成时间未知 ⇒ 降序时自然沉底，
 ///    **不拿 `updatedAt` 冒充**。
 pub fn board_order(records: &mut [TaskRecord]) {
-    records.sort_by(|a, b| match (is_unfinished(a.status), is_unfinished(b.status)) {
-        // 都在跑/排队：按先后顺序（行号）。没有行号的用 id 兜底，保证顺序确定。
-        (true, true) => a.line.cmp(&b.line).then_with(|| a.id.cmp(&b.id)),
-        // 都已结束：完成时间倒序（`Option` 里 `None` 小于 `Some` ⇒ 未知的自然沉底）。
-        (false, false) => b
-            .state_since
-            .cmp(&a.state_since)
-            .then_with(|| a.id.cmp(&b.id)),
-        // 跨组：还在跑的排前面 —— 打开就能先看到"正在动的"。
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
+    records.sort_by(|a, b| {
+        let (rank_a, rank_b) = (group_rank(a.status), group_rank(b.status));
+        // 跨组：active → queued → waiting → finished。
+        // ⚠️ 不能再用 `is_unfinished` 二分：`needs_confirm` 是终态，
+        //    那样会被排进「已结束」，与界面把它放在「待你处理」最上面矛盾。
+        if rank_a != rank_b {
+            return rank_a.cmp(&rank_b);
+        }
+        // 组内规则直接复用上面算好的 rank，不再第二次调 `task_group`。
+        match rank_a {
+            // 在跑/排队：按先后顺序（行号）。没有行号的用 id 兜底，保证顺序确定。
+            0 | 1 => a.line.cmp(&b.line).then_with(|| a.id.cmp(&b.id)),
+            // 待你处理/已结束：按进入该状态的时刻倒序（`None` 小于 `Some` ⇒ 未知的自然沉底）。
+            _ => b
+                .state_since
+                .cmp(&a.state_since)
+                .then_with(|| a.id.cmp(&b.id)),
+        }
     });
+}
+
+/// 板面分档：`active` → `queued` → `waiting` → `finished`。
+fn group_rank(status: TaskStatus) -> u8 {
+    match task_group(status) {
+        "active" => 0,
+        "queued" => 1,
+        "waiting" => 2,
+        _ => 3,
+    }
+}
+
+/// 产物存在性：`文件名（记录里的原文）→ 是否真在盘上`。
+///
+/// 文本看板与 JSON 看板**共用这一份** —— 原先两处各写一遍
+/// `BTreeMap` + `resolve_file` + `is_file`，改口径时必然漏一处。
+fn files_present(records: &[TaskRecord], output_dir: &Path) -> BTreeMap<String, bool> {
+    let mut present: BTreeMap<String, bool> = BTreeMap::new();
+    for record in records {
+        for file in record.files.iter().flatten() {
+            // 记录里存的是**相对输出目录**的路径（旧记录是绝对路径）⇒ 先归一成绝对再看盘。
+            let resolved = resolve_file(output_dir, file);
+            present
+                .entry(file.clone())
+                .or_insert_with(|| resolved.is_file());
+        }
+    }
+    present
+}
+
+/// 逐状态计数（顺序 = `STATUS_TABLE`）。
+///
+/// 文本汇总与 JSON `summary` **共用这一份**：原先一边按表过滤 `count`、
+/// 一边 `all()` + `json_key` + `filter`，加状态时两边的口径可能悄悄分叉。
+fn status_counts(records: &[TaskRecord]) -> Vec<(TaskStatus, usize)> {
+    crate::engine::state::all()
+        .map(|status| {
+            let count = records
+                .iter()
+                .filter(|record| record.status == status)
+                .count();
+            (status, count)
+        })
+        .collect()
 }
 
 /// 看板的**机器可读**形态（`--status --json`）。
@@ -410,16 +488,7 @@ pub fn build_status_json(state_file: &Path, output_dir: &Path) -> Result<Value, 
     let mut records: Vec<TaskRecord> = state.all().into_iter().cloned().collect();
     board_order(&mut records);
 
-    let mut present: BTreeMap<String, bool> = BTreeMap::new();
-    for record in &records {
-        for file in record.files.clone().unwrap_or_default() {
-            // 记录里存的是**相对输出目录**的路径（旧记录是绝对路径）⇒ 先归一成绝对再看盘。
-            let resolved = resolve_file(output_dir, &file);
-            present
-                .entry(file.clone())
-                .or_insert_with(|| resolved.is_file());
-        }
-    }
+    let present = files_present(&records, output_dir);
     let tasks: Vec<Value> = records
         .iter()
         .map(|record| {
@@ -449,9 +518,14 @@ pub fn build_status_json(state_file: &Path, output_dir: &Path) -> Result<Value, 
                     "statusLabel".to_string(),
                     Value::String(status_label(record.status).to_string()),
                 );
+                // ⚠️ **只在生产中的任务才有值**（`null` = 界面不显示时长）。
+                //    原先对所有状态都给字符串 ⇒ 排队中的卡片也在跳秒（2026-10-19 实测反馈）。
                 object.insert(
                     "stateSinceText".to_string(),
-                    Value::String(format_elapsed(record.state_since.as_deref())),
+                    match elapsed_text(record.status, record.state_since.as_deref()) {
+                        Some(text) => Value::String(text),
+                        None => Value::Null,
+                    },
                 );
                 // ⚠️ 分组 / 异常 / **可做的动作**（`actions`）**一并下发**：前端不再自己写
                 //    一遍状态清单，否则「窗口里看到的」与「终端看到的」会分叉
@@ -496,20 +570,15 @@ pub fn build_status_json(state_file: &Path, output_dir: &Path) -> Result<Value, 
         })
         .collect();
 
-    // 逐状态计数**由表生成**（遍历 `all()`，键名 = 线格式名的 camelCase）。
+    // 逐状态计数**由表生成**（`status_counts`，键名 = 线格式名的 camelCase）。
     // 原先这里是手抄的 9 行，**漏了 `submitting`** —— 而且加状态时不报错。
     let mut summary = serde_json::Map::new();
     summary.insert("total".to_string(), json!(records.len()));
-    for status in crate::engine::state::all() {
-        let count = records
-            .iter()
-            .filter(|record| record.status == status)
-            .count();
+    for (status, count) in status_counts(&records) {
         summary.insert(crate::engine::state::json_key(status), json!(count));
     }
 
     Ok(json!({
-        "generatedAt": now_iso(),
         "stateFile": state_file.display().to_string(),
         "outputDir": output_dir.display().to_string(),
         "summary": summary,
@@ -521,25 +590,9 @@ pub fn build_status_json(state_file: &Path, output_dir: &Path) -> Result<Value, 
 ///
 /// 回答三件事：① 现在哪些任务在跑；② 每条在当前状态待了多久；③ 每张图对应哪条提示词。
 fn print_status(state_file: &Path, output_dir: &Path, full: bool, as_json: bool) -> Result<(), String> {
-    // 只读打开：不压实、不建目录 —— 生成进程可能正在追加写同一个文件。
-    let state = StateStore::open_read_only(state_file).map_err(|error| error.to_string())?;
-    let mut records: Vec<TaskRecord> = state.all().into_iter().cloned().collect();
-    // ⚠️ 顺序**只此一份**（与窗口共用），别再在这里写一遍 `sort_by_key`。
-    board_order(&mut records);
-
-    // 核对产物是否真的在盘上（提示词与图对不上时，这里会立刻暴露）
-    let mut present: BTreeMap<String, bool> = BTreeMap::new();
-    for record in &records {
-        for file in record.files.clone().unwrap_or_default() {
-            let resolved = resolve_file(output_dir, &file);
-            present
-                .entry(file.clone())
-                .or_insert_with(|| resolved.is_file());
-        }
-    }
-
-    let count = |status: TaskStatus| records.iter().filter(|r| r.status == status).count();
-
+    // ⚠️ JSON 分支**必须在任何读盘动作之前**返回。
+    //    原先这里先读 store / `all()` / `board_order` / 算产物存在性，
+    //    然后 `build_status_json` 又从头读一遍 —— 同一份数据读两次、排两次、stat 两次。
     if as_json {
         let payload = build_status_json(state_file, output_dir)?;
         println!(
@@ -548,6 +601,16 @@ fn print_status(state_file: &Path, output_dir: &Path, full: bool, as_json: bool)
         );
         return Ok(());
     }
+
+    // 只读打开：不压实、不建目录 —— 生成进程可能正在追加写同一个文件。
+    let state = StateStore::open_read_only(state_file).map_err(|error| error.to_string())?;
+    let mut records: Vec<TaskRecord> = state.all().into_iter().cloned().collect();
+    // ⚠️ 顺序**只此一份**（与窗口共用），别再在这里写一遍 `sort_by_key`。
+    board_order(&mut records);
+
+    // 核对产物是否真的在盘上（提示词与图对不上时，这里会立刻暴露）
+    let present = files_present(&records, output_dir);
+    let counts = status_counts(&records);
 
     let width = if full { 500 } else { 74 };
     println!("================ 任务看板 ================");
@@ -566,12 +629,12 @@ fn print_status(state_file: &Path, output_dir: &Path, full: bool, as_json: bool)
     // 「已完成」打头（它是唯一"有产出"的那行），其余按表顺序 = 生命周期顺序。
     rows.sort_by_key(|row| row.not_done);
     for row in rows {
-        println!(
-            "{}: {}（{}）",
-            pad_label(row.label),
-            count(row.status),
-            row.rerun
-        );
+        let count = counts
+            .iter()
+            .find(|(status, _)| *status == row.status)
+            .map(|(_, count)| *count)
+            .unwrap_or(0);
+        println!("{}: {}（{}）", pad_label(row.label), count, row.rerun);
     }
 
     let render = |record: &TaskRecord| {
@@ -579,25 +642,27 @@ fn print_status(state_file: &Path, output_dir: &Path, full: bool, as_json: bool)
             .line
             .map(|value| value.to_string())
             .unwrap_or_else(|| "?".to_string());
-        // 「当前状态已持续」——旧记录没有 `state_since` 就显示 `—`。
-        // **刻意不拿 `updated_at` 兜底**：它会被 `finish()` 的顺带写污染，
-        // 用它冒充"状态起点"就是撒谎。宁可显示"未知"。
-        let since = format_elapsed(record.state_since.as_deref());
-        let submitted = record
-            .submitted_at
-            .as_deref()
-            .map(|value| format!(" · 已提交 {}", format_elapsed(Some(value))))
-            .unwrap_or_default();
+        // 行尾时间只有两种口径：
+        // · 生产中的任务 ⇒ `[已持续 X]`（当前这一段状态跑了多久）；
+        // · 已结束 ⇒ `结束 MM-DD HH:MM`（绝对时刻，静态）。
+        // 排队 / 待确认 ⇒ **什么都不打**（没开始生产，没有"持续"可言）。
+        // ⚠️ 不再打 `· 已提交 X`：它与"已持续"是同一件事（过了多久）的两份投影。
+        let tail = match task_group(record.status) {
+            "active" => elapsed_text(record.status, record.state_since.as_deref())
+                .map(|text| format!("  [已持续 {text}]"))
+                .unwrap_or_default(),
+            "finished" => format!("  结束 {}", format_clock(record.state_since.as_deref())),
+            _ => String::new(),
+        };
         println!(
-            "  第{}行  {}  {}  {} {}  {}  [已持续 {}]{}",
+            "  第{}行  {}  {}  {} {}  {}{}",
             line,
             record.id,
             record.model,
             record.aspect_ratio,
             record.image_size,
             status_label(record.status),
-            since,
-            submitted
+            tail
         );
         println!("          {}", clip(&record.prompt, width));
         for file in record.files.clone().unwrap_or_default() {
@@ -620,24 +685,29 @@ fn print_status(state_file: &Path, output_dir: &Path, full: bool, as_json: bool)
         }
     };
 
-    let active: Vec<&TaskRecord> = records
-        .iter()
-        .filter(|record| is_unfinished(record.status))
-        .collect();
-    let finished: Vec<&TaskRecord> = records
-        .iter()
-        .filter(|record| !is_unfinished(record.status))
-        .collect();
-
-    if !active.is_empty() {
-        println!("\n── 处理中（{}）────────────────────────────", active.len());
-        for record in active {
-            render(record);
-        }
+    // 四段分组与界面**同一判据**（`task_group`）。原先用 `is_unfinished` 二分，
+    // `needs_confirm`（终态）会被归进「已结束」—— 与窗口把它放在「待你处理」矛盾。
+    let mut groups: [(&str, Vec<&TaskRecord>); 4] = [
+        ("处理中", Vec::new()),
+        ("排队", Vec::new()),
+        ("待你处理", Vec::new()),
+        ("已结束", Vec::new()),
+    ];
+    for record in &records {
+        let index = match task_group(record.status) {
+            "active" => 0,
+            "queued" => 1,
+            "waiting" => 2,
+            _ => 3,
+        };
+        groups[index].1.push(record);
     }
-    if !finished.is_empty() {
-        println!("\n── 已结束（{}）────────────────────────────", finished.len());
-        for record in finished {
+    for (title, group) in groups {
+        if group.is_empty() {
+            continue;
+        }
+        println!("\n── {title}（{}）────────────────────────────", group.len());
+        for record in group {
             render(record);
         }
     }
@@ -841,8 +911,16 @@ pub fn main_with_args(argv: &[String]) -> Result<(), String> {
     let recheck_timeout = Duration::from_secs_f64(
         arg_number(&args, "recheck-timeout", 30.0).max(1.0) * 60.0,
     );
-    let task_interval =
-        Duration::from_millis(arg_number(&args, "task-interval-ms", 1000.0).max(0.0) as u64);
+    // 缺省跟随设置（`.env` 的 LOVART_TASK_INTERVAL_MS），再退到内置默认。
+    // `.env` 已在本函数前半段载入 ⇒ 这里读到的就是设置页保存的值。
+    let env_interval_ms = std::env::var("LOVART_TASK_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value <= 600_000)
+        .unwrap_or(crate::engine::scheduler::TASK_INTERVAL_DEFAULT_MS);
+    let task_interval = Duration::from_millis(
+        arg_number(&args, "task-interval-ms", env_interval_ms as f64).max(0.0) as u64,
+    );
     let retry_failed = has_arg(&args, "retry-failed");
     // 取值顺序：命令行 > `.env`（LOVART_DEFAULT_*）> 内置默认。与 GUI 设置页同一套兜底。
     let defaults = PromptDefaults {

@@ -1,4 +1,4 @@
-//! 板面顺序契约 —— 「已结束按完成时间倒序 · 未结束按先后顺序」。
+//! 板面顺序契约 —— 「active → queued → waiting → finished；前两组按行号，后两组按时间倒序」。
 //!
 //! ── 为什么必须有它 ────────────────────────────────────────────────
 //! `StateStore::all()` 返回的是 `BTreeMap` 的**键序**，而键是**内容哈希 id**
@@ -60,7 +60,7 @@ fn 已结束按完成时间倒序_未结束按先后顺序() {
         &record("done-old", "done", 1, Some("2026-10-01T10:00:00.000Z")),
         &record("done-new", "done", 2, Some("2026-10-01T14:56:36.000Z")),
         &record("done-unknown", "done", 3, None),
-        // 未结束两条：提示词行号 2 / 1（先后顺序 = 行号升序）
+        // 未结束两条：active（running，行号 2）先于 queued（pending，行号 1）。
         &record("live-line2", "running", 2, None),
         &record("live-line1", "pending", 1, None),
     ]);
@@ -68,14 +68,31 @@ fn 已结束按完成时间倒序_未结束按先后顺序() {
     assert_eq!(
         ordered_ids(&path),
         [
-            // 还在跑的排前面，内部按先后顺序（先发的在上）
-            "live-line1",
+            // active 组在前：内部按先后顺序（先发的在上）
             "live-line2",
+            // queued 组在后：同样是行号升序
+            "live-line1",
             // 已结束按完成时间倒序；完成时间**未知**的沉底
             "done-new",
             "done-old",
             "done-unknown",
         ],
         "板面顺序不对 —— 见本文件头（不排 = id 字典序 = 看起来随机）"
+    );
+}
+
+#[test]
+fn 待确认排在已结束之前() {
+    let path = write_state(&[
+        // 完成时间更早的 done 也不能排在 needs_confirm 前面：
+        // 它是**终态**，但界面把它放在「待你处理」，不是「已结束」。
+        &record("done-old", "done", 1, Some("2026-10-01T10:00:00.000Z")),
+        &record("confirm", "needs_confirm", 2, Some("2026-10-01T09:00:00.000Z")),
+    ]);
+
+    assert_eq!(
+        ordered_ids(&path),
+        ["confirm", "done-old"],
+        "needs_confirm 必须排在已结束之前（waiting 档位高于 finished）"
     );
 }

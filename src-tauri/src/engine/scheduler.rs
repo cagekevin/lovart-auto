@@ -63,8 +63,8 @@ const BUSY_BACKOFF_BASE_MS: u64 = 5_000;
 /// 402/409 退避封顶（ms）。
 const BUSY_BACKOFF_MAX_MS: u64 = 60_000;
 
-/// 全局任务间隔默认值（ms）。
-const TASK_INTERVAL_DEFAULT_MS: u64 = 1_000;
+/// 全局任务间隔默认值（ms）。1s 对上游偏密（429 明显变多），默认放到 5s。
+pub(crate) const TASK_INTERVAL_DEFAULT_MS: u64 = 5_000;
 
 /// 429 熔断基数 / 封顶（ms）。
 const RATE_LIMIT_BACKOFF_BASE_MS: u64 = 60_000;
@@ -268,7 +268,7 @@ pub struct SchedulerOptions {
     pub max_attempts: Option<u32>,
     pub max_busy_retries: Option<u32>,
     pub busy_backoff_base: Option<Duration>,
-    /// 全局任务间隔（提交，含重试）。缺省 1000ms。
+    /// 全局任务间隔（提交，含重试）。缺省 5000ms。
     pub task_interval: Option<Duration>,
     /// 429 熔断基数（测试缝）。缺省 60s。
     pub rate_limit_backoff_base: Option<Duration>,

@@ -503,7 +503,8 @@ button { cursor: pointer; color: inherit; }
  * ⇒ 「这一条生成到几成」**没有真值**。画一条按时间猜的、或走一步跳一下的条，
  *    都是在「把不知道的数字写成肯定句」。
  * 单条能给的都是**事实**（`.task-facts`）：现在在哪一步（`statusLabel`）、
- * 这个状态已持续多久、试了几次、产物叫什么 —— 全是真值，一个猜的数字都没有。
+ * 正在生产的那几条跑了多久（排队/待确认不计时）、试了几次、产物叫什么
+ * —— 全是真值，一个猜的数字都没有。
  */
 
 /* 排队中：一个可展开的计数条 */
@@ -654,12 +655,6 @@ button { cursor: pointer; color: inherit; }
   font-size: var(--fs-sm);
   line-height: 1.5;
   color: var(--ink);
-}
-
-.task-time {
-  font-size: var(--fs-xs);
-  color: var(--ink-3);
-  font-variant-numeric: tabular-nums;
 }
 
 /* 顶排：**垫图在卡片左上角，文字列在右**。

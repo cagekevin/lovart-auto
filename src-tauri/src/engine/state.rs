@@ -516,14 +516,16 @@ pub struct TaskRecord {
     pub ready_at: u64,
     /// **首次拿到 threadId** 的时刻（ISO 字符串）。写一次不再改（除非重跑把 threadId 清空）。
     ///
-    /// 用途：进度条的 **30% 锚点**与 30%→90% 的插值基准。
+    /// ⚠️ 当前**没有展示消费者**：它原先给进度条当「30% 锚点」，而进度条已经删了。
+    ///    字段保留是为了将来算「总耗时」（首次提交 → 完成）；删它要动 schema 与重跑逻辑。
     /// ⚠️ 不能用 `updated_at` 顶替 —— 任务会 `running → timeout → running` 来回切，
     /// 那个时间戳跟着变。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub submitted_at: Option<String>,
     /// **进入当前 `status`** 的时刻（ISO 字符串）。**仅在 status 变化时**写。
     ///
-    /// 用途：「当前状态已持续 12:30」。
+    /// 用途：看板给**生产中的任务**算「已持续 12:30」（`run.rs` 的 `elapsed_text`）；
+    /// 排队 / 待确认 / 终态**不用它计时**，终态只取它的绝对时刻当「结束」。
     /// ⚠️ 不能用 `updated_at` 顶替 —— `finish()` 里 `update(id, { readyAt: 0 })`
     /// 会**顺带刷新** `updated_at`，于是「别人一完成，你的时间戳就被改了」。
     #[serde(skip_serializing_if = "Option::is_none")]
