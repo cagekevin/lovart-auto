@@ -800,17 +800,12 @@ function moreButton(task, file) {
       ))) return;
       removeTasks([task.id], '删除');
     }, true));
-    // 「取消所有任务」—— **只给处理中（active）的卡片**。
+    // 「取消所有任务」**不在这里**：已搬到板级 ⋯（见 `bindBoardMenu`）。
     //
-    // 作用域是"全部未结束"（处理中 + 排队 + 待处理），入口放这里是因为：
-    // 用户要的是"在正在跑的地方就能停掉全部"，而不是滚回板头找板级 ⋯。
-    // 板级 ⋯（`btnBoardMore`）刻意**不接**：同一个动作只留一个入口。
-    if (task.group === 'active') {
-      actions.push(menuItem('取消所有任务', () => {
-        closeMenu();
-        cancelAllTasks();
-      }, true, boardClearing));
-    }
+    // 原设计只在 `task.group === 'active'` 的卡片上给入口，理由是"在正在跑的地方就能停"。
+    // 实测反面：**没有处理中任务时它根本不存在** —— 而"一条 `needs_confirm` / 排队记录
+    // 卡着、想全部清掉"恰恰是最需要它的时候（后端作用域本就含这三组）。
+    // 板级入口始终可达；同一个动作只留一个入口。
     if (actions.length) {
       menu.appendChild(el('div', 'menu-sep'));
       for (const item of actions) menu.appendChild(item);
@@ -846,6 +841,40 @@ function menuItem(label, onClick, danger, disabled) {
   button.disabled = Boolean(disabled);
   button.addEventListener('click', onClick);
   return button;
+}
+
+/**
+ * 板级 ⋯ 菜单（2026-10-20）：**「取消所有任务」的唯一入口**。
+ *
+ * 为什么从卡片搬到这里：原入口只在 `task.group === 'active'` 的卡片菜单里，
+ * **没有处理中任务时它根本不存在**。而"一条 `needs_confirm` 卡着、取消不掉"
+ * 恰恰是最需要它的时候 —— 后端 `cancel_all_tasks` 的作用域本来就是
+ * 「未结束 = 处理中 + 排队 + 待处理」，前端却把入口绑在了其中一个分组上。
+ *
+ * 板级按钮始终可见；`clearing` 期间菜单项置灰（与卡片 ⋯ 同一套 `openMenu`）。
+ */
+function bindBoardMenu() {
+  const button = $('btnBoardMore');
+  if (!button) return;
+  button.type = 'button';
+  const anchor = button.parentElement;
+
+  button.addEventListener('click', (event) => {
+    // 拦住冒泡，否则立刻被全局那个 closeMenu 关掉（与卡片 ⋯ 同一处理）。
+    event.stopPropagation();
+    if (openMenu) {
+      closeMenu();
+      return;
+    }
+    const menu = el('div', 'menu');
+    // 禁用的菜单项仍然渲染：藏起来会让人以为功能没了。
+    menu.appendChild(menuItem('取消所有任务', () => {
+      closeMenu();
+      cancelAllTasks();
+    }, true, boardClearing));
+    anchor.appendChild(menu);
+    openMenu = menu;
+  });
 }
 
 // ── 看大图 ───────────────────────────────────────────────────────────
@@ -1954,6 +1983,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     refreshBoard();
   });
 
+  bindBoardMenu();
   $('btnAutoConfirm').addEventListener('click', toggleAutoConfirm);
   $('btnSettings').addEventListener('click', openSettings);
   $('btnSettingsCancel').addEventListener('click', () => closeMask('maskSettings'));
