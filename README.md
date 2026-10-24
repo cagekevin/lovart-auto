@@ -42,12 +42,12 @@ make app                    # → 仓库根目录下的 lovart.app
 
 **Windows 上的正式交付形态是仓库根下的 `lovart-client.exe`**（`scripts/make-exe.ps1` 生成）：
 
-**一键打包（推荐）**：双击仓库根的 `build-win.bat`。它会先检查 `lovart-client.exe` 是否还在运行
+**一键打包（推荐）**：双击 `scripts\build-win.bat`。它会先检查 `lovart-client.exe` 是否还在运行
 （占用时提示先关闭，**不替你杀进程**，免得中断正在跑的任务），再调用同一个 `make-exe.ps1`；
 失败时窗口停住，错误不会一闪而过。
 
 ```powershell
-.\build-win.bat                                                              # 双击等价
+.\scripts\build-win.bat                                                      # 双击等价
 powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/make-exe.ps1   # 或：make win
 ```
 
@@ -224,7 +224,6 @@ lovart-client --list-models            # 权威别名表，不会像文档那样
 lovart 自动/
 ├── lovart.app/           macOS 应用包（`make app` 生成，**不进版本库**）
 ├── lovart-client.exe     Windows 单文件交付（`make win` 生成，**不进版本库**）
-├── build-win.bat         一键打包（双击即用；调用 scripts/make-exe.ps1）
 ├── src-tauri/            唯一实现（Rust）：GUI 与无头 CLI 是**同一个二进制**
 │   ├── src/
 │   │   ├── main.rs             双击 = GUI；带参数 = 无头 CLI
@@ -238,6 +237,7 @@ lovart 自动/
 ├── assets/icon.png       图标源（1024，打包脚本从它生成 .icns / .ico）
 ├── packaging/macos/      `.app` 外壳样板（Info.plist）
 ├── scripts/
+│   ├── build-win.bat     一键打包（双击即用；调用同目录的 make-exe.ps1）
 │   ├── make-app.sh       打包 `lovart.app`（`make app`）
 │   ├── make-exe.ps1      打包 `lovart-client.exe`（`make win`）
 │   └── probe.mjs         「先红后绿」探针执行器

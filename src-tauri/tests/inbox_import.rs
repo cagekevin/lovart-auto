@@ -1,7 +1,9 @@
 //! 「从 inbox 导入」的契约测试。
 //!
-//! 守一条规则：**导入 = 读 + 校验 + 归位，三件事一起发生**（DEBT **TD-05-12**）。
-//! 少了「归位」⇒ 同一个文件能**反复导入** ⇒ 重复出图、重复扣积分，而且全程不报错。
+//! 守两条规则：
+//! 1. **`inbox/` 直属文件：导入 = 读 + 校验 + 归位，三件事一起发生**（DEBT **TD-05-12**）。
+//!    少了「归位」⇒ 同一个文件能**反复导入** ⇒ 重复出图、重复扣积分，而且全程不报错。
+//! 2. **`inbox/` 之外的文件（用户自己挑的）：只读，绝不移动** —— 那是用户的文件夹。
 
 use std::path::{Path, PathBuf};
 
@@ -60,6 +62,25 @@ fn 归位重名不覆盖_换名进_imported() {
         std::fs::read_dir(&imported).expect("列 imported").count(),
         2,
         "imported/ 里应当有两份（旧的 + 换了名的新份）"
+    );
+}
+
+#[test]
+fn inbox_之外的文件导入后原地不动() {
+    let cwd = temp_dir("outside");
+    let outside = cwd.join("elsewhere");
+    std::fs::create_dir_all(&outside).expect("建外部目录");
+    let file = outside.join("batch.jsonl");
+    std::fs::write(&file, "{\"prompt\":\"一只狗\"}\n").expect("写外部文件");
+
+    let tasks = import_inbox_core(&cwd, &file).expect("导入应当成功");
+    assert_eq!(tasks.as_array().map(Vec::len), Some(1), "应当返回 1 条任务");
+
+    // 用户的目录不许被程序改动：文件还在原地，`imported/` 里也不该多出副本。
+    assert!(file.is_file(), "inbox 之外的文件必须原地不动");
+    assert!(
+        !cwd.join("inbox").join("imported").join("batch.jsonl").exists(),
+        "不许把外部文件搬进 inbox/imported/"
     );
 }
 

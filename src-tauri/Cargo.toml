@@ -36,6 +36,9 @@ libc = "0.2"
 # `protocol-asset` 是**必须的**：出图结果在本地盘上，前端要用 `<img>` 显示它们。
 # 没有这个特性，Tauri 会拒绝 `asset:` 协议 ⇒ 所有缩略图和大图都是白板（且不报错）。
 tauri = { version = "2", features = ["protocol-asset"] }
+# 原生「选择文件」对话框：提示词文件**不限于** `inbox/` —— 用户想导哪份就导哪份。
+# 用官方插件而不是自己调 Win32/rfd：跨平台行为一致（macOS 侧同一个二进制）。
+tauri-plugin-dialog = "2"
 # HMAC-SHA256 鉴权（`hmac` = RustCrypto 的标准实现，配 `sha2` 作底层哈希）。
 hmac = "0.12"
 sha2 = "0.10"

@@ -1,14 +1,16 @@
 @echo off
 chcp 65001 >nul
 setlocal EnableExtensions
+rem 本脚本住在 `scripts\` 里 —— 仓库根是它的**上一级**，不能再用 `%~dp0` 当根。
 rem `%~dp0` 末尾带反斜杠，直接 `cd /d "…\"` 在部分 cmd 版本会被当成转义引号；
 rem 用 `pushd`（对末尾反斜杠容忍）最稳。
-pushd "%~dp0"
+for %%I in ("%~dp0..") do set "ROOT=%%~fI"
+pushd "%ROOT%"
 title lovart-auto - 一键打包 Windows
 
 echo ============================================================
 echo   lovart-auto 一键打包（Windows 单文件 exe）
-echo   产物：%~dp0lovart-client.exe
+echo   产物：%ROOT%\lovart-client.exe
 echo ============================================================
 echo.
 
@@ -34,15 +36,16 @@ exit /b 2
 rem ── 2. 调用唯一的打包实现 ──────────────────────────────────────
 rem 不在 bat 里重写构建步骤：make-exe.ps1 是 Windows 打包的唯一入口
 rem （图标 → MSVC 环境 → cargo build --release → 拷到仓库根）。
+rem 它与本脚本**同目录**，所以用 `%~dp0` 直接拼文件名。
 :build
 echo [1/2] 编译并组装（首次约 2 分钟，之后更快）...
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\make-exe.ps1" %*
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0make-exe.ps1" %*
 if errorlevel 1 goto fail
 
 echo.
 echo [2/2] 完成
-if exist "%~dp0lovart-client.exe" (
-  for %%F in ("%~dp0lovart-client.exe") do echo     产物：%%~fF
+if exist "%ROOT%\lovart-client.exe" (
+  for %%F in ("%ROOT%\lovart-client.exe") do echo     产物：%%~fF
 )
 echo.
 echo     双击 exe = 图形界面
