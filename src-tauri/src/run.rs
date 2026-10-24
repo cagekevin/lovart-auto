@@ -358,6 +358,15 @@ fn elapsed_text(status: TaskStatus, state_since: Option<&str>) -> Option<String>
     if task_group(status) != "active" {
         return None;
     }
+    active_elapsed_text(state_since)
+}
+
+/// 同一条文案的**后半段**：已知属于 `active` 时，只按 `state_since` 出字。
+///
+/// 存在的唯一理由是 `gui::get_state` 的缓存命中路径 —— 那时手里只有上一轮的
+/// `state_since`（`state.jsonl` 没变 ⇒ 状态也不可能变），不必为了重算这几个字
+/// 再读一遍全部记录。**文案实现仍然只有一份**（[`elapsed_text`] 调它）。
+pub(crate) fn active_elapsed_text(state_since: Option<&str>) -> Option<String> {
     let text = format_elapsed(state_since);
     (text != "—").then_some(text)
 }

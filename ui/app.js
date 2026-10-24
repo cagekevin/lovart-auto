@@ -73,6 +73,8 @@ let refSeq = 0;
 const queue = [];
 let models = [];
 let inboxFiles = [];
+/** `list_inbox` 实际扫的目录 —— 空列表时把它显示出来，用户才知道程序在找哪儿。 */
+let inboxDir = '';
 let doneOpen = false;
 let queuedOpen = false;
 let busy = false;
@@ -187,6 +189,25 @@ function boardSignature(data) {
     // 上游探针的结论也进签名：它到了 ⇒ 要重画（否则标题行永远停在「正在探测…」）。
     upstreamSummary(),
   ].join('#');
+}
+
+/**
+ * 只更新「已持续 X」那几格（`[data-elapsed]`），**不重建任何卡片**。
+ *
+ * 两个调用点：① 后端回 `unchanged`（最常见的一秒，载荷只有这几条）；
+ * ② 数据变了但结构签名没变（卡片不用重建，计时仍要走）。
+ *
+ * ⚠️ 用 `Map` 而不是逐格 `tasks.find`：后者是 O(卡片数 × 任务数)，
+ *    而这里是每秒都跑一次的路径。文案仍由 Rust 给（`stateSinceText` / `elapsed`），
+ *    前端只负责把字放进去。
+ */
+function applyElapsed(items) {
+  if (!items || !items.length) return;
+  const textById = new Map(items.map((item) => [item.id, item.text]));
+  for (const node of document.querySelectorAll('[data-elapsed]')) {
+    const text = textById.get(node.dataset.elapsed);
+    if (text) node.textContent = `已持续 ${text}`;
+  }
 }
 
 /**
@@ -325,7 +346,58 @@ async function toggleAutoConfirm() {
   }
 }
 
+/**
+ * 轮询间隔。`REFRESH_MS` 是"上一轮**结束后**再等这么久"，不是 fixedRate。
+ *
+ * 窗口不可见时降到 `HIDDEN_REFRESH_MS`：后台每秒拉一次全量看板是纯白干
+ * （用户看不见，还占着 CPU 与 IPC）。
+ */
+const REFRESH_MS = 1000;
+const HIDDEN_REFRESH_MS = 5000;
+
+let boardTimer = null;
+let refreshInFlight = false;
+let refreshAgain = false;
+
+/**
+ * 排下一轮。
+ *
+ * ⚠️ 用 `setTimeout` 自排而不是 `setInterval`：`setInterval` 不管上一轮回来没有，
+ * 数据一大单轮就可能超过 1s，于是请求**叠加**——排得越多越慢，越慢排得越多。
+ */
+function scheduleRefresh() {
+  clearTimeout(boardTimer);
+  const delay = document.hidden ? HIDDEN_REFRESH_MS : REFRESH_MS;
+  boardTimer = setTimeout(async () => {
+    await refreshBoard();
+    scheduleRefresh();
+  }, delay);
+}
+
+/**
+ * 刷一次看板 —— **不重入**。
+ *
+ * 有一轮在飞时，不再发第二轮，只记一笔「结束后再跑一次」：
+ * 调用方（点按钮、跑完命令）的意图不会被丢掉，但永远不会有两个请求同时压后端。
+ */
 async function refreshBoard() {
+  if (refreshInFlight) {
+    refreshAgain = true;
+    return;
+  }
+  refreshInFlight = true;
+  try {
+    await refreshBoardOnce();
+  } finally {
+    refreshInFlight = false;
+    if (refreshAgain) {
+      refreshAgain = false;
+      void refreshBoard();
+    }
+  }
+}
+
+async function refreshBoardOnce() {
   let data;
   try {
     data = await invoke('get_state');
@@ -339,12 +411,25 @@ async function refreshBoard() {
   show($('boardNotice'), false);
   show($('boardMain'), true);
 
-  // 顶栏开关状态：每秒对账一次（切换后另有命令返回值即时刷新）。
-  renderAutoConfirm(data.autoConfirm, data.autoConfirmed);
-
   // 批次级告警：**必须显示**，所以放在「结构没变就早退」之前 ——
   // 告警的出现与任务列表的结构无关（跑批失败时列表往往一点没变）。
   await flushAlerts();
+
+  // ── 后端说「什么都没变」：只改计时，别的都不动 ────────────────────
+  // 拿到的是 `{ unchanged, elapsed }`（几十字节），没有任务列表：
+  // 这一秒省掉的是整条链 —— 4MB 载荷 + JSON 解析 + 签名 + 可能的整块重建。
+  //
+  // ⚠️ 这条分支里**不许读** `data.autoConfirm` / `data.tasks` 之类的字段：
+  //    它们不在载荷里（`undefined` 会被当成「关 / 空」画出去，界面就会撒谎）。
+  //    自动确认开关与清空状态都进了后端的指纹 ⇒ 它们一变必然走全量，
+  //    所以这里的 DOM 一定还是上一轮画好的那个状态。
+  if (data.unchanged) {
+    applyElapsed(data.elapsed);
+    return;
+  }
+
+  // 顶栏开关状态（切换后另有命令返回值即时刷新）。
+  renderAutoConfirm(data.autoConfirm, data.autoConfirmed);
 
   // **自动探测上游**（只读、同一批数据只探一次）：给「本地没跟的那几条」一个交代，
   // 而不是让用户（或维护者）自己拿密钥去上游问一遍。放在算签名之前 ——
@@ -355,10 +440,11 @@ async function refreshBoard() {
   if (signature === lastSignature) {
     // 结构没变 ⇒ 只把「已跑多久」原地改掉。
     // `stateSinceText` 只有生产中的任务才有值；变 null 时靠签名（含 status）重建整卡。
-    for (const node of document.querySelectorAll('[data-elapsed]')) {
-      const task = (data.tasks || []).find((item) => item.id === node.dataset.elapsed);
-      if (task && task.stateSinceText) node.textContent = `已持续 ${task.stateSinceText}`;
-    }
+    applyElapsed(
+      (data.tasks || [])
+        .filter((task) => task.stateSinceText)
+        .map((task) => ({ id: task.id, text: task.stateSinceText })),
+    );
     return;
   }
   lastSignature = signature;
@@ -610,6 +696,7 @@ function taskCard(task) {
       img.src = url;
       img.alt = '垫图';
       img.loading = 'lazy';
+      img.decoding = 'async';
       item.appendChild(img);
       item.addEventListener('click', () => openViewerRemote(url, task.prompt));
       refs.appendChild(item);
@@ -660,6 +747,8 @@ function taskCard(task) {
     img.src = toFileUrl(first.file);
     img.alt = '';
     img.loading = 'lazy';
+    // 解码放到别的线程：几千张卡重建时，主线程不该被图片解码占住
+    img.decoding = 'async';
     thumb.appendChild(img);
     thumb.addEventListener('click', () => openViewer(first.file, task.prompt));
     card.appendChild(thumb);
@@ -994,6 +1083,7 @@ function renderQueue() {
       img.src = refSrc(firstRef.url);
       img.alt = '垫图';
       img.loading = 'lazy';
+      img.decoding = 'async';
       if (item.refs.length > 1) {
         img.title = `这条有 ${item.refs.length} 张垫图，这里显示的是第一张`;
       }
@@ -1521,16 +1611,42 @@ async function openImport() {
     return;
   }
   inboxFiles = data.files || [];
+  inboxDir = data.dir || '';
+  renderImportList();
+  openMask('maskImport');
+}
+
+/** 目录部分（Windows 反斜杠 / macOS 斜杠都吃）。 */
+function dirOf(path) {
+  return path.replace(/[\\/][^\\/]*$/, '');
+}
+
+/**
+ * 画导入列表。
+ *
+ * 列表里混着两种来源：`inbox/` 扫到的，和用户自己挑的任意路径 ——
+ * 后者导入后**不会被移动**（后端只归位 inbox 直属文件），所以行里要说清楚，
+ * 否则用户会以为文件被程序吞了。
+ */
+function renderImportList() {
   const list = $('importList');
   clear(list);
   if (inboxFiles.length === 0) {
-    list.appendChild(el('div', 'empty', `inbox 里还没有提示词文件。\n把 .jsonl 放进 ${data.dir} 再打开这里。`));
+    list.appendChild(
+      el(
+        'div',
+        'empty',
+        `inbox 里还没有提示词文件（${inboxDir}）。\n点下面的「选择文件…」可以直接挑任意目录下的 .jsonl。`,
+      ),
+    );
   }
   inboxFiles.forEach((file, index) => {
     const row = el('div', 'import-row');
     const text = el('div', 'import-text');
     text.appendChild(el('div', 'import-name', file.name));
-    text.appendChild(el('div', 'import-meta', file.ok ? `${file.count} 条 · 检查通过` : `${(file.errors || []).length} 处问题`));
+    const facts = file.ok ? `${file.count} 条 · 检查通过` : `${(file.errors || []).length} 处问题`;
+    const where = file.inbox ? '' : ` · ${dirOf(file.path)}（导入后不移动）`;
+    text.appendChild(el('div', 'import-meta', `${facts}${where}`));
     if (!file.ok) {
       const ul = el('ul', 'import-errors');
       for (const message of (file.errors || []).slice(0, 4)) ul.appendChild(el('li', '', message));
@@ -1540,14 +1656,39 @@ async function openImport() {
 
     const button = el('button', 'btn btn-sm', '导入');
     button.disabled = !file.ok;
-    button.addEventListener('click', () => {
-      importFile(index);
-      closeMask('maskImport');
-    });
+    button.addEventListener('click', () => importFile(index));
     row.appendChild(button);
     list.appendChild(row);
   });
-  openMask('maskImport');
+}
+
+/**
+ * 自己挑一个文件：原生对话框 → 校验 → 插进列表（**仍然要点「导入」**）。
+ *
+ * 为什么不选完直接入队：选错文件是常事，先让他看见「几条 / 有没有错」再决定，
+ * 比先塞进待发再删更省事。
+ */
+async function pickImportFile() {
+  let path;
+  try {
+    path = await invoke('pick_prompt_file');
+  } catch (error) {
+    notice(`打开文件选择器失败：${error}`);
+    return;
+  }
+  if (!path) return; // 用户取消了
+
+  let file;
+  try {
+    file = await invoke('inspect_prompt_file', { path });
+  } catch (error) {
+    notice(`读不了这个文件：${error}`);
+    return;
+  }
+  const at = inboxFiles.findIndex((item) => item.path === file.path);
+  if (at >= 0) inboxFiles[at] = file;
+  else inboxFiles.unshift(file);
+  renderImportList();
 }
 
 async function importFile(index) {
@@ -1575,6 +1716,13 @@ async function importFile(index) {
       });
     }
     renderQueue();
+    notice(`已导入 ${tasks.length} 条`);
+    // 按 path 删行，**不用点击时的索引**：等待期间列表可能被「选择文件…」插了新行，
+    // 索引会错位 ⇒ 删掉别的行、还留下一行点不动的幽灵行。
+    const at = inboxFiles.findIndex((item) => item.path === file.path);
+    if (at >= 0) inboxFiles.splice(at, 1);
+    if (inboxFiles.length === 0) closeMask('maskImport');
+    else renderImportList();
   } catch (error) {
     notice(`导入失败：${error}`);
   }
@@ -1926,6 +2074,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   });
 
   $('btnImport').addEventListener('click', openImport);
+  $('btnImportPick').addEventListener('click', pickImportFile);
   $('btnImportCancel').addEventListener('click', () => closeMask('maskImport'));
 
   $('btnClear').addEventListener('click', () => {
@@ -2025,5 +2174,11 @@ window.addEventListener('DOMContentLoaded', async () => {
   renderRefs();
   renderQueue();
   await refreshBoard();
-  setInterval(refreshBoard, 1000);
+  // 轮询：自排 + 不重入（理由见 `scheduleRefresh` / `refreshBoard`）
+  scheduleRefresh();
+  // 切回窗口立刻刷一次：后台时降过频，别让人盯着旧数据看 5 秒。
+  document.addEventListener('visibilitychange', () => {
+    scheduleRefresh();
+    if (!document.hidden) void refreshBoard();
+  });
 });

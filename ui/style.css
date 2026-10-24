@@ -595,6 +595,12 @@ button { cursor: pointer; color: inherit; }
   border: 1px solid var(--line);
   border-radius: var(--r-lg);
   background: var(--bg);
+  /* 「已结束」可能有几千张卡。让**视口外**的卡跳过布局与绘制：
+   * 展开时只算眼前那十几张，而不是几千张全排一遍。
+   * `contain-intrinsic-size: auto <估算高度>` —— 没量过的卡按 220px 占位，
+   * 量过之后浏览器记住真实高度（`auto`），滚动条不会越滑越跳。 */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 220px;
 }
 
 .task-head {
@@ -960,6 +966,9 @@ button { cursor: pointer; color: inherit; }
   font-size: var(--fs-sm);
   color: var(--ink-3);
   line-height: 1.9;
+  /* 空态文案里带 `\n`（例如导入弹窗要同时说清目录和入口）——
+     不写这条，换行会被 HTML 折成空格，两句话挤成一行。 */
+  white-space: pre-line;
 }
 
 /* 查7：读盘失败**不许**渲染成空态 —— 保留提示 + 给重试动作 */

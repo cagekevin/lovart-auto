@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 use tauri::Manager;
+use tauri_plugin_dialog::DialogExt;
 
 use crate::engine::scheduler::{
     run_scheduler, AutoConfirm, Batch, SchedulerOptions, SchedulerTuning,
@@ -78,6 +79,13 @@ struct Board {
     /// 批次已退出、还没删完的那几毫秒里若放过 `start_run`，
     /// 新批次会把记录写回刚清空的表（用户看到"取消完又冒出来"）。
     wipe: bool,
+    /// 内存侧变更计数：批次起停 / 清空意图的每一次变化都 +1。
+    ///
+    /// 用途只有一个 —— `get_state` 缓存判「看板内存态变了没」（见 [`view_key`]）。
+    /// 为什么不用「有没有批次 + id 条数」：新一批恰好同条数时判不出来，
+    /// 界面会继续用上一批的 `following`（进度条撒谎）。计数器没这个问题，
+    /// 而且**四个变更点全在 Board 自己的方法里**，加不进新字段也不会漏。
+    rev: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +125,7 @@ impl Board {
 
     fn set_batch(&mut self, batch: RunningBatch) {
         self.batch = Some(batch);
+        self.rev += 1;
     }
 
     /// 请求「取消全部」。锁内**只改内存**，不碰磁盘。
@@ -125,6 +134,7 @@ impl Board {
             return ClearIntent::Already;
         }
         self.wipe = true;
+        self.rev += 1;
         match self.batch.as_ref() {
             Some(batch) => {
                 // 与「停止」是**同一个标志**：不新增第二套取消机制。
@@ -140,12 +150,14 @@ impl Board {
     /// ⚠️ `wipe` **保持置位**（不 take）—— 调用方还要在锁外删；删完再 [`Self::clear_done`]。
     fn take_finished(&mut self) -> bool {
         self.batch = None;
+        self.rev += 1;
         self.wipe
     }
 
     /// 删除结束（成功或失败都必须调）：复位意图。忘了调 ⇒ 永久禁写。
     fn clear_done(&mut self) {
         self.wipe = false;
+        self.rev += 1;
     }
 
     fn clear_block(&self) -> Option<&'static str> {
@@ -155,6 +167,63 @@ impl Board {
             None
         }
     }
+}
+
+/// `get_state` 的「没变就别重算」缓存。
+///
+/// ── 为什么需要它 ────────────────────────────────────────────────────
+/// `get_state` 每秒跑一次，而它做的事是**全量**的：读整个 `state.jsonl` →
+/// 逐行反序列化 → 每条记录再 `serde_json::to_value` → 整体序列化给 IPC。
+/// 实测 2263 条 = 一次约 200ms、载荷约 4MB；而其中 `finished` 的记录
+/// **永远不再变**。界面静止时，这 200ms 与 4MB 全是白干。
+///
+/// ⇒ 指纹（[`view_key`]）没变就只回 active 那几条「已持续」文案（几十字节）。
+/// 指纹变了才走全量。
+#[derive(Default)]
+struct ViewCache {
+    /// 上次全量重算时的指纹。空串 = 没有缓存 / 被 [`GuiState::invalidate_view`] 作废。
+    key: String,
+    /// `(id, state_since)` —— 只有 `stateSinceText` 非空的那几条（= `active` 组）。
+    ///
+    /// 命中缓存时**只重算这几条文案**：它们是全量载荷里唯一每秒都在变的东西，
+    /// 其余一个字节都没变。判据用的是 Rust 已经下发过的字段，不另写状态清单。
+    elapsed: Vec<(String, Option<String>)>,
+}
+
+/// `get_state` 的指纹：**文件侧**（长度 + 修改时间）+ **内存侧**（看板 rev / 清空 / 自动确认）
+/// + **输出目录**。
+///
+/// 文件侧用 `len + mtime` 而不是内容哈希：追加和压实都会改这两个值，
+/// 而一次 `metadata()` 是微秒级（对照：2263 条全量重算是 200ms 级）。
+///
+/// ⚠️ 输出目录**必须进指纹**：设置里改了输出目录时 `state.jsonl` 一个字都不会变，
+/// 但 `filesPresent`（绝对路径 + 在不在盘上）与 `missingArtifact` 全都变了。
+/// 漏了它 ⇒ 改完设置，界面继续指着旧目录说"图在 / 图缺"。
+fn view_key(
+    state_file: &Path,
+    output_dir: &Path,
+    board_rev: u64,
+    clearing: bool,
+    auto_confirm: bool,
+    auto_confirmed: usize,
+) -> String {
+    let (len, modified) = match std::fs::metadata(state_file) {
+        Ok(meta) => (
+            meta.len(),
+            meta.modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or(0),
+        ),
+        // 文件还没建：与「存在但为空」不是一回事，用哨兵长度区分开。
+        Err(_) => (u64::MAX, 0),
+    };
+    format!(
+        "{len}:{modified}:{board_rev}:{auto_confirm}:{auto_confirmed}:{}:{}",
+        if clearing { 'c' } else { '-' },
+        output_dir.display()
+    )
 }
 
 /// GUI 全局状态。
@@ -186,6 +255,8 @@ pub struct GuiState {
     ///
     /// 与 `log` 的另一个区别：**告警不裁剪**。日志可以丢，告警丢了就是骗人。
     alerts: Mutex<Vec<String>>,
+    /// 看板载荷的「没变就别重算」缓存（见 [`ViewCache`]）。
+    view: Mutex<ViewCache>,
 }
 
 impl GuiState {
@@ -196,6 +267,7 @@ impl GuiState {
             cwd,
             board: Mutex::new(Board::default()),
             alerts: Mutex::new(Vec::new()),
+            view: Mutex::new(ViewCache::default()),
             auto_confirm: Arc::new(AtomicBool::new(auto_confirm)),
             env_lock: Mutex::new(()),
         };
@@ -227,6 +299,15 @@ impl GuiState {
     /// 看板槽的唯一取用口（锁中毒按全仓惯例就地恢复）。
     fn board(&self) -> std::sync::MutexGuard<'_, Board> {
         self.board.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// 作废看板缓存 ⇒ 下一轮 `get_state` 强制全量重算。
+    ///
+    /// ⚠️ **上游探针必须调它**：探针改的是界面标题行那句结论，而它是 JS 里拼的、
+    /// 不落 `state.jsonl` ⇒ 文件指纹不变。不作废，标题行会永远停在「探测中…」。
+    fn invalidate_view(&self) {
+        let mut view = self.view.lock().unwrap_or_else(|error| error.into_inner());
+        view.key.clear();
     }
 
     /// 「清空中」统一写闸：**4 个**写任务表的命令在动手前各调一次。
@@ -297,6 +378,141 @@ impl GuiState {
 
 // ── 命令 ──────────────────────────────────────────────────────────────
 
+/// 一次 `get_state` 需要的**内存侧面**（与磁盘无关）。
+///
+/// 抽成结构体的理由：`get_state` 要 `await` 读盘，而锁不能跨 `await` 持有；
+/// 同时它让"读哪些内存、拼什么指纹"变成一个可以直接单测的东西（见文件末尾 v1–v4）。
+struct ViewInput {
+    state_file: PathBuf,
+    output_dir: PathBuf,
+    batch_label: Option<String>,
+    batch_ids: BTreeSet<String>,
+    auto_confirmed: usize,
+    clearing: bool,
+    auto_confirm: bool,
+    board_rev: u64,
+}
+
+impl ViewInput {
+    fn key(&self) -> String {
+        view_key(
+            &self.state_file,
+            &self.output_dir,
+            self.board_rev,
+            self.clearing,
+            self.auto_confirm,
+            self.auto_confirmed,
+        )
+    }
+}
+
+/// 取内存侧快照：只碰锁与原子量，**不读盘**。
+fn view_input(state: &GuiState) -> ViewInput {
+    let state_file = state.state_file();
+    let output_dir = state.output_dir();
+    let auto_confirm = state.auto_confirm.load(Ordering::Relaxed);
+
+    // 计数只在本批存在时有意义；没有批次就是 0（不伪造"上次跑到多少"）。
+    let (batch_label, batch_ids, auto_confirmed, clearing, board_rev) = {
+        let board = state.board();
+        // `clearing` 与 `running` 是**两件事**：清空期间批次往往还在收尾，
+        // 所以 `running` 仍为 true（不撒谎），`clearing` 才是"正在取消全部"。
+        let clearing = board.gate() == Gate::Clearing;
+        match board.batch() {
+            Some(batch) => (
+                Some(batch.label.clone()),
+                batch.ids.clone(),
+                batch.auto_confirm.count(),
+                clearing,
+                board.rev,
+            ),
+            None => (None, BTreeSet::new(), 0, clearing, board.rev),
+        }
+    };
+
+    ViewInput {
+        state_file,
+        output_dir,
+        batch_label,
+        batch_ids,
+        auto_confirmed,
+        clearing,
+        auto_confirm,
+        board_rev,
+    }
+}
+
+/// 缓存命中 ⇒ `{ unchanged, elapsed }`；未命中 ⇒ `None`（调用方去读盘）。
+///
+/// ⚠️ 命中时**仍然重算**那几条「已持续」：它们是全量载荷里唯一每秒都在变的东西。
+/// 文案实现只有 `run::active_elapsed_text` 一份，这里不自己拼字。
+fn cached_payload(view: &Mutex<ViewCache>, key: &str) -> Option<Value> {
+    let view = view.lock().unwrap_or_else(|error| error.into_inner());
+    if view.key != key {
+        return None;
+    }
+    let elapsed: Vec<Value> = view
+        .elapsed
+        .iter()
+        .filter_map(|(id, since)| {
+            crate::run::active_elapsed_text(since.as_deref())
+                .map(|text| json!({ "id": id, "text": text }))
+        })
+        .collect();
+    Some(json!({ "unchanged": true, "elapsed": elapsed }))
+}
+
+/// 全量载荷的收尾：并入内存侧字段、逐条 `following`，并把指纹与 elapsed 写回缓存。
+///
+/// ⚠️ **只在读盘成功之后调** —— 失败时不落指纹，下一轮自然会重算。
+fn finish_payload(view: &Mutex<ViewCache>, input: &ViewInput, key: String, mut payload: Value) -> Value {
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("running".to_string(), Value::Bool(input.batch_label.is_some()));
+        object.insert("clearing".to_string(), Value::Bool(input.clearing));
+        object.insert(
+            "runningBatch".to_string(),
+            input
+                .batch_label
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+        object.insert("autoConfirm".to_string(), Value::Bool(input.auto_confirm));
+        object.insert("autoConfirmed".to_string(), json!(input.auto_confirmed));
+
+        let mut elapsed: Vec<(String, Option<String>)> = Vec::new();
+        if let Some(tasks) = object.get_mut("tasks").and_then(Value::as_array_mut) {
+            for task in tasks {
+                let Some(id) = task.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let following = input.batch_ids.contains(id);
+                // 缓存只收**已经有文案**的那几条（= `active` 组）：判据仍是 Rust 自己
+                // 下发的 `stateSinceText`，不在这里另写一遍"哪些状态要计时"。
+                if task
+                    .get("stateSinceText")
+                    .is_some_and(|value| !value.is_null())
+                {
+                    elapsed.push((
+                        id.to_string(),
+                        task.get("stateSince")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    ));
+                }
+                if let Some(task) = task.as_object_mut() {
+                    task.insert("following".to_string(), Value::Bool(following));
+                }
+            }
+        }
+
+        let mut cached = view.lock().unwrap_or_else(|error| error.into_inner());
+        cached.key = key;
+        cached.elapsed = elapsed;
+    }
+    payload
+}
+
 /// 看板数据（与 `--status --json` **同一份构造**）。
 ///
 /// ── 「在跑」的判据**收口在这里**（DEBT TD-05-22）────────────────────
@@ -319,50 +535,31 @@ impl GuiState {
 /// 它们不是"正在跑"，是**上次被中断留下的残记录**（调度器的队列只由当前提示词
 /// 文件派生，不含它们的 id 就永远不会被复查）。
 /// ⇒ 判据下沉到每一条：`following = 有批次 && 这条 id 在本批次的 ids 里`。
+///
+/// ── 每秒一次，但**大多数秒什么都没变** ─────────────────────────────
+/// 指纹（[`view_key`]）没变就只回 `{ unchanged, elapsed }`（几十字节），
+/// 不再读盘、不再序列化（见 [`ViewCache`]）。指纹一变仍走全量 —— 也就是
+/// 这个函数在任何时刻返回的都是"真话"，只是**没变的时候不必把同一句话重说一遍**。
 #[tauri::command]
-fn get_state(state: tauri::State<'_, GuiState>) -> Result<Value, String> {
-    let mut payload = build_status_json(&state.state_file(), &state.output_dir())?;
-    // 计数只在本批存在时有意义；没有批次就是 0（不伪造"上次跑到多少"）。
-    let (batch, auto_confirmed, clearing) = {
-        let board = state.board();
-        // `clearing` 与 `running` 是**两件事**：清空期间批次往往还在收尾，
-        // 所以 `running` 仍为 true（不撒谎），`clearing` 才是"正在取消全部"。
-        let clearing = board.gate() == Gate::Clearing;
-        match board.batch() {
-            Some(batch) => (
-                Some((batch.label.clone(), batch.ids.clone())),
-                batch.auto_confirm.count(),
-                clearing,
-            ),
-            None => (None, 0, clearing),
-        }
-    };
-    let auto_confirm = state.auto_confirm.load(Ordering::Relaxed);
-    if let Some(object) = payload.as_object_mut() {
-        object.insert("running".to_string(), Value::Bool(batch.is_some()));
-        object.insert("clearing".to_string(), Value::Bool(clearing));
-        object.insert(
-            "runningBatch".to_string(),
-            batch
-                .as_ref()
-                .map(|(label, _)| Value::String(label.clone()))
-                .unwrap_or(Value::Null),
-        );
-        object.insert("autoConfirm".to_string(), Value::Bool(auto_confirm));
-        object.insert("autoConfirmed".to_string(), json!(auto_confirmed));
-        if let Some(tasks) = object.get_mut("tasks").and_then(Value::as_array_mut) {
-            for task in tasks {
-                let following = task
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| batch.as_ref().is_some_and(|(_, ids)| ids.contains(id)));
-                if let Some(task) = task.as_object_mut() {
-                    task.insert("following".to_string(), Value::Bool(following));
-                }
-            }
-        }
+async fn get_state(state: tauri::State<'_, GuiState>) -> Result<Value, String> {
+    // ── 为什么是 `async`（与 `probe_unfinished` 同一条理由）──────────
+    // Tauri 的**同步**命令在主线程上 inline 执行，而这里要读整个 `state.jsonl`
+    // 再整体序列化给 IPC（实测 2263 条 ≈ 200ms）。每秒堵主线程 200ms = 每秒掉一批帧。
+    // ⇒ 读盘那半段挪进 `spawn_blocking`，界面线程始终能响应。
+    //
+    // 三段：① 取内存快照（便宜）→ ② 指纹命中就直接回 → ③ 否则读盘 + 收尾。
+    let input = view_input(&state);
+    let key = input.key();
+    if let Some(hit) = cached_payload(&state.view, &key) {
+        return Ok(hit);
     }
-    Ok(payload)
+    let read_file = input.state_file.clone();
+    let read_dir = input.output_dir.clone();
+    let built =
+        tauri::async_runtime::spawn_blocking(move || build_status_json(&read_file, &read_dir))
+            .await
+            .map_err(|error| format!("状态线程异常退出：{error}"))?;
+    Ok(finish_payload(&state.view, &input, key, built?))
 }
 
 /// 取走**尚未读过的**批次级告警（取走即清，不重复弹）。
@@ -412,37 +609,84 @@ fn list_inbox(state: tauri::State<'_, GuiState>) -> Result<Value, String> {
         paths.sort();
 
         for path in paths {
-            let name = path
-                .file_name()
-                .map(|value| value.to_string_lossy().to_string())
-                .unwrap_or_default();
-            // 读失败**照抛**，绝不 `unwrap_or_default()` 伪装成空文件 ——
-            // 空文本会被解析成「0 条 0 错」，界面于是显示「这个文件是空的」。
-            let text = read_text(&path)
-                .map_err(|error| format!("读不了 {}：{error}", path.display()))?
-                .ok_or_else(|| {
-                    format!("文件在列出之后被移走了：{}（刷新重试）", path.display())
-                })?;
-            let parsed = parse_prompts(&text, &defaults, &ParseOptions::default());
-            let preview: Vec<String> = parsed
-                .tasks
-                .iter()
-                .take(3)
-                .map(|task| task.prompt.clone())
-                .collect();
-            files.push(json!({
-                "name": name,
-                "path": path.display().to_string(),
-                "count": parsed.tasks.len(),
-                "preview": preview,
-                "errors": parsed.errors,
-                "warnings": parsed.warnings,
-                "ok": parsed.errors.is_empty() && !parsed.tasks.is_empty(),
-            }));
+            files.push(inspect_jsonl(&path, &defaults, true)?);
         }
     }
 
     Ok(json!({ "dir": dir.display().to_string(), "files": files }))
+}
+
+/// 校验一个 `.jsonl` → 前端列表行（**不移动、不导入**）。
+///
+/// 抽出来的理由：「inbox 里的文件」与「用户自己挑的文件」必须看到**同一份**检查结果 ——
+/// 两处各写一遍，迟早一处漏字段、两处说法不一致。
+///
+/// 读失败**照抛**，绝不 `unwrap_or_default()` 伪装成空文件 ——
+/// 空文本会被解析成「0 条 0 错」，界面于是显示「这个文件是空的」。
+fn inspect_jsonl(path: &Path, defaults: &PromptDefaults, in_inbox: bool) -> Result<Value, String> {
+    let name = path
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let text = read_text(path)
+        .map_err(|error| format!("读不了 {}：{error}", path.display()))?
+        .ok_or_else(|| format!("文件在列出之后被移走了：{}（刷新重试）", path.display()))?;
+    let parsed = parse_prompts(&text, defaults, &ParseOptions::default());
+    let preview: Vec<String> = parsed
+        .tasks
+        .iter()
+        .take(3)
+        .map(|task| task.prompt.clone())
+        .collect();
+    Ok(json!({
+        "name": name,
+        "path": path.display().to_string(),
+        "count": parsed.tasks.len(),
+        "preview": preview,
+        "errors": parsed.errors,
+        "warnings": parsed.warnings,
+        "ok": parsed.errors.is_empty() && !parsed.tasks.is_empty(),
+        // 只有 inbox 里的文件导入后才会被归位（移进 `inbox/imported/`）——
+        // 前端要据此说清楚「这个文件会不会被移动」。
+        "inbox": in_inbox,
+    }))
+}
+
+/// 弹原生「选择文件」对话框，返回用户选中的路径（取消 ⇒ `None`）。
+///
+/// 起始目录给 `inbox/`（多数时候文件在那儿），但**不限制**在那里 ——
+/// 提示词文件可以放在任何目录，用户想导哪份就导哪份。
+#[tauri::command]
+fn pick_prompt_file(
+    state: tauri::State<'_, GuiState>,
+    app: tauri::AppHandle,
+) -> Result<Option<String>, String> {
+    let mut dialog = app
+        .dialog()
+        .file()
+        .set_title("选择提示词文件（.jsonl）")
+        .add_filter("提示词文件", &["jsonl"]);
+    let inbox = state.cwd.join("inbox");
+    if inbox.is_dir() {
+        dialog = dialog.set_directory(inbox);
+    }
+    // `blocking_*` 只能在**非主线程**调用；同步 command 跑在 Tauri 的阻塞线程池里，安全。
+    Ok(dialog
+        .blocking_pick_file()
+        .and_then(|file| file.into_path().ok())
+        .map(|path| path.display().to_string()))
+}
+
+/// 校验用户自选的一个文件（**只读，不移动**）。
+#[tauri::command]
+fn inspect_prompt_file(state: tauri::State<'_, GuiState>, path: String) -> Result<Value, String> {
+    let path = PathBuf::from(&path);
+    if !path.extension().is_some_and(|ext| ext == "jsonl") {
+        return Err(format!("不是 .jsonl 文件：{}", path.display()));
+    }
+    let (defaults, _) = PromptDefaults::from_env();
+    let in_inbox = is_inbox_child(&state.cwd, &path);
+    inspect_jsonl(&path, &defaults, in_inbox)
 }
 
 /// 起一个批次：把 inbox 里的某个文件交给调度器跑。
@@ -766,16 +1010,19 @@ fn prompts_json(path: &Path) -> Result<Value, String> {
     Ok(Value::Array(tasks))
 }
 
-/// 从 `inbox/` 导入一个文件：**读 + 校验 + 归位**，返回任务给前端。
+/// 导入一个提示词文件：**读 + 校验**（`inbox/` 里的还要归位），返回任务给前端。
 ///
-/// ⚠️ **归位（移进 `inbox/imported/`）是这个动作不可分的一半** ——
-/// 只取不归位 ⇒ 同一个文件可以**反复导入** ⇒ 重复出图、重复扣积分，
-/// 而且全程不报错（DEBT **TD-05-12**）。
-/// 「已处理」的记录**就是文件系统本身**（文件在 `imported/` 里）——
-/// 不另立一份「已导入清单」：那是第二份真相，必然与磁盘漂移。
+/// ⚠️ **归位（移进 `inbox/imported/`）只针对 `inbox/` 的直属文件** ——
+/// 那批文件是「AI 写的、等人发」的，归位就是「已处理」的记录，
+/// 记录**就是文件系统本身**（文件在 `imported/` 里），不另立一份会漂移的
+/// 「已导入清单」（DEBT **TD-05-12**）。
+///
+/// 用户自己从别的目录挑来的文件**原地不动**：那是他的文件夹，程序不该替他搬。
+/// 代价是同一份外部文件可以再导一遍 —— 这是**用户看得见的手动动作**
+/// （队列里会多出那几条，发布前能数、能删），不是静默重复。
 ///
 /// 顺序是**先读+校验、再归位**：
-/// · 校验不过 ⇒ 文件留在 `inbox/`（用户改完还能再来），也不会把错文件搬进 `imported/`；
+/// · 校验不过 ⇒ 文件留在原地（用户改完还能再来），也不会把错文件搬进 `imported/`；
 /// · 归位失败 ⇒ `Err`（不静默）—— 否则用户以为导入成功，下次又导一遍，正好退回原 bug。
 ///
 /// 追加 / 替换是**前端编辑区**的事（待发队列是前端的真相）⇒ 这里**不带 mode 参数**。
@@ -790,8 +1037,25 @@ fn import_inbox(state: tauri::State<'_, GuiState>, file: String) -> Result<Value
 /// 相同：**能力要有一个不绑框架的入口**，否则只能靠真跑 GUI 才能验证。）
 pub fn import_inbox_core(cwd: &Path, file: &Path) -> Result<Value, String> {
     let value = prompts_json(file)?;
-    move_to_imported(cwd, file)?;
+    // ⚠️ 只归位 `inbox/` 的**直属**文件。用户从别的目录挑来的文件属于他自己的文件夹：
+    // 搬走 = 替用户动了别人的目录（且不可逆）。防重复导入靠前端队列里看得见的重复条目。
+    if is_inbox_child(cwd, file) {
+        move_to_imported(cwd, file)?;
+    }
     Ok(value)
+}
+
+/// 这个文件是不是 `inbox/` 的直属子项（`inbox/imported/` 里的不算）。
+///
+/// 比较**父目录**而不是拼字符串：`..`、相对路径、符号链接都能对上真实位置。
+fn is_inbox_child(cwd: &Path, file: &Path) -> bool {
+    let Some(parent) = file.parent() else {
+        return false;
+    };
+    let Ok(inbox) = std::fs::canonicalize(cwd.join("inbox")) else {
+        return false;
+    };
+    std::fs::canonicalize(parent).is_ok_and(|dir| dir == inbox)
 }
 
 /// 把导入过的 inbox 文件移进 `inbox/imported/`。
@@ -1161,9 +1425,14 @@ fn probe_unfinished_core(cwd: &Path) -> Result<Value, String> {
 #[tauri::command]
 async fn probe_unfinished(state: tauri::State<'_, GuiState>) -> Result<Value, String> {
     let cwd = state.cwd.clone();
-    tauri::async_runtime::spawn_blocking(move || probe_unfinished_core(&cwd))
+    let probes = tauri::async_runtime::spawn_blocking(move || probe_unfinished_core(&cwd))
         .await
-        .map_err(|error| format!("探测线程异常退出：{error}"))?
+        .map_err(|error| format!("探测线程异常退出：{error}"))?;
+    // ⚠️ 探测结论**不落** `state.jsonl`（它是界面标题行那句话的原料）⇒ 文件指纹不变。
+    //    不作废缓存，标题行会永远停在「探测中…」（`upstreamSummary()` 进了前端签名，
+    //    但签名只在收到全量载荷时才算）。
+    state.invalidate_view();
+    probes
 }
 
 /// **接着查**那些「没人跟」的未完成任务 —— 把它们重新交给调度器。
@@ -1530,12 +1799,16 @@ pub fn run() {
         }
     };
     tauri::Builder::default()
+        // 原生文件对话框（`pick_prompt_file` 用它）：提示词文件不绑定 `inbox/`。
+        .plugin(tauri_plugin_dialog::init())
         .manage(GuiState::new(cwd))
         .invoke_handler(tauri::generate_handler![
             get_state,
             take_alerts,
             list_inbox,
             list_models,
+            pick_prompt_file,
+            inspect_prompt_file,
             import_inbox,
             publish_queue,
             retry_one,
@@ -1645,5 +1918,174 @@ mod tests {
         );
         board.request_clear();
         assert_eq!(board.clear_block(), Some(CLEARING_BLOCK));
+    }
+
+    // ── `get_state` 的「没变就别重算」缓存（v1–v4）────────────────────
+    //
+    // 立这些用例的理由：**命不中只是变慢，命错才是说假话**。
+    // 指纹漏掉某一维（文件 / 批次 / 开关 / 清空），界面就会永远停在上一轮的
+    // `following` 或计时上 —— 而那正是本仓最不能接受的一类错。
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("lovart-view-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        dir
+    }
+
+    /// 一条只有必填字段的记录（= `state.jsonl` 的一行）。
+    fn record_line(id: &str, status: &str, since: Option<&str>) -> String {
+        let mut value = json!({
+            "id": id,
+            "prompt": "测试提示词",
+            "model": "m",
+            "aspectRatio": "1:1",
+            "imageSize": "1K",
+            "status": status,
+            "attempts": 0,
+            "updatedAt": "2026-10-24T00:00:00.000Z",
+        });
+        if let Some(since) = since {
+            value["stateSince"] = json!(since);
+        }
+        value.to_string()
+    }
+
+    fn input_of(state_file: PathBuf, dir: PathBuf) -> ViewInput {
+        ViewInput {
+            state_file,
+            output_dir: dir,
+            batch_label: None,
+            batch_ids: BTreeSet::new(),
+            auto_confirmed: 0,
+            clearing: false,
+            auto_confirm: false,
+            board_rev: 0,
+        }
+    }
+
+    #[test]
+    fn v1_指纹没变_第二次必须命中且只回计时() {
+        let dir = temp_dir("v1");
+        let since = "2026-10-24T00:00:00.000Z";
+        let file = dir.join("state.jsonl");
+        std::fs::write(&file, record_line("t1", "running", Some(since))).expect("写状态文件");
+        let input = input_of(file, dir);
+        let key = input.key();
+        let view = Mutex::new(ViewCache::default());
+
+        assert!(cached_payload(&view, &key).is_none(), "首次必须未命中");
+        let full = finish_payload(
+            &view,
+            &input,
+            key.clone(),
+            build_status_json(&input.state_file, &input.output_dir).expect("构造看板"),
+        );
+        assert_eq!(full["tasks"].as_array().map(Vec::len), Some(1));
+        assert_eq!(full["tasks"][0]["following"], json!(false));
+
+        let hit = cached_payload(&view, &key).expect("第二次必须命中");
+        assert_eq!(hit["unchanged"], json!(true));
+        assert_eq!(hit["elapsed"][0]["id"], json!("t1"));
+        assert!(
+            hit["elapsed"][0]["text"].as_str().is_some_and(|text| !text.is_empty()),
+            "命中时仍然要重算「已持续」——它是唯一每秒都在变的东西"
+        );
+        assert!(
+            hit["tasks"].is_null(),
+            "命中时不许再带全量任务（那 4MB 就是白搭的）"
+        );
+    }
+
+    #[test]
+    fn v2_状态文件变了_指纹必须变() {
+        let dir = temp_dir("v2");
+        let file = dir.join("state.jsonl");
+        std::fs::write(
+            &file,
+            record_line("t1", "running", Some("2026-10-24T00:00:00.000Z")),
+        )
+        .expect("写状态文件");
+        let before = input_of(file.clone(), dir.clone()).key();
+
+        // 追加一行 —— 与调度器的真实写法一致（只追加，不改已有行）
+        let mut text = std::fs::read_to_string(&file).expect("读状态文件");
+        text.push('\n');
+        text.push_str(&record_line("t1", "done", None));
+        std::fs::write(&file, text).expect("追加状态");
+
+        let after = input_of(file, dir).key();
+        assert_ne!(before, after, "文件变了而指纹没变 ⇒ 界面永远不刷新");
+    }
+
+    #[test]
+    fn v3_批次变了_指纹必须变() {
+        let dir = temp_dir("v3");
+        let file = dir.join("state.jsonl");
+        std::fs::write(
+            &file,
+            record_line("t1", "running", Some("2026-10-24T00:00:00.000Z")),
+        )
+        .expect("写状态文件");
+        let mut input = input_of(file, dir);
+        let before = input.key();
+        // 换了一批（文件一个字没变）—— 变的只有「谁在被跟」
+        input.board_rev += 1;
+        input.batch_ids.insert("t1".to_string());
+        assert_ne!(
+            before,
+            input.key(),
+            "换批但文件没变 ⇒ 必须重算，否则 following 还是上一批的"
+        );
+    }
+
+    #[test]
+    fn v5_输出目录变了_指纹必须变() {
+        let dir = temp_dir("v5");
+        let file = dir.join("state.jsonl");
+        std::fs::write(
+            &file,
+            record_line("t1", "running", Some("2026-10-24T00:00:00.000Z")),
+        )
+        .expect("写状态文件");
+        let mut input = input_of(file, dir.clone());
+        let before = input.key();
+        // 设置里换了输出目录：状态文件一个字没变，但 `filesPresent` 全变了
+        input.output_dir = dir.join("另一个输出目录");
+        assert_ne!(
+            before,
+            input.key(),
+            "指纹漏了输出目录 ⇒ 改完设置界面还指着旧目录说图在不在"
+        );
+    }
+
+    #[test]
+    fn v4_探针回来必须作废缓存() {
+        let dir = temp_dir("v4");
+        std::fs::create_dir_all(dir.join("var")).expect("建 var");
+        let file = dir.join("var/state.jsonl");
+        std::fs::write(
+            &file,
+            record_line("t1", "running", Some("2026-10-24T00:00:00.000Z")),
+        )
+        .expect("写状态文件");
+
+        // 走真实构造：`state_file` / `output_dir` 与生产路径同一套推导
+        let state = GuiState::new(dir);
+        let input = view_input(&state);
+        let key = input.key();
+        finish_payload(
+            &state.view,
+            &input,
+            key.clone(),
+            build_status_json(&input.state_file, &input.output_dir).expect("构造看板"),
+        );
+        assert!(cached_payload(&state.view, &key).is_some(), "先造出命中");
+
+        state.invalidate_view();
+        assert!(
+            cached_payload(&state.view, &key).is_none(),
+            "探针结论不落盘，不作废缓存 ⇒ 标题行永远停在「探测中…」"
+        );
     }
 }
