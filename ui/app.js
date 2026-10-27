@@ -180,7 +180,7 @@ function boardSignature(data) {
     tasks.length,
     body,
     data.runningBatch ? 'r' : '-',
-    // ⚠️ `clearing` **必须进签名**：点「取消所有任务」那一刻，tasks / running 一个都没变，
+    // ⚠️ `clearing` **必须进签名**：点「取消所有未完成任务」那一刻，tasks / running 一个都没变，
     //    变的只是 clearing。签名漏了它 ⇒ 结构"没变" ⇒ 早退 ⇒ 界面上没有任何反馈，
     //    用户看到的是"点了没反应"（与 stopRun 那段注释同一个教训）。
     data.clearing ? 'c' : '-',
@@ -428,6 +428,9 @@ async function refreshBoardOnce() {
     return;
   }
 
+  // 这一份是全量载荷 ⇒ 存下来给**纯前端**的重画用（见 `renderBoardNow`）。
+  lastBoardData = data;
+
   // 顶栏开关状态（切换后另有命令返回值即时刷新）。
   renderAutoConfirm(data.autoConfirm, data.autoConfirmed);
 
@@ -460,15 +463,51 @@ async function refreshBoardOnce() {
 let lastTasks = [];
 
 /**
- * 「正在取消全部任务」—— 后端 `get_state.clearing` 的镜像（**只用于显示和禁用**，
+ * 最近一份**全量**载荷（`get_state` 的非 `unchanged` 返回）。
+ *
+ * 存在的唯一理由：**展开 / 收起是纯前端状态，不在后端指纹里**。
+ * 后端空闲时每秒都回 `{unchanged, elapsed}`，那条分支直接早退 ⇒ 点「已结束」的箭头
+ * 走 `refreshBoard()` 根本到不了 `renderBoard`，箭头与列表一动不动
+ * （用户看到的就是"点了没反应 / 像卡住了"）。所以这类点击必须用这份缓存就地重画。
+ */
+let lastBoardData = null;
+
+/**
+ * 用**上一份全量载荷**重画一次，不请求后端。
+ *
+ * 只给「纯前端开关」（`doneOpen` / `queuedOpen`）用；数据真变了仍由轮询那条路重画。
+ * 还没有任何全量载荷时（首帧）退回正常刷新，不能假装画得出来。
+ */
+function renderBoardNow() {
+  if (!lastBoardData) {
+    void refreshBoard();
+    return;
+  }
+  const scroller = $('boardBody');
+  const keepScroll = scroller.scrollTop;
+  renderBoard(lastBoardData);
+  scroller.scrollTop = keepScroll;
+}
+
+/**
+ * 「正在取消所有未完成任务」—— 后端 `get_state.clearing` 的镜像（**只用于显示和禁用**，
  * 能不能开跑由后端判，前端不自己推）。
  */
 let boardClearing = false;
+
+/**
+ * 有没有批次在跑 —— 后端 `get_state.running` 的镜像（同样只用于显示和禁用）。
+ *
+ * 唯一需要的场合是「清空所有已完成任务」：它要重写整个 `state.jsonl`，跑批中后端会拒，
+ * 那就不该让人点（点了只会弹一句错）。
+ */
+let boardLive = false;
 
 function renderBoard(data) {
   const tasks = data.tasks || [];
   lastTasks = tasks;
   boardClearing = Boolean(data.clearing);
+  boardLive = Boolean(data.running);
   // 分组判据来自 Rust（见文件头的说明），前端不自己算。
   const running = tasks.filter((task) => task.group === 'active');
   const queued = tasks.filter((task) => task.group === 'queued');
@@ -496,7 +535,7 @@ function renderBoard(data) {
   // 只说「未跟进」只讲了本地半边 —— 用户真正要知道的是"那几条还有没有戏"。
   const upstreamNote = stranded > 0 ? ` · ${upstreamSummary()}` : '';
   // 清空期间必须说出来：删除最坏要等 60 秒，界面不写这句就是"点了没反应"。
-  const clearingNote = boardClearing ? ' · 正在取消全部任务' : '';
+  const clearingNote = boardClearing ? ' · 正在取消所有未完成任务' : '';
   $('runningMeta').textContent =
     (live
       ? `${followed} 在跑 · ${queued.length} 排队${stranded > 0 ? ` · ${stranded} 未跟进` : ''}`
@@ -889,7 +928,7 @@ function moreButton(task, file) {
       ))) return;
       removeTasks([task.id], '删除');
     }, true));
-    // 「取消所有任务」**不在这里**：已搬到板级 ⋯（见 `bindBoardMenu`）。
+    // 「取消所有未完成任务」**不在这里**：已搬到板级 ⋯（见 `bindBoardMenu`）。
     //
     // 原设计只在 `task.group === 'active'` 的卡片上给入口，理由是"在正在跑的地方就能停"。
     // 实测反面：**没有处理中任务时它根本不存在** —— 而"一条 `needs_confirm` / 排队记录
@@ -933,14 +972,18 @@ function menuItem(label, onClick, danger, disabled) {
 }
 
 /**
- * 板级 ⋯ 菜单（2026-10-20）：**「取消所有任务」的唯一入口**。
+ * 板级 ⋯ 菜单（2026-10-20）：**两个板级清理动作的唯一入口**。
  *
  * 为什么从卡片搬到这里：原入口只在 `task.group === 'active'` 的卡片菜单里，
  * **没有处理中任务时它根本不存在**。而"一条 `needs_confirm` 卡着、取消不掉"
  * 恰恰是最需要它的时候 —— 后端 `cancel_all_tasks` 的作用域本来就是
  * 「未结束 = 处理中 + 排队 + 待处理」，前端却把入口绑在了其中一个分组上。
  *
+ * 两个动作的作用域**互补**（Rust 侧是 [`is_board_open`] 与它的补集），
+ * 加起来正好是整张表 —— 一个删未结束、一个删已结束，不会重叠也不会漏。
+ *
  * 板级按钮始终可见；`clearing` 期间菜单项置灰（与卡片 ⋯ 同一套 `openMenu`）。
+ * 「清空已完成」另有一条：**跑批中置灰**（后端会拒，别让人白点）。
  */
 function bindBoardMenu() {
   const button = $('btnBoardMore');
@@ -957,10 +1000,15 @@ function bindBoardMenu() {
     }
     const menu = el('div', 'menu');
     // 禁用的菜单项仍然渲染：藏起来会让人以为功能没了。
-    menu.appendChild(menuItem('取消所有任务', () => {
+    menu.appendChild(menuItem('取消所有未完成任务', () => {
       closeMenu();
       cancelAllTasks();
     }, true, boardClearing));
+    menu.appendChild(el('div', 'menu-sep'));
+    menu.appendChild(menuItem('清空所有已完成任务', () => {
+      closeMenu();
+      clearFinishedTasks();
+    }, true, boardClearing || boardLive));
     anchor.appendChild(menu);
     openMenu = menu;
   });
@@ -1569,7 +1617,7 @@ async function stopRun() {
 let cancelAllBusy = false;
 
 /**
- * 取消所有任务 = **停掉当前批次 + 删除全部未结束记录**（已结束的、图片、报告都不动）。
+ * 取消所有未完成任务 = **停掉当前批次 + 删除全部未结束记录**（已结束的、图片、报告都不动）。
  *
  * 顺序由后端保证（先停 → 等批次线程退出 → 再删），前端只做两件事：
  * ① 把不可逆的代价说清；② 把返回值如实转述（不自己推断"应该删完了吧"）。
@@ -1582,20 +1630,53 @@ async function cancelAllTasks() {
   cancelAllBusy = true;
   try {
     const ok = await askConfirm(
-      '取消所有任务？',
+      '取消所有未完成任务？',
       '会停止当前批次（最坏等当前请求结束，约 60 秒），并删除全部未结束任务的记录（含处理中、排队、待处理）。已结束的任务、图片文件和报告都不会删除；上游若仍在生成，那些图不会再被取回。此操作不能撤销。',
     );
     if (!ok) return;
     const result = await invoke('cancel_all_tasks');
     if (result.stopping) {
-      notice('已请求取消全部任务：批次退出后自动清空（最坏约 60 秒）');
+      notice('已请求取消所有未完成任务：批次退出后自动清空（最坏约 60 秒）');
     } else if (result.cleared > 0) {
       notice(`已取消并删除 ${result.cleared} 条未结束任务记录（已结束的任务与图片未删除）`);
     } else {
       notice('没有未结束的任务可删');
     }
   } catch (error) {
-    notice(`取消所有任务失败：${error}`);
+    notice(`取消所有未完成任务失败：${error}`);
+  } finally {
+    cancelAllBusy = false;
+    await refreshBoard();
+  }
+}
+
+/**
+ * 清空所有已完成任务 = **删除「已结束」组的全部记录**（图片、报告都不动）。
+ *
+ * 与「取消所有未完成任务」是两件事：这条**不停批次**（已结束的记录本来没人在跟），
+ * 但它同样要重写整个 `state.jsonl` ⇒ 跑批中后端会拒（界面上菜单项已置灰）。
+ *
+ * 条数从 `lastTasks` 里数 —— 分组判据仍来自 Rust 下发的 `group`，前端不自己判状态。
+ */
+async function clearFinishedTasks() {
+  if (cancelAllBusy) return;
+  const count = lastTasks.filter((task) => task.group === 'finished').length;
+  if (count === 0) {
+    // 后端也会返回 0，但那时候弹确认框只是让人白点一次「确定」。
+    notice('没有已完成的任务可清空');
+    return;
+  }
+  cancelAllBusy = true;
+  try {
+    const ok = await askConfirm(
+      '清空所有已完成任务？',
+      `会删除 ${count} 条已结束任务的记录。图片文件和报告都不会删除；此操作不能撤销（已结束的记录清掉后，界面不再显示它们）。`,
+    );
+    if (!ok) return;
+    const cleared = await invoke('clear_finished_tasks');
+    notice(cleared > 0 ? `已清空 ${cleared} 条已完成任务记录（图片与报告未删除）` : '没有已完成的任务可清空');
+  } catch (error) {
+    notice(`清空已完成任务失败：${error}`);
   } finally {
     cancelAllBusy = false;
     await refreshBoard();
@@ -2123,13 +2204,16 @@ window.addEventListener('DOMContentLoaded', async () => {
     invoke('open_output_dir').catch((error) => notice(`打开输出文件夹失败：${error}`)),
   );
 
+  // ⚠️ 两个展开/收起都是**纯前端状态**，不在后端指纹里 —— 走 `refreshBoard()` 的话，
+  //    空闲时后端回 `unchanged` 会直接早退，`renderBoard` 一次都不跑 ⇒
+  //    箭头不转、列表不出现，看着就是"卡住了"（2026-10-27 实测反馈）。
   $('btnDone').addEventListener('click', () => {
     doneOpen = !doneOpen;
-    refreshBoard();
+    renderBoardNow();
   });
   $('btnQueued').addEventListener('click', () => {
     queuedOpen = !queuedOpen;
-    refreshBoard();
+    renderBoardNow();
   });
 
   bindBoardMenu();

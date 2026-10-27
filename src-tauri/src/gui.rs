@@ -57,11 +57,11 @@ struct RunningBatch {
     ids: BTreeSet<String>,
 }
 
-/// 「正在取消全部任务」期间，**任何**写任务表的命令都返回这一句。
+/// 「正在取消所有未完成任务」期间，**任何**写任务表的命令都返回这一句。
 ///
 /// 唯一一份文案：连点、发布、重跑、接着查、确认、单删都走它 ——
 /// 四处各写一句就会出现"有的说停止有的说清空"的口径分叉。
-const CLEARING_BLOCK: &str = "正在取消全部任务，请稍候";
+const CLEARING_BLOCK: &str = "正在取消所有未完成任务，请稍候";
 
 /// 看板槽：**谁在跑** 与 **是否正在清空** 的同一份状态。
 ///
@@ -92,7 +92,7 @@ struct Board {
 enum Gate {
     Idle,
     Running,
-    /// 正在取消全部任务：要么在等批次退出，要么正在删。
+    /// 正在取消所有未完成任务：要么在等批次退出，要么正在删。
     Clearing,
 }
 
@@ -784,7 +784,7 @@ fn start_run(
 
     {
         let mut board = state.board();
-        // 复核一次：上面那道闸之后，可能有人点了「取消所有任务」（空闲路径会立刻删）。
+        // 复核一次：上面那道闸之后，可能有人点了「取消所有未完成任务」（空闲路径会立刻删）。
         // **置位与判定在同一把锁里** —— 否则批次会挂在清空之后，把记录又写回空表。
         if board.clear_block().is_some() {
             return Err(CLEARING_BLOCK.to_string());
@@ -1524,7 +1524,42 @@ pub fn remove_open_tasks_core(state_file: &Path) -> Result<usize, String> {
     store.remove(&ids).map_err(|error| error.to_string())
 }
 
-/// 取消所有任务：停掉当前批次（若有）→ 等它退出 → 删除全部未结束记录。
+/// 删除**看板已完成**的记录（`finished` 组），返回删除条数。
+///
+/// 判据用 [`crate::run::is_board_finished`] —— 与 `remove_open_tasks_core` 同一份
+/// 分组本体、互为补集，所以两个入口加起来正好覆盖全表、不会重叠也不会漏。
+/// 一条都没有时**不写盘**（没有要删的就别重写整个文件）。
+pub fn remove_finished_tasks_core(state_file: &Path) -> Result<usize, String> {
+    let mut store = StateStore::open(state_file).map_err(|error| error.to_string())?;
+    let ids: Vec<String> = store
+        .all()
+        .into_iter()
+        .filter(|record| crate::run::is_board_finished(record.status))
+        .map(|record| record.id.clone())
+        .collect();
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    store.remove(&ids).map_err(|error| error.to_string())
+}
+
+/// 清空所有已完成任务：删除 `finished` 组的全部记录，返回删除条数。
+///
+/// ── 与「取消所有未完成任务」的区别 ────────────────────────────────
+/// 它**不碰批次**（已结束的记录本来没人在跟），所以不置 `wipe`、也不需要停批；
+/// 但它和单删一样是**重写整个 `state.jsonl`**，因此共用那两道闸：
+/// 清空未结束任务期间拒绝（`ensure_not_clearing`）、跑批中拒绝（追加写会打架）。
+/// 只删记录，图片文件与报告都不动。
+#[tauri::command]
+fn clear_finished_tasks(state: tauri::State<'_, GuiState>) -> Result<usize, String> {
+    state.ensure_not_clearing()?;
+    if state.board().batch().is_some() {
+        return Err("正在跑批，先停止再清空（清空要重写状态文件，和跑批写的是同一个文件）".to_string());
+    }
+    remove_finished_tasks_core(&state.state_file())
+}
+
+/// 取消所有未完成任务：停掉当前批次（若有）→ 等它退出 → 删除全部未结束记录。
 ///
 /// 返回值：
 /// - 空闲：`{"cleared": N, "stopping": false}`（N 就是实际删除条数）
@@ -1819,6 +1854,7 @@ pub fn run() {
             resume_one,
             resume_unfinished,
             remove_tasks,
+            clear_finished_tasks,
             cancel_all_tasks,
             reveal_path,
             open_output_dir,
@@ -1862,7 +1898,7 @@ mod tests {
         assert_eq!(board.request_clear(), ClearIntent::Waiting);
         assert!(
             flag.load(Ordering::SeqCst),
-            "「取消所有任务」必须复用「停止」的那个标志"
+            "「取消所有未完成任务」必须复用「停止」的那个标志"
         );
         assert_eq!(board.gate(), Gate::Clearing, "wipe 必须优先于 batch");
     }
