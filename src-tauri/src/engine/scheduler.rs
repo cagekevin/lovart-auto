@@ -460,8 +460,9 @@ struct Ctx {
     queue: Vec<String>,
     /// 全局提交闸门（间隔 + 429 熔断）。
     gate: SubmitGate,
-    /// 排队模式是否已设置（惰性初始化，正常跑批只调 1 次）。
-    mode_ready: bool,
+    /// 本批是否已经记过「排队模式已设置」—— **只影响日志**，不影响行为。
+    /// 每条提交前都会重设（见 [`Shared::ensure_mode`]），这里只是避免刷屏。
+    mode_logged: bool,
 }
 
 fn now_ms() -> u64 {
@@ -482,8 +483,6 @@ struct Shared {
     cancelled: Arc<AtomicBool>,
     /// 自动确认策略（全局开关 + 本批计数 + 本批许可）。
     auto_confirm: Arc<AutoConfirm>,
-    /// `set_mode` 的 once 守卫：只让一个 worker 进去，网络 I/O 不持 `Ctx` 锁。
-    mode_init: Mutex<()>,
 }
 
 impl Shared {
@@ -499,20 +498,38 @@ impl Shared {
         self.cancelled.load(Ordering::SeqCst)
     }
 
-    /// 惰性设置排队模式：once 守卫，正常跑批只调 1 次。
+    /// 提交前把服务端模式设回排队（`unlimited`，免费）。**每条提交都调**。
+    ///
+    /// ── 为什么不是「每批一次」────────────────────────────────────────
+    /// 服务端模式是**账号级持久设置**，不是本进程的局部状态：手机、另一台电脑、
+    /// AI Canvas 任何一处点了 fast，都会把它改掉，而 fast 是**扣积分**的。
+    /// 一批能跑十几个小时（2026-11-03 那批 18:39 → 次日 08:55），只在开头设一次
+    /// ⇒ 中途被改之后，后面每一条都在裸奔。
+    ///
+    /// 实测（2026-11-04 10:42 那批 13 张，`var/run.log` 50341-50483）：
+    /// 前 4 张在免费队列里等了 26~28 分钟；模式在 10:42:42~10:47:55 之间被外部
+    /// 改成 fast 后，后 9 张全部 66~70 秒出图 —— 那就是被扣积分的那 9 张。
+    /// 当时本批只在 10:42:23 设过一次，之后一次都没设、也没校验。
+    ///
+    /// ── 代价 ────────────────────────────────────────────────────────
+    /// 每条多 1 次 `/mode/set`（实测约 1.6s）。它发生在 `SubmitGate` 已 claim 之后，
+    /// 而闸门本来就强制提交间隔（默认 6s）⇒ **这 1.6s 藏在原本的空等里，不增加墙钟时间**。
+    /// 日志只在**首次成功**时打一行，其余静默（否则 1590 条就是 1590 行噪音）。
+    ///
+    /// ── 失败 ────────────────────────────────────────────────────────
+    /// 返回 `Err` ⇒ 调用方**不提交**（见 [`run_submit`]）。宁可不发，也不在未知模式下扣钱。
     fn ensure_mode(&self, deps: &ClientDeps, ports: &dyn Ports) -> Result<(), LovartError> {
-        if self.lock().mode_ready {
-            return Ok(());
-        }
-        let _guard = self
-            .mode_init
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if self.lock().mode_ready {
-            return Ok(());
-        }
+        // 网络 I/O 一律在锁外：这里只把结果搬进 `Ctx`。
         ports.set_mode(deps, true)?;
-        self.lock().mode_ready = true;
+        let first = {
+            let mut ctx = self.lock();
+            let first = !ctx.mode_logged;
+            ctx.mode_logged = true;
+            first
+        };
+        if first {
+            self.log("排队模式已设置（unlimited / 免费）—— 之后每条提交前都会重设");
+        }
         Ok(())
     }
 
@@ -818,7 +835,8 @@ fn run_submit(worker_id: usize, id: &str, shared: &Shared) {
         task.model, task.image_size, task.aspect_ratio
     ));
 
-    // 服务端模式是持久设置：只在首次提交时惰性设置一次（once 守卫）。
+    // 服务端模式是**账号级**持久设置，随时会被别处改回 fast ⇒ **每条提交前都重设**。
+    // 失败就不发（退回 pending，下次重投时再设一次），不在未知模式下花钱。
     if let Err(error) = shared.ensure_mode(&deps, ports.as_ref()) {
         handle_submit_error(worker_id, id, &error, &record, shared);
         return;
@@ -1661,7 +1679,7 @@ pub fn run_scheduler(options: SchedulerOptions) -> Result<SchedulerSummary, Lova
         task_by_id,
         queue,
         gate: SubmitGate::new(task_interval, rate_limit_backoff_base),
-        mode_ready: false,
+        mode_logged: false,
     };
     let queue_len = ctx.queue.len();
 
@@ -1680,7 +1698,6 @@ pub fn run_scheduler(options: SchedulerOptions) -> Result<SchedulerSummary, Lova
         log: Arc::clone(&log),
         cancelled,
         auto_confirm,
-        mode_init: Mutex::new(()),
     });
 
     let mut handles = Vec::new();

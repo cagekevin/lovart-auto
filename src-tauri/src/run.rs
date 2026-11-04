@@ -1080,7 +1080,10 @@ pub fn main_with_args(argv: &[String]) -> Result<(), String> {
     log(&format!("接口地址 {}", connection.base_url));
     let deps = to_client_deps(&connection)?;
 
-    // 4. 排队模式：服务端是持久设置，开工前先设一次
+    // 4. 排队模式：服务端是**账号级**持久设置，开工前先设一次并回读。
+    //    这里只是**早失败**（凭据 / 网络不通就别开跑，省得跑一半才发现）；
+    //    调度器在**每条提交前**还会再设一次（见 `scheduler::Shared::ensure_mode`），
+    //    因为跑批可能持续十几个小时，中途随时会被别的设备改回 fast（扣积分）。
     set_mode(&deps, true).map_err(|error| error.to_string())?;
     let mode = query_mode(&deps).ok();
     log(&format!(

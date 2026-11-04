@@ -201,7 +201,7 @@ fn 轮询_429_会等熔断到期再重试() {
 }
 
 #[test]
-fn 排队模式只设置一次() {
+fn 每条提交前都设置排队模式() {
     let script = done_script(json!({ "concurrency": 3, "taskIntervalMs": 0 }));
     let f = TempFixture::new(
         "{\"prompt\":\"a\"}\n{\"prompt\":\"b\"}\n{\"prompt\":\"c\"}\n",
@@ -209,10 +209,12 @@ fn 排队模式只设置一次() {
     );
     let run = f.run();
 
+    // 服务端模式是**账号级持久设置**，跑批中途可能被别的设备改回 fast（扣积分）。
+    // 只在开头设一次 ⇒ 后面每一条都在裸奔（2026-11-04 那批 13 张漏了 9 张）。
     assert_eq!(
         run.calls.iter().filter(|path| *path == "/mode/set").count(),
-        1,
-        "set_mode 只应调用一次"
+        3,
+        "每条提交前都应重设排队模式"
     );
 }
 
