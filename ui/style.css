@@ -1166,6 +1166,15 @@ button { cursor: pointer; color: inherit; }
   gap: var(--sp-2);
 }
 
+/* 工具条右端（数量 + 发送）：`margin-left:auto` 把它顶到最右，
+   模型/比例/尺寸靠左 —— 与截图里的位置一致。 */
+.bar-tail {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  margin-left: auto;
+}
+
 .bar-label {
   font-size: var(--fs-xs);
   color: var(--ink-3);
@@ -1264,35 +1273,10 @@ select {
 
 select:focus { border-color: var(--ink); }
 
-/* 分段控件（比例 / 尺寸） */
-.seg {
-  display: flex;
-  gap: 2px;
-  padding: 2px;
-  border-radius: var(--r-md);
-  background: var(--bg);
-}
-
-.seg button {
-  height: calc(var(--h-ctl) - 4px);
-  padding: 0 10px;
-  border: none;
-  border-radius: var(--r-sm);
-  background: transparent;
-  color: var(--ink-2);
-  font-size: var(--fs-sm);
-  white-space: nowrap;
-  line-height: 1;
-}
-
-.seg button:hover { color: var(--ink); }
-
-.seg button.is-on {
-  background: var(--bg-sub);
-  color: var(--ink);
-  font-weight: 500;
-  box-shadow: var(--shadow);
-}
+/* 比例 / 尺寸的下拉：**同一个 `select` 规格**，只是宽度按内容收窄。
+   全局 `select` 的 `min-width: 148px` 是给模型名留的（最长那条要放得下），
+   而比例/尺寸的值最多 4 个字，照搬会把工具条顶到换行。 */
+select.select-short { min-width: 84px; }
 
 /* ══ 工作台：待发 ══════════════════════════════════════════════════ */
 
@@ -1508,6 +1492,38 @@ select:focus { border-color: var(--ink); }
   margin-top: 2px;
   font-size: var(--fs-xs);
   color: var(--ink-3);
+}
+
+/* 份数 / 数量输入框（**两处共用这一套**：导入弹窗的「份数」、工具条右端的「数量」）。
+   窄输入框，紧挨它右边的动作按钮；原生上下箭头在 56px 里会盖住数字，去掉
+   （份数靠直接输入，1→4 比点三次快）。 */
+.copies-input {
+  width: 56px;
+  flex: 0 0 auto;
+  height: var(--h-ctl);
+  padding: 0 var(--sp-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg-sub);
+  color: var(--ink);
+  font-size: var(--fs-sm);
+  text-align: center;
+  outline: none;
+}
+
+.copies-input:focus {
+  border-color: var(--ink);
+  background: var(--bg);
+}
+
+.copies-input:disabled {
+  color: var(--ink-3);
+}
+
+.copies-input::-webkit-inner-spin-button,
+.copies-input::-webkit-outer-spin-button {
+  appearance: none;
+  margin: 0;
 }
 
 .import-errors {

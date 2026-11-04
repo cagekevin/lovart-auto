@@ -150,7 +150,8 @@
             <div class="prompt-input" id="promptInput" contenteditable="true"
               role="textbox" aria-multiline="true" aria-label="提示词"></div>
             <!-- 占位符：`contentEditable` **没有 placeholder** ⇒ 用一个绝对定位的兄弟节点顶上。
-                 显隐判据是**序列化后的文本**（不是 `innerHTML`），见 app.js 的 syncPromptPlaceholder。 -->
+                 显隐判据是**序列化后的文本**（不是 `innerHTML`），见 app.js 的 syncComposerState
+                 （它同时决定「发送」按钮的可用性 —— 同一个判据只判一次）。 -->
             <span class="prompt-placeholder" id="promptPlaceholder" aria-hidden="true"
               >描述画面（输入 @ 引用垫图）</span>
             <!-- `@` 候选弹层：内容与坐标由 app.js 算（判定/定位在 `ui/promptMention.js`）。
@@ -164,13 +165,28 @@
             <label class="bar-label" for="modelSelect">模型</label>
             <select id="modelSelect"></select>
           </div>
+          <!-- 比例 / 尺寸 = 与「模型」**同款下拉**（原先是一条工具条上并存
+               分段按钮 + 下拉两种控件，选中反馈也不一样）。 -->
           <div class="bar-field">
-            <span class="bar-label">比例</span>
-            <div class="seg" id="ratioSeg"></div>
+            <label class="bar-label" for="ratioSelect">比例</label>
+            <select class="select-short" id="ratioSelect"></select>
           </div>
           <div class="bar-field">
-            <span class="bar-label">尺寸</span>
-            <div class="seg" id="sizeSeg"></div>
+            <label class="bar-label" for="sizeSelect">尺寸</label>
+            <select class="select-short" id="sizeSelect"></select>
+          </div>
+          <!-- 右端：数量 + 发送。
+               ⚠️ 两者都只是「加入待发」，真正花钱的是下面的「发布任务」——
+                  所以这里不写「提交 / 发布」，否则用户会以为点一下就扣积分。
+               回车与「发送」是**同一个入口**（都走 app.js 的 `addToQueue`），
+               数量 = 这条提示词入队几份（每份一个独立任务、一张不同的图）。
+               `max` 由 app.js 按 `MAX_COPIES` 填，不在 HTML 里写第二份 20。 -->
+          <div class="bar-tail">
+            <div class="bar-field">
+              <label class="bar-label" for="copiesInput">数量</label>
+              <input class="copies-input" id="copiesInput" type="number" min="1" step="1" value="1" />
+            </div>
+            <button class="btn btn-sm btn-primary" id="btnSend" title="加入待发（回车同效）">发送</button>
           </div>
         </div>
       </div>

@@ -18,8 +18,8 @@ const { invoke } = window.__TAURI__.core;
 
 // ── 常量 ─────────────────────────────────────────────────────────────
 
-// 主界面分段控件：只放最常用的四个，再多会把工具条挤到换行。
-const RATIOS = ['1:1', '3:4', '4:3', '16:9'];
+// 主界面比例下拉的候选：只放最常用的几个（下拉不额外占宽度，但选项太多反而要翻）。
+const RATIOS = ['1:1', '3:4', '4:3', '16:9', '9:16'];
 // 设置页兜底比例的下拉候选：横竖版都覆盖。解析器本身接受任意 `w:h`，
 // 这里只是把常用值列全，省得用户去猜能填什么。
 const RATIO_CHOICES = [
@@ -35,6 +35,14 @@ const RATIO_CHOICES = [
   '4:5',
 ];
 const SIZES = ['1K', '2K', '4K'];
+
+/**
+ * 导入时可选的**份数**上限。
+ *
+ * 份数 = 同一批把这几条**各提交 N 次**，上游会出 N 张不同的图。
+ * 每份占一个并发槽位（硬上限 7），20 已经远超单批抽卡的合理量，再大基本是误输入。
+ */
+const MAX_COPIES = 20;
 
 /**
  * ⚠️ **这里刻意不定义任何状态清单。**
@@ -97,6 +105,19 @@ function clear(node) {
 
 function show(node, visible) {
   node.hidden = !visible;
+}
+
+/**
+ * 解析导入份数：**只接受 1..MAX_COPIES 的整数**，其余一律 `null`。
+ *
+ * 为什么不夹到边界：把 `0` 静默改成 1、把 `99` 改成 20，用户会以为"我设的生效了"
+ * —— 本仓头号伪装型债就是「失败伪装成成功」。调用方拿到 `null` 必须报错且不入队。
+ */
+function parseCopies(raw) {
+  const text = String(raw ?? '').trim();
+  if (!/^\d+$/.test(text)) return null;
+  const value = Number(text);
+  return value >= 1 && value <= MAX_COPIES ? value : null;
 }
 
 /**
@@ -1166,25 +1187,39 @@ function addToQueue() {
   // 「纯文本 + 参考图」。芯片在文本里的位置换成 `[img=图片N]`（N = 首次出现顺序）。
   const resolved = chips.resolvePromptChips(chips.serializeDOM(input), draft.refs);
   if (!resolved.text) return;
+  // 数量**先校验再入队**，与「从 inbox 导入」的份数同一口径（`parseCopies`）：
+  // 不夹到边界、也不静默按 1 发 —— 否则用户会以为「我设的生效了」。
+  const copies = parseCopies($('copiesInput').value);
+  if (copies === null) {
+    notice(`数量要填 1–${MAX_COPIES} 的整数，这条没有加入待发`);
+    return;
+  }
   const labelOf = (url) => {
     const hit = draft.refs.find((ref) => ref.url === url);
     return hit ? hit.label : '';
   };
-  queue.push({
-    prompt: resolved.text,
-    model: draft.model,
-    ratio: draft.ratio,
-    size: draft.size,
-    // ⚠️ **顺序是语义**：`@` 芯片引用的在前（对应文本里的「图片N」编号），其余垫图在后；
-    //    按 url 去重（同一张图既是芯片又整张垫着，只算一次）。
-    refs: chips
-      .mergeReferenceImageUrls(resolved.refImages, draft.refs)
-      .map((url) => ({ url, label: labelOf(url) })),
-  });
+  // ⚠️ **顺序是语义**：`@` 芯片引用的在前（对应文本里的「图片N」编号），其余垫图在后；
+  //    按 url 去重（同一张图既是芯片又整张垫着，只算一次）。
+  const refs = chips
+    .mergeReferenceImageUrls(resolved.refImages, draft.refs)
+    .map((url) => ({ url, label: labelOf(url) }));
+  // 数量 N = 同一条 push N 次，且**每份都是独立对象**（`refs` 各拷一份）——
+  // 共用引用会让「改一条」联动全部（与 `importFile` 的份数同一口径）。
+  for (let copy = 0; copy < copies; copy += 1) {
+    queue.push({
+      prompt: resolved.text,
+      model: draft.model,
+      ratio: draft.ratio,
+      size: draft.size,
+      refs: refs.map((ref) => ({ ...ref })),
+    });
+  }
   clear(input);
   closeMentions();
   input.focus();
   renderQueue();
+  syncComposerState(); // 输入框已清空 ⇒ 占位符回来、「发送」变灰
+  if (copies > 1) notice(`已加入待发 ${copies} 条`);
 }
 
 // ── 垫图 ─────────────────────────────────────────────────────────────
@@ -1292,14 +1327,19 @@ function mentionCandidates() {
 }
 
 /**
- * 占位符显隐。
+ * 合成器状态：占位符显隐 + 「发送」可用性。
+ *
+ * 两件事**共用一个判据**（序列化后的文本是否为空）：各判一次迟早会有一处漏掉，
+ * 出现「占位符还显示着，按钮却能点」或反过来「按钮永远灰着」。
  *
  * ⚠️ `contentEditable` **没有 placeholder** ⇒ 用一个绝对定位的兄弟节点当占位符。
  *    判据是**序列化后的文本**，不是 `innerHTML` —— 只剩一个空 `<br>` 或零宽空格时，
  *    `innerHTML` 非空但内容其实是空的（那时占位符必须继续显示）。
  */
-function syncPromptPlaceholder() {
-  show($('promptPlaceholder'), window.PromptChips.serializeDOM($('promptInput')) === '');
+function syncComposerState() {
+  const empty = window.PromptChips.serializeDOM($('promptInput')) === '';
+  show($('promptPlaceholder'), empty);
+  $('btnSend').disabled = empty;
 }
 
 /** 取「`@` 字符」的视口矩形（fixed 弹层的锚点）；找不到时退回光标矩形。 */
@@ -1437,7 +1477,7 @@ function pickMention(item) {
   }
   insertChipAtCursor(item);
   closeMentions();
-  syncPromptPlaceholder();
+  syncComposerState();
 }
 
 /** 把芯片插到**当前光标处**（光标不在编辑器里就插到末尾）。 */
@@ -1518,7 +1558,7 @@ function removeChipsById(id) {
   }
   if (changed) {
     window.PromptChips.normalizeChipSlots(input);
-    syncPromptPlaceholder();
+    syncComposerState();
   }
 }
 
@@ -1538,27 +1578,25 @@ async function wireDropZone() {
   }
 }
 
-// ── 分段控件 ─────────────────────────────────────────────────────────
+// ── 参数下拉（比例 / 尺寸）────────────────────────────────────────────
 
-function pickRatio(value) {
-  draft.ratio = value;
-  renderSeg('ratioSeg', RATIOS, draft.ratio, pickRatio);
-}
-
-function pickSize(value) {
-  draft.size = value;
-  renderSeg('sizeSeg', SIZES, draft.size, pickSize);
-}
-
-function renderSeg(id, values, current, onPick) {
+/**
+ * 把候选值画进一个 `<select>`，返回**实际生效**的值。
+ *
+ * 与「模型」下拉同一套规格（原生 `<select>`）：一条工具条上只该有一种参数控件。
+ * 值不在候选里（`.env` 手改过）时退回第一个 —— 绝不留一个空下拉，
+ * 否则用户看到的是「设置丢了」，而发出去的是空参数（解析器会直接报错）。
+ */
+function renderParamSelect(id, values, current) {
   const box = $(id);
   clear(box);
   for (const value of values) {
-    const button = el('button', value === current ? 'is-on' : '', value);
-    button.type = 'button';
-    button.addEventListener('click', () => onPick(value));
-    box.appendChild(button);
+    const option = el('option', '', value);
+    option.value = value;
+    box.appendChild(option);
   }
+  box.value = values.includes(current) ? current : values[0];
+  return box.value;
 }
 
 // ── 弹窗 ─────────────────────────────────────────────────────────────
@@ -1735,8 +1773,31 @@ function renderImportList() {
     }
     row.appendChild(text);
 
+    // 份数：值挂在 `file` 上，**不只存在 DOM 里** —— 「选择文件…」会重渲染整个列表，
+    // DOM 一重建，输入框就回到 1（份数是用户刚设的，不能悄悄丢）。
+    const copies = el('input', 'copies-input');
+    copies.type = 'number';
+    copies.min = '1';
+    copies.max = String(MAX_COPIES);
+    copies.step = '1';
+    copies.value = String(file.copies ?? 1);
+    copies.disabled = !file.ok;
+    copies.title = `份数：每条提交 N 次，出 N 张不同的图（占 N 个并发槽位，上限 ${MAX_COPIES}）`;
+    row.appendChild(copies);
+
     const button = el('button', 'btn btn-sm', '导入');
     button.disabled = !file.ok;
+    // 按钮文案**带结果条数**：点之前就能看见会入队几条，不用自己乘。
+    // 份数非法时只写「导入」—— 不猜他打算填多少，点下去会报错。
+    const syncLabel = () => {
+      const parsed = parseCopies(file.copies ?? 1);
+      button.textContent = file.ok && parsed ? `导入 ${file.count * parsed} 条` : '导入';
+    };
+    copies.addEventListener('input', () => {
+      file.copies = copies.value;
+      syncLabel();
+    });
+    syncLabel();
     button.addEventListener('click', () => importFile(index));
     row.appendChild(button);
     list.appendChild(row);
@@ -1775,29 +1836,44 @@ async function pickImportFile() {
 async function importFile(index) {
   const file = inboxFiles[index];
   if (!file) return;
+  // 份数**先校验再调后端**：`import_inbox` 会顺手把 inbox 文件归位，
+  // 校验放它后面就会出现「文件搬走了、一条都没入队」。
+  const copies = parseCopies(file.copies ?? 1);
+  if (copies === null) {
+    notice(`份数要填 1–${MAX_COPIES} 的整数，这个文件没有导入`);
+    return;
+  }
   try {
     // 后端一次做完「读 + 校验 + 归位」（移进 inbox/imported/）——
     // 归位失败会抛错，不会静默留下一份还能被再导入一次的文件（TD-05-12）。
     const tasks = await invoke('import_inbox', { file: file.path });
     for (const task of tasks) {
-      queue.push({
-        prompt: task.prompt,
-        model: task.model,
-        ratio: task.aspectRatio,
-        size: task.imageSize,
-        // ⚠️ 后端给的是 **url 字符串数组**，而队列里的 `refs` 必须是 `{id,url,label}`
-        //    （见文件头的约定）。原先直接塞字符串 ⇒ 两个后果一起出现：
-        //    ① 待发缩略图取 `firstRef.url` 得 undefined ⇒ 一片破图；
-        //    ② 发布时 `.map((ref) => ref.url)` 全变 undefined ⇒ queue.jsonl 里
-        //       **refs 整段消失**，整批静默退化成文生图（垫图白垫，产品全靠猜）。
-        refs: (task.refs || []).map((url) => {
-          refSeq += 1;
-          return { id: `ref-${refSeq}`, url, label: refLabelOf(url, refSeq) };
-        }),
+      // ⚠️ 后端给的是 **url 字符串数组**，而队列里的 `refs` 必须是 `{id,url,label}`
+      //    （见文件头的约定）。原先直接塞字符串 ⇒ 两个后果一起出现：
+      //    ① 待发缩略图取 `firstRef.url` 得 undefined ⇒ 一片破图；
+      //    ② 发布时 `.map((ref) => ref.url)` 全变 undefined ⇒ queue.jsonl 里
+      //       **refs 整段消失**，整批静默退化成文生图（垫图白垫，产品全靠猜）。
+      const refs = (task.refs || []).map((url) => {
+        refSeq += 1;
+        return { id: `ref-${refSeq}`, url, label: refLabelOf(url, refSeq) };
       });
+      // 份数：同一条 push N 次，且**每份都是独立对象**（`refs` 也要各拷一份）——
+      // 共用引用会让「改一条」联动全部。
+      // 重复行的 id 由后端 `parse_prompts` 按出现次序生成 `hash` / `hash-2` / `hash-3`…，
+      // 所以 N 份 = N 个独立任务（N 张不同的图），不是「同一任务提交 N 次」。
+      for (let copy = 0; copy < copies; copy += 1) {
+        queue.push({
+          prompt: task.prompt,
+          model: task.model,
+          ratio: task.aspectRatio,
+          size: task.imageSize,
+          refs: refs.map((ref) => ({ ...ref })),
+        });
+      }
     }
     renderQueue();
-    notice(`已导入 ${tasks.length} 条`);
+    const total = tasks.length * copies;
+    notice(copies > 1 ? `已导入 ${total} 条（${tasks.length} 条 × ${copies} 份）` : `已导入 ${total} 条`);
     // 按 path 删行，**不用点击时的索引**：等待期间列表可能被「选择文件…」插了新行，
     // 索引会错位 ⇒ 删掉别的行、还留下一行点不动的幽灵行。
     const at = inboxFiles.findIndex((item) => item.path === file.path);
@@ -1833,8 +1909,8 @@ async function loadSettings() {
  */
 function applyDefaultSettings(settings) {
   if (settings) {
-    // 比例可能是手改 `.env` 写进去的非常用值（如 9:16）：补进分段控件，
-    // 否则一个都不高亮，用户会以为设置丢了。
+    // 比例可能是手改 `.env` 写进去的非常用值（如 9:16）：补进下拉候选，
+    // 否则下拉会跳回第一个，用户会以为设置丢了。
     if (settings.defaultRatio && !RATIOS.includes(settings.defaultRatio)) {
       RATIOS.push(settings.defaultRatio);
     }
@@ -1845,9 +1921,9 @@ function applyDefaultSettings(settings) {
       $('modelSelect').value = draft.model;
     }
   }
-  // 无论有没有读到设置都要画一次：分段控件不能是空白。
-  renderSeg('ratioSeg', RATIOS, draft.ratio, pickRatio);
-  renderSeg('sizeSeg', SIZES, draft.size, pickSize);
+  // 无论有没有读到设置都要画一次：下拉不能是空白。
+  draft.ratio = renderParamSelect('ratioSelect', RATIOS, draft.ratio);
+  draft.size = renderParamSelect('sizeSelect', SIZES, draft.size);
 }
 
 /** 设置弹窗里的三个兜底下拉：选项来自后端模型表 + 前端的合法值清单（与合成器同一份）。 */
@@ -2032,7 +2108,7 @@ window.addEventListener('DOMContentLoaded', async () => {
 
   const promptInput = $('promptInput');
   promptInput.addEventListener('input', () => {
-    syncPromptPlaceholder();
+    syncComposerState();
     if (composing) return; // 输入法组字中不判定（中文输入不会被候选弹层打断）
     detectMention();
   });
@@ -2086,18 +2162,19 @@ window.addEventListener('DOMContentLoaded', async () => {
       range.collapse(true);
       selection.removeAllRanges();
       selection.addRange(range);
-      syncPromptPlaceholder();
+      syncComposerState();
       return;
     }
     if (event.key === 'Backspace' || event.key === 'Delete') {
       if (deleteChipNearCursor()) {
         event.preventDefault();
         window.PromptChips.normalizeChipSlots(promptInput);
-        syncPromptPlaceholder();
+        syncComposerState();
         return;
       }
     }
-    // ⚠️ Enter = 加入待发（本工具的老习惯）；换行走 Shift+Enter（上面已处理）。
+    // ⚠️ Enter = 加入待发（本工具的老习惯），与工具条右端的「发送」**同一个入口**
+    //    （都走 `addToQueue`）；换行走 Shift+Enter（上面已处理）。
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault();
       addToQueue();
@@ -2116,7 +2193,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     range.collapse(false);
     selection.removeAllRanges();
     selection.addRange(range);
-    syncPromptPlaceholder();
+    syncComposerState();
     detectMention();
   });
   promptInput.addEventListener('compositionstart', () => {
@@ -2127,7 +2204,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     composing = false;
   });
   promptInput.addEventListener('blur', () => {
-    syncPromptPlaceholder();
+    syncComposerState();
     // 延后一拍：候选行的 `mousedown` 要先跑完（它 preventDefault 了默认的失焦）
     setTimeout(closeMentions, 0);
   });
@@ -2138,7 +2215,18 @@ window.addEventListener('DOMContentLoaded', async () => {
     if (promptInput.contains(event.target) || menu.contains(event.target)) return;
     closeMentions();
   });
-  syncPromptPlaceholder();
+  // 比例 / 尺寸：与模型下拉同款 —— 改了就写进 `draft`。**不重画控件**
+  // （`<select>` 自己维护选中态，重画会把焦点抢走）。
+  $('ratioSelect').addEventListener('change', () => { draft.ratio = $('ratioSelect').value; });
+  $('sizeSelect').addEventListener('change', () => { draft.size = $('sizeSelect').value; });
+
+  // 数量：上限取自 `MAX_COPIES`（HTML 里不写第二份 20）；说明文案同理，
+  // 免得改了常量、界面还在说旧数字。
+  const copiesInput = $('copiesInput');
+  copiesInput.max = String(MAX_COPIES);
+  copiesInput.title = `数量：这条提示词入队几次（每份一个独立任务、一张不同的图，占同样多个并发槽位，上限 ${MAX_COPIES}）`;
+  $('btnSend').addEventListener('click', addToQueue);
+  syncComposerState();
 
   $('refPicker').addEventListener('change', (event) => {
     const files = Array.from(event.target.files || []);
