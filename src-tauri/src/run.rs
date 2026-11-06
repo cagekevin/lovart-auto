@@ -766,7 +766,7 @@ pub fn image_models_json() -> Vec<Value> {
 /// 文本表格投影 —— `--list-models` 用。
 ///
 /// 列宽**从数据算**，不写死：曾经写死 `{alias:<28}`，而最长的别名
-/// `gpt-image-2.5-sunburst-medium` 是 **30** 字符 ⇒ 那一行只剩一个空格、整列歪掉。
+/// `gpt-image-2.6-sunburst-medium` 是 **30** 字符 ⇒ 那一行只剩一个空格、整列歪掉。
 /// 写死宽度与"文档里写死测试条数"是同一类病：写的时候对，加一个更长的名字就歪，
 /// **而且不会有任何东西变红**。
 fn image_models_text() -> String {

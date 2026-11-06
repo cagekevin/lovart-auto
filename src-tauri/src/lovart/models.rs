@@ -81,28 +81,28 @@ pub const MODEL_SPECS: &[ModelSpec] = &[
         readable_name: "Nano Banana 2 Lite",
     },
     ModelSpec {
-        id: "gpt-image-2.5-sunburst-low",
+        id: "gpt-image-2.6-sunburst-low",
         category: Category::Image,
         tool: None,
-        readable_name: "GPT Image 2.5 Sunburst Low",
+        readable_name: "GPT Image 2.6 Sunburst Low",
     },
     ModelSpec {
-        id: "gpt-image-2.5-sunburst-medium",
+        id: "gpt-image-2.6-sunburst-medium",
         category: Category::Image,
         tool: None,
-        readable_name: "GPT Image 2.5 Sunburst Medium",
+        readable_name: "GPT Image 2.6 Sunburst Medium",
     },
     ModelSpec {
-        id: "gpt-image-2.5-flare-low",
+        id: "gpt-image-2.6-flare-low",
         category: Category::Image,
         tool: None,
-        readable_name: "GPT Image 2.5 Flare Low",
+        readable_name: "GPT Image 2.6 Flare Low",
     },
     ModelSpec {
-        id: "gpt-image-2.5-flare-medium",
+        id: "gpt-image-2.6-flare-medium",
         category: Category::Image,
         tool: None,
-        readable_name: "GPT Image 2.5 Flare Medium",
+        readable_name: "GPT Image 2.6 Flare Medium",
     },
     ModelSpec {
         id: "lovart-chat",
@@ -164,44 +164,44 @@ pub const IMAGE_RULES: AliasRules = &[
         &["gpt-image-2-medium", "gpt-image2-medium", "gptimage2medium"],
         "generate_image_gpt_image_2",
     ),
-    // 必须在 `gpt-image-2` 之前：`gpt-image-2.5-*` 含 `gpt-image-2` 子串。
+    // 必须在 `gpt-image-2` 之前：`gpt-image-2.6-*` 含 `gpt-image-2` 子串。
     // 工具名已去质量后缀 —— 质量经 prompt『质量 X』子句独立下发（对齐 Lovart：
     // tool_hint = 基础工具名，quality = 独立档位）。
     (
         &[
-            "gpt-image-2.5-sunburst-low",
-            "gpt-image2-5-sunburst-low",
-            "gptimage2-5sunburstlow",
-            "gpt image 2.5 sunburst low",
+            "gpt-image-2.6-sunburst-low",
+            "gpt-image2-6-sunburst-low",
+            "gptimage2-6sunburstlow",
+            "gpt image 2.6 sunburst low",
         ],
-        "generate_image_gpt_image_2_5_sunburst",
+        "generate_image_gpt_image_2_6_sunburst",
     ),
     (
         &[
-            "gpt-image-2.5-sunburst-medium",
-            "gpt-image2-5-sunburst-medium",
-            "gptimage2-5sunburstmedium",
-            "gpt image 2.5 sunburst medium",
+            "gpt-image-2.6-sunburst-medium",
+            "gpt-image2-6-sunburst-medium",
+            "gptimage2-6sunburstmedium",
+            "gpt image 2.6 sunburst medium",
         ],
-        "generate_image_gpt_image_2_5_sunburst",
+        "generate_image_gpt_image_2_6_sunburst",
     ),
     (
         &[
-            "gpt-image-2.5-flare-low",
-            "gpt-image2-5-flare-low",
-            "gptimage2-5flarelow",
-            "gpt image 2.5 flare low",
+            "gpt-image-2.6-flare-low",
+            "gpt-image2-6-flare-low",
+            "gptimage2-6flarelow",
+            "gpt image 2.6 flare low",
         ],
-        "generate_image_gpt_image_2_5_flare",
+        "generate_image_gpt_image_2_6_flare",
     ),
     (
         &[
-            "gpt-image-2.5-flare-medium",
-            "gpt-image2-5-flare-medium",
-            "gptimage2-5flaremedium",
-            "gpt image 2.5 flare medium",
+            "gpt-image-2.6-flare-medium",
+            "gpt-image2-6-flare-medium",
+            "gptimage2-6flaremedium",
+            "gpt image 2.6 flare medium",
         ],
-        "generate_image_gpt_image_2_5_flare",
+        "generate_image_gpt_image_2_6_flare",
     ),
     (
         &["gpt-image-2", "gpt-image2", "gptimage2"],
@@ -294,14 +294,14 @@ pub const QUALITY_MODELS: &[(&str, &str, &str)] = &[
     ("gpt-image-2-low", "GPT Image 2", "low"),
     ("gpt-image-2-medium", "GPT Image 2", "medium"),
     ("gpt-image-2-high", "GPT Image 2", "high"),
-    ("gpt-image-2.5-sunburst-low", "GPT Image 2.5 Sunburst", "low"),
+    ("gpt-image-2.6-sunburst-low", "GPT Image 2.6 Sunburst", "low"),
     (
-        "gpt-image-2.5-sunburst-medium",
-        "GPT Image 2.5 Sunburst",
+        "gpt-image-2.6-sunburst-medium",
+        "GPT Image 2.6 Sunburst",
         "medium",
     ),
-    ("gpt-image-2.5-flare-low", "GPT Image 2.5 Flare", "low"),
-    ("gpt-image-2.5-flare-medium", "GPT Image 2.5 Flare", "medium"),
+    ("gpt-image-2.6-flare-low", "GPT Image 2.6 Flare", "low"),
+    ("gpt-image-2.6-flare-medium", "GPT Image 2.6 Flare", "medium"),
 ];
 
 /// 查质量档位。返回 `(base, quality)`。
@@ -316,7 +316,7 @@ pub fn quality_model(id: &str) -> Option<(&'static str, &'static str)> {
 /// 提示词可读模型名：前端可能传内部代号（如 `nano-bn-2-lite`），
 /// 但拼进 prompt 时必须用上游 AI 能识别的**官方可读名**，否则 Agent 看不懂。
 ///
-/// ⚠️ GPT Image 2.5 的质量模型**不在这张表里** —— 它们的可读名（去后缀）+ 质量档位
+/// ⚠️ GPT Image 2.6 的质量模型**不在这张表里** —— 它们的可读名（去后缀）+ 质量档位
 /// 由 [`QUALITY_MODELS`] 统一派生，避免重复真相源。
 pub const PROMPT_MODEL_NAMES: &[(&str, &str)] = &[
     ("nano-bn-pro", "Nano Banana Pro"),
