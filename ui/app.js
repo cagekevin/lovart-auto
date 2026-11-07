@@ -873,6 +873,25 @@ function closeMenu() {
   }
 }
 
+// 滚动或改窗口大小时关掉：`fixed` 菜单不会跟着锚点走，留着就是错位。
+// 捕获阶段能收到**滚动容器**（`.panel-body`）的滚动事件。
+window.addEventListener('scroll', () => closeMenu(), true);
+window.addEventListener('resize', () => closeMenu());
+
+/** 把菜单摆在按钮下方；下方空间不够就翻到上方。水平右对齐按钮。 */
+function placeMenu(menu, button) {
+  const rect = button.getBoundingClientRect();
+  const gap = 4;
+  const height = menu.offsetHeight;
+  const below = window.innerHeight - rect.bottom;
+  const top =
+    below >= height + gap
+      ? rect.bottom + gap
+      : Math.max(gap, rect.top - height - gap);
+  menu.style.top = `${top}px`;
+  menu.style.right = `${Math.max(gap, window.innerWidth - rect.right)}px`;
+}
+
 function moreButton(task, file) {
   const anchor = el('div', 'menu-anchor');
   const button = el('button', 'icon-btn');
@@ -963,7 +982,12 @@ function moreButton(task, file) {
       for (const item of actions) menu.appendChild(item);
     }
 
-    anchor.appendChild(menu);
+    // 浮层挂到 body：祖先 `.panel-body` 的 `overflow: auto` 裁不到它。
+    // 先藏一帧再定位，避免出现在 (0,0) 上闪一下。
+    menu.style.visibility = 'hidden';
+    document.body.appendChild(menu);
+    placeMenu(menu, button);
+    menu.style.visibility = '';
     openMenu = menu;
   });
 
@@ -1609,6 +1633,112 @@ function openMask(id) { show($(id), true); }
 function closeMask(id) { show($(id), false); }
 
 // ── 动作 ─────────────────────────────────────────────────────────────
+
+/** 待发 → JSONL 文本（每行一条，与 prompts.jsonl 同构）。 */
+function queueToJsonl() {
+  return queue.map((item) => {
+    const line = { prompt: item.prompt };
+    if (item.model) line.model = item.model;
+    if (item.ratio) line.ratio = item.ratio;
+    if (item.size) line.size = item.size;
+    const refs = (item.refs || []).map((ref) => ref.url).filter(Boolean);
+    if (refs.length) line.refs = refs;
+    return JSON.stringify(line);
+  }).join('\n');
+}
+
+/**
+ * 打开 JSONL 编辑器：改完 → 校验 → 回填待发。
+ *
+ * ⚠️ 校验失败时**不动待发**（用户可能改到一半），只把错误列出来。
+ * 校验走后端 `validate_draft`（与 CLI `--check` 同一份 `parse_prompts`）。
+ */
+function openJsonlEditor() {
+  const overlay = el('div', 'modal');
+  const panel = el('div', 'modal-panel jsonl-panel');
+  panel.appendChild(el('div', 'modal-title', '编辑待发（JSONL）'));
+
+  const editor = el('div', 'jsonl-editor');
+  const gutter = el('pre', 'jsonl-gutter');
+  const area = el('textarea', 'jsonl-area');
+  area.value = queueToJsonl();
+  area.spellcheck = false;
+  area.wrap = 'off';
+  editor.appendChild(gutter);
+  editor.appendChild(area);
+  panel.appendChild(editor);
+
+  const errors = el('pre', 'jsonl-errors');
+  errors.hidden = true;
+  panel.appendChild(errors);
+
+  const syncGutter = () => {
+    const count = area.value.split('\n').length;
+    gutter.textContent = Array.from({ length: count }, (_, index) => index + 1).join('\n');
+    gutter.scrollTop = area.scrollTop;
+  };
+  area.addEventListener('input', syncGutter);
+  area.addEventListener('scroll', () => { gutter.scrollTop = area.scrollTop; });
+  syncGutter();
+
+  const actions = el('div', 'modal-actions');
+  const cancel = el('button', 'btn btn-sm btn-quiet', '取消');
+  const save = el('button', 'btn btn-sm btn-primary', '保存并应用');
+  cancel.type = 'button';
+  save.type = 'button';
+  cancel.addEventListener('click', () => overlay.remove());
+  save.addEventListener('click', async () => {
+    save.disabled = true;
+    try {
+      const result = await invoke('validate_draft', { text: area.value });
+      if (result.errors && result.errors.length) {
+        errors.hidden = false;
+        errors.textContent = result.errors.join('\n');
+        return;
+      }
+      queue.length = 0;
+      for (const task of result.tasks) {
+        queue.push({
+          prompt: task.prompt,
+          model: task.model,
+          ratio: task.ratio,
+          size: task.size,
+          refs: (task.refs || []).map((url) => ({ url, label: '' })),
+          copies: 1,
+        });
+      }
+      renderQueue();
+      overlay.remove();
+      notice(`已应用 ${queue.length} 条`);
+    } catch (error) {
+      notice(`校验失败：${error}`);
+    } finally {
+      save.disabled = false;
+    }
+  });
+  actions.appendChild(cancel);
+  actions.appendChild(save);
+  panel.appendChild(actions);
+
+  overlay.appendChild(panel);
+  document.body.appendChild(overlay);
+  area.focus();
+  area.setSelectionRange(0, 0);
+}
+
+/** 待发 → .jsonl 文件（保存对话框由后端弹，默认落在 inbox/）。 */
+async function exportQueue() {
+  if (!queue.length) {
+    notice('待发是空的，没有可存的');
+    return;
+  }
+  try {
+    const path = await invoke('export_draft', { text: queueToJsonl() });
+    if (path) notice(`已存到 ${path}`);
+  } catch (error) {
+    notice(`保存失败：${error}`);
+  }
+}
 
 async function publish() {
   if (busy || queue.length === 0) return;
@@ -2273,6 +2403,8 @@ window.addEventListener('DOMContentLoaded', async () => {
   });
 
   $('btnImport').addEventListener('click', openImport);
+  $('btnEditJsonl').addEventListener('click', openJsonlEditor);
+  $('btnExportJsonl').addEventListener('click', exportQueue);
   $('btnImportPick').addEventListener('click', pickImportFile);
   $('btnImportCancel').addEventListener('click', () => closeMask('maskImport'));
 

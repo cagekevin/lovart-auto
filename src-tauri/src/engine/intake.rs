@@ -18,8 +18,8 @@
 
 use crate::engine::scheduler::LogFn;
 use crate::engine::state::{
-    clear, is_terminal, new_record, reset_for_retry, row as status_row, set, Clearable, RecordPatch,
-    StateStore, TaskStatus,
+    is_terminal, new_record, reset_for_retry, row as status_row, RecordPatch, StateStore,
+    TaskStatus,
 };
 use crate::lovart::models::is_known_image_model;
 use crate::lovart::prompt::{
@@ -127,17 +127,6 @@ pub fn tasks_from_inputs(
     Ok(tasks)
 }
 
-/// 垫图地址的补丁值：**有就给、没有就显式清空**。
-///
-/// 「没有就清空」是刻意的：换了提示词/参考图之后，旧地址必须消失 ——
-/// 留着它，界面会拿**上一张垫图**冒充这一张，而用户正是靠这个地址去核对垫图的。
-fn ref_urls_of(task: &PromptTask) -> Clearable<Vec<String>> {
-    match task.refs.clone() {
-        Some(urls) if !urls.is_empty() => set(urls),
-        _ => clear(),
-    }
-}
-
 /// 派工：按 id 取记录 → 投影成任务 → 入队。返回报告用的任务表。
 ///
 /// 两条判据与声明路径**同源**（都读状态表）：终态不处理；`job` 为空的
@@ -180,159 +169,80 @@ pub fn enqueue_records(
     (tasks, rejected)
 }
 
-/// 声明：按本次投喂的参数，创建 / 重置 / 同步记录并全部入队。
+/// 声明：为本次投喂的**每一条**任务新建记录并全部入队。
 ///
-/// 返回「因参数变更而重置重跑」的条数（日志与摘要都要用）。
+/// ⚠️ **永不覆盖已有记录**：同一个提示词再投一次就是新的一张
+/// （id 顺延 `-2` / `-3`…）；参数变了也新建 —— 旧图还在，新图是另一张。
 ///
-/// ⚠️ 只对声明生效。派工不要走这里 —— 它会按「声明里没有垫图」去覆盖记录，
-/// 那正是 2026-10-01 那个 bug（点确认后垫图消失）。
+/// 返回值第一项**恒为 `0`**：它原名是「参数变更重置条数」，而现在已经没有
+/// 「重置已有记录」这条路径了。保留它是为了少改一处调用方，
+/// 语义说明见 `EnqueueOutcome::param_changed`。
+///
+/// ⚠️ 只对声明生效；派工走 [`enqueue_records`]（那边按记录无损投影，不碰声明内容）。
 pub fn sync_declared(
     state: &mut StateStore,
     queue: &mut Vec<String>,
     tasks: &[PromptTask],
     retry_failed: bool,
     log: &LogFn,
-) -> (usize, Vec<Rejection>) {
-    let mut param_changed = 0usize;
+) -> (usize, Vec<Rejection>, Vec<PromptTask>) {
     let mut rejected: Vec<Rejection> = Vec::new();
+    // 新建的记录：调用方要补进 `task_by_id`（报告的行号/模式靠它）。
+    let mut spawned: Vec<PromptTask> = Vec::with_capacity(tasks.len());
     for task in tasks {
-        let existing = state.get(&task.id).cloned();
-        let Some(existing) = existing else {
-            state.create(new_record(task));
-            queue.push(task.id.clone());
-            continue;
-        };
-
-        // 参数（模型/比例/尺寸/参考图）被改过：以当前文件为准。
-        // id 只哈希提示词文本，不检测的话终态记录会静默沿用旧参数/旧参考图的产物。
-        let ref_signature = task.ref_signature.clone().unwrap_or_default();
-        let same_params = existing.model == task.model
-            && existing.aspect_ratio == task.aspect_ratio
-            && existing.image_size == task.image_size
-            && existing.ref_signature.clone().unwrap_or_default() == ref_signature;
-
-        // ⚠️ 待确认（`needs_confirm`）：上游可能**已经出图**，只等你点头。
-        // 它是终态、`job` 为空，若按普通终态走「参数变了就重置重跑」，
-        // 会清掉 threadId（那张图再也找不回）并**重新扣一次费**。
-        // 所以投喂一律拒绝，让它走「确认并继续」或显式「重跑」。
-        if existing.status == TaskStatus::NeedsConfirm {
-            rejected.push(Rejection::new(
-                &task.prompt,
-                "在等你确认；请点「确认并继续」或「重跑」，重新发布不会生效",
-            ));
-            continue;
-        }
-
-        if !same_params && is_terminal(existing.status) {
-            if let Err(error) = state.update(
-                &task.id,
-                RecordPatch {
-                    status: Some(TaskStatus::Pending),
-                    model: Some(task.model.clone()),
-                    aspect_ratio: Some(task.aspect_ratio.clone()),
-                    image_size: Some(task.image_size.clone()),
-                    attempts: Some(0),
-                    timeout_count: Some(0),
-                    busy_retries: Some(0),
-                    ready_at: Some(0),
-                    thread_id: clear(),
-                    // 一并清掉 30% 锚点：重跑会拿到**新** threadId，进度应重新计时。
-                    submitted_at: clear(),
-                    project_id: clear(),
-                    artifacts: clear(),
-                    files: clear(),
-                    error: clear(),
-                    ref_signature: if ref_signature.is_empty() {
-                        clear()
-                    } else {
-                        set(ref_signature.clone())
-                    },
-                    ref_urls: ref_urls_of(task),
-                    ..Default::default()
-                },
-            ) {
-                log(&format!("参数变更重置失败（内部 bug，请报告）：{error}"));
-            }
-            queue.push(task.id.clone());
-            param_changed += 1;
-            continue;
-        }
-
-        let mut patch = RecordPatch::default();
-        if !same_params {
-            patch.model = Some(task.model.clone());
-            patch.aspect_ratio = Some(task.aspect_ratio.clone());
-            patch.image_size = Some(task.image_size.clone());
-            patch.ref_signature = if ref_signature.is_empty() {
-                clear()
-            } else {
-                set(ref_signature.clone())
-            };
-            // 垫图地址与指纹**必须同进同退**：只改指纹不改地址，界面就会拿旧垫图当新的
-            // （图换了、显示的地址没换 ⇒ 用户对着错的图查）。见 `TaskRecord::ref_urls`。
-            patch.ref_urls = ref_urls_of(task);
-        }
-        if existing.line != Some(task.line) {
-            patch.line = Some(task.line);
-        }
-        if patch != RecordPatch::default() {
-            if let Err(error) = state.update(&task.id, patch) {
-                log(&format!("参数同步失败（内部 bug，请报告）：{error}"));
-            }
-        }
-
-        if is_terminal(existing.status) {
-            if retry_failed && existing.status == TaskStatus::Failed && existing.thread_id.is_none()
-            {
-                match reset_for_retry(state, &task.id) {
-                    Ok(_) => {
-                        queue.push(task.id.clone());
-                        log(&format!("[retry-failed] 🔁 {} 已重置为待提交", task.id));
-                    }
-                    Err(error) => {
-                        log(&format!("[retry-failed] 重置失败（内部 bug）：{error}"));
-                    }
+        // CLI 的 `--retry-failed` 是**唯一**特例：把失败那条重置再跑。
+        // （新建一条会拿同样参数再失败一次，等于什么也没修。）
+        if retry_failed
+            && state.get(&task.id).is_some_and(|record| {
+                record.status == TaskStatus::Failed && record.thread_id.is_none()
+            })
+        {
+            match reset_for_retry(state, &task.id) {
+                Ok(_) => {
+                    queue.push(task.id.clone());
+                    log(&format!("[retry-failed] 🔁 {} 已重置为待提交", task.id));
                 }
-            } else if retry_failed
-                && existing.status == TaskStatus::Failed
-                && existing.thread_id.is_some()
-            {
-                log(&format!(
-                    "⚠️ {} 失败但已有 threadId，跳过 --retry-failed",
-                    task.id
-                ));
-            } else {
-                // 终态 + 参数没变：**明确拒绝**而不是静默跳过。
-                // 编辑框保留文字后用户会重复点提交，静默跳过就是「假成功」。
-                rejected.push(Rejection::new(
-                    &task.prompt,
-                    "已完成且参数没变，未重复提交（要再出一张请点「重跑」）",
-                ));
+                Err(error) => log(&format!("[retry-failed] 重置失败（内部 bug）：{error}")),
             }
             continue;
         }
 
-        // ⚠️ 判据**读表**：非终态里**只有 `submitting` 不进队列**（`job` 为空）。
-        //    它是「已认领、还没拿到 threadId」的那个 —— 进程在上次提交中途被杀，
-        //    没有 threadId 无从续查 ⇒ 只能重新提交。
-        //    （提交可能已成功但没落盘 —— 这个窗口无法消除，只能缩到最小。）
-        //    上面 `is_terminal` 已经放行过，所以这里 `job` 为空 ⟺ `submitting`。
-        if status_row(existing.status).job.is_none() {
-            if let Err(error) = state.update(
-                &task.id,
-                RecordPatch {
-                    status: Some(TaskStatus::Pending),
-                    error: Some(Some("上次提交未完成，重新提交".to_string())),
-                    ..Default::default()
-                },
-            ) {
-                log(&format!("重置「上次提交未完成」失败（内部 bug，请报告）：{error}"));
+        // 其余一律**新建一条**：同一个提示词要几张就新建几条，
+        // 参数变了也新建（旧图还在，新图是另一张）。id 冲突就顺延 `-2` / `-3`…
+        match spawn_extra(state, task) {
+            Some(extra) => {
+                queue.push(extra.id.clone());
+                spawned.push(extra);
             }
-            queue.push(task.id.clone());
-            continue;
+            None => rejected.push(Rejection::new(
+                &task.prompt,
+                "这一条已经排到第 999 张，没有新建",
+            )),
         }
-
-        queue.push(task.id.clone());
     }
-    (param_changed, rejected)
+
+    (0, rejected, spawned)
+}
+
+/// 为「同一个提示词再要一张」分配新 id 并建记录。
+///
+/// id 契约不变：`sha1(prompt)` 前缀 + `-N` 后缀（`prompt_id` 的既有约定）。
+/// 这里找下一个**未被占用**的序号，所以历史记录一张都不会被覆盖。
+pub(crate) fn spawn_extra(state: &mut StateStore, task: &PromptTask) -> Option<PromptTask> {
+    // 原 id 空着就用它（首次投喂走这条），否则顺延。
+    if state.get(&task.id).is_none() {
+        state.create(new_record(task));
+        return Some(task.clone());
+    }
+    let base = task.id.as_str();
+    for seq in 2..=999u32 {
+        let candidate = format!("{base}-{seq}");
+        if state.get(&candidate).is_none() {
+            let mut spawned = task.clone();
+            spawned.id = candidate;
+            state.create(new_record(&spawned));
+            return Some(spawned);
+        }
+    }
+    None
 }

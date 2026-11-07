@@ -781,6 +781,63 @@ fn prompts_json(path: &Path) -> Result<Value, String> {
 /// · 归位失败 ⇒ `Err`（不静默）—— 否则用户以为导入成功，下次又导一遍，正好退回原 bug。
 ///
 /// 追加 / 替换是**前端编辑区**的事（待发队列是前端的真相）⇒ 这里**不带 mode 参数**。
+/// 校验待发 JSONL 文本 —— **复用 `parse_prompts`**（CLI `--check`、投喂前校验同一份）。
+///
+/// 返回 `{ tasks, errors }`：`errors` 非空时前端**不动待发**（用户可能改到一半）。
+/// 不落盘：存不存、存哪儿，由用户点「存为 JSONL」时决定。
+#[tauri::command]
+fn validate_draft(text: String) -> Result<Value, String> {
+    let (defaults, _) = PromptDefaults::from_env();
+    let parsed = parse_prompts(&text, &defaults, &ParseOptions::default());
+    let tasks: Vec<Value> = parsed
+        .tasks
+        .iter()
+        .map(|task| {
+            json!({
+                "prompt": task.prompt,
+                "model": task.model,
+                "ratio": task.aspect_ratio,
+                "size": task.image_size,
+                // 前端队列的 `refs` 是 url 字符串数组（见 app.js 文件头的约定）。
+                "refs": task.ref_inputs.clone().unwrap_or_default(),
+            })
+        })
+        .collect();
+    Ok(json!({ "tasks": tasks, "errors": parsed.errors }))
+}
+
+/// 把待发文本存成 `.jsonl`（路径由前端保存对话框给）。
+///
+/// 与 `prompts.jsonl` **完全同构** ⇒ 存下来的文件可以直接
+/// `lovart-client --prompts 它 --check`，也能被「导入」读回来。
+#[tauri::command]
+fn export_draft(
+    state: tauri::State<'_, GuiState>,
+    app: tauri::AppHandle,
+    text: String,
+) -> Result<Option<String>, String> {
+    let mut dialog = app
+        .dialog()
+        .file()
+        .set_title("存为 JSONL")
+        .add_filter("提示词文件", &["jsonl"])
+        .set_file_name(format!(
+            "prompts-{}.jsonl",
+            chrono::Local::now().format("%Y%m%d-%H%M")
+        ));
+    // 起始目录给 `inbox/`：下次「导入」直接能在列表里看到它。
+    let inbox = state.cwd.join("inbox");
+    if inbox.is_dir() {
+        dialog = dialog.set_directory(inbox);
+    }
+    let Some(file) = dialog.blocking_save_file() else {
+        return Ok(None); // 用户取消
+    };
+    let path = file.into_path().map_err(|error| error.to_string())?;
+    std::fs::write(&path, text).map_err(|error| format!("写不了 {}：{error}", path.display()))?;
+    Ok(Some(path.display().to_string()))
+}
+
 #[tauri::command]
 fn import_inbox(state: tauri::State<'_, GuiState>, file: String) -> Result<Value, String> {
     import_inbox_core(&state.cwd, Path::new(&file))
@@ -1582,6 +1639,8 @@ pub fn run() {
             pick_prompt_file,
             inspect_prompt_file,
             import_inbox,
+            validate_draft,
+            export_draft,
             publish_queue,
             retry_one,
             retry_abnormal,

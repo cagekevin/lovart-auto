@@ -700,6 +700,10 @@ impl Shared {
             .last_summary
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(closed.summary.clone());
+        // 回调在**锁外、报告写完之后**：GUI 在这里把「本会话跑完」变成告警与日志。
+        if let Some(callback) = &self.on_session_end {
+            callback(&closed.summary);
+        }
         if let Some(path) = closed.report_file {
             write_report_file(
                 &path,
@@ -1735,7 +1739,11 @@ pub struct SchedulerConfig {
 pub struct EnqueueOutcome {
     /// 本次投喂的任务（报告 `tasks_by_id` 的原料）。
     pub tasks: Vec<PromptTask>,
-    /// 因参数变更而重置重跑的条数。
+    /// **恒为 0**（历史字段）。
+    ///
+    /// 原名「因参数变更而重置重跑的条数」，但投喂现在**一律新建**、
+    /// 不再重置已有记录（见 `intake::sync_declared`），所以这个数永远是 0。
+    /// 保留字段是为了不牵动调用方；日志里那半句因此永远不会出现。
     pub param_changed: usize,
     /// 本次是否开启了新会话（`false` = 追加到已有会话）。
     pub opened: bool,
@@ -1887,7 +1895,7 @@ impl Scheduler {
             // 声明路径：参数以本次投喂为准（创建 / 重置 / 同步 + 入队）。
             // ⚠️ 只对「声明」生效，派工进来会按"声明里没有垫图"覆盖记录。
             let param_changed = if declared {
-                let (changed, rejects) = intake::sync_declared(
+                let (changed, rejects, spawned) = intake::sync_declared(
                     &mut ctx.state,
                     &mut new_ids,
                     &tasks,
@@ -1895,6 +1903,10 @@ impl Scheduler {
                     &self.shared.log,
                 );
                 rejected.extend(rejects);
+                // 「再要一张」新建的记录也要进 `task_by_id`：报告里的行号/模式靠它。
+                for extra in spawned {
+                    ctx.task_by_id.insert(extra.id.clone(), extra);
+                }
                 changed
             } else {
                 0
@@ -1919,19 +1931,28 @@ impl Scheduler {
                 if seen.insert(id.clone()) {
                     ctx.queue.push(id);
                 } else {
-                    // 已在队列里（重复投喂正在跑的那条）：也要**明说**，
-                    // 否则界面报"已提交 N 条"，实际一条都没加（还是假成功）。
-                    let label = tasks
-                        .iter()
-                        .find(|task| task.id == id)
-                        .map(|task| task.prompt.as_str())
-                        .unwrap_or(id.as_str());
-                    rejected.push(intake::Rejection::new(label, "已在队列里，没有重复排队"));
+                    // 已在队列里（同一条正在跑/排队）：再发一次 = 要**更多张** ⇒ 新 id 新建。
+                    let source = tasks.iter().find(|task| task.id == id).cloned();
+                    match source.and_then(|task| intake::spawn_extra(&mut ctx.state, &task)) {
+                        Some(extra) => {
+                            seen.insert(extra.id.clone());
+                            ctx.task_by_id.insert(extra.id.clone(), extra.clone());
+                            ctx.queue.push(extra.id);
+                        }
+                        None => rejected.push(intake::Rejection::new(
+                            id.as_str(),
+                            "已在队列里且序号用满，没有新建",
+                        )),
+                    }
                 }
             }
             let ids: Vec<String> = tasks.iter().map(|task| task.id.clone()).collect();
             let opened = ctx.session.record(ids);
             let session_id = ctx.session.id().map(str::to_string);
+            // 自动确认计数按**会话**算：新会话从 0 开始（否则告警会把上一会话的算进来）。
+            if opened {
+                self.shared.auto_confirm.reset();
+            }
             // 自动确认计数按**会话**算：新会话从 0 开始（否则告警会把上一会话的算进来）。
             if opened {
                 self.shared.auto_confirm.reset();
@@ -2074,39 +2095,30 @@ impl Scheduler {
     /// 与旧实现（先停批 → 等线程退出 → 再删）相比不再需要等待：写者只有调度器自己，
     /// 删除与 worker 的写入天然串行。在飞任务随后收尾时命中墓碑，静默丢弃（§2.5）。
     pub fn remove_open(&self) -> Result<usize, LovartError> {
+        // 先停：在飞任务收尾时走 `stopped` 分支（只改状态、不入队）。
         self.shared.stopped.store(true, Ordering::SeqCst);
         self.shared.cancelled.store(true, Ordering::SeqCst);
-        let removed = {
-            let mut ctx = self.lock();
-            let ids: Vec<String> = ctx
-                .state
+        // 立刻叫醒阻塞在 `wait` 的 worker，让它们重新评估 `stopped`
+        // （否则下面 `remove` 万一失败提前返回，worker 还睡着）。
+        self.shared.wake.notify_all();
+        // 只负责「挑哪些 id」（锁内），清理统一交给 [`Self::remove`] ——
+        // 队列/在飞/墓碑/task_by_id 的摘除逻辑只有那一份。
+        let ids: Vec<String> = {
+            let ctx = self.lock();
+            ctx.state
                 .all()
                 .into_iter()
                 .filter(|record| crate::run::is_board_open(record.status))
                 .map(|record| record.id.clone())
-                .collect();
-            if ids.is_empty() {
-                0
-            } else {
-                let count = ctx
-                    .state
-                    .remove(&ids)
-                    .map_err(|error| LovartError::transport(format!("删任务失败：{error}")))?;
-                let set: std::collections::BTreeSet<String> = ids.into_iter().collect();
-                ctx.queue.retain(|id| !set.contains(id));
-                for id in &set {
-                    // 只有**正在跑**的才需要墓碑（它收尾时会写回）；已结束的直接删。
-                    if ctx.processing.remove(id) {
-                        ctx.removed.insert(id.clone());
-                    }
-                    ctx.task_by_id.remove(id);
-                }
-                // 取消全部 = 这次会话到此为止（下一条投喂开新会话）。
-                // 不写报告：用户要的是「清空」，一份空报告没有意义。
-                let _ = ctx.session.close();
-                count
-            }
+                .collect()
         };
+        let removed = self.remove(&ids)?;
+        if removed > 0 {
+            // 取消全部 = 这次会话到此为止（下一条投喂开新会话）。
+            // 不写报告：用户要的是「清空」，一份空报告没有意义。
+            let mut ctx = self.lock();
+            let _ = ctx.session.close();
+        }
         self.shared.wake.notify_all();
         Ok(removed)
     }

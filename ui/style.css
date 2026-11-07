@@ -474,6 +474,68 @@ button { cursor: pointer; color: inherit; }
   background: rgb(0 0 0 / 35%);
 }
 
+/* ── JSONL 编辑器（待发「编辑 JSONL」）───────────────────────────────
+ * 行号与文本必须**同字体同行高**，否则滚动时对不齐。
+ */
+.jsonl-panel {
+  width: min(760px, 92vw);
+  max-height: 84vh;
+}
+
+.jsonl-editor {
+  display: flex;
+  height: 46vh;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg-sub);
+  overflow: hidden;
+}
+
+.jsonl-gutter,
+.jsonl-area {
+  margin: 0;
+  padding: var(--sp-2) 0;
+  font: 12px/20px ui-monospace, SFMono-Regular, Consolas, monospace;
+  border: 0;
+  background: transparent;
+  resize: none;
+  outline: none;
+}
+
+.jsonl-gutter {
+  flex: none;
+  width: 46px;
+  padding-right: var(--sp-1);
+  text-align: right;
+  color: var(--ink-3);
+  background: var(--bg);
+  border-right: 1px solid var(--line);
+  user-select: none;
+  overflow: hidden;
+}
+
+.jsonl-area {
+  flex: 1;
+  padding-left: var(--sp-2);
+  padding-right: var(--sp-2);
+  color: var(--ink);
+  white-space: pre;
+  overflow: auto;
+}
+
+.jsonl-errors {
+  margin: var(--sp-2) 0 0;
+  padding: var(--sp-2);
+  max-height: 22vh;
+  overflow: auto;
+  border-radius: var(--r-md);
+  background: var(--bg-sub);
+  border: 1px solid var(--line);
+  color: var(--bad);
+  font: 12px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace;
+  white-space: pre-wrap;
+}
+
 .modal-panel {
   display: flex;
   flex-direction: column;
@@ -827,10 +889,11 @@ button { cursor: pointer; color: inherit; }
 /* ══ ⋯ 菜单（查8：常显入口，不靠 hover）════════════════════════════ */
 
 .menu {
-  position: absolute;
-  right: 0;
-  top: calc(100% + 4px);
-  z-index: 30;
+  /* 浮层：相对**视口**定位（坐标由 `placeMenu` 算）。
+   * ⚠️ 不能是 `absolute` + 留在卡片里：祖先 `.panel-body` 是 `overflow: auto`，
+   *    靠近列表底部/右侧的菜单会被**直接裁掉** —— z-index 再高也治不了 overflow 裁剪。 */
+  position: fixed;
+  z-index: 150;
   min-width: 150px;
   width: max-content;
   max-width: 260px;
