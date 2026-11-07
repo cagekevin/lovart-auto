@@ -1044,7 +1044,14 @@ pub fn main_with_args(argv: &[String]) -> Result<(), String> {
         return Ok(());
     }
 
-    // 2. 日志：**从这里开始落盘**。
+    // 2. 单实例写锁：`state.jsonl` 只有一个写者（理由见 `engine::lockfile` 文件头）。
+    //    ⚠️ 必须在所有只读命令之后 —— `--status` / `--check` / `--dry-run` 上面已返回，
+    //    它们不写状态文件；给它们加锁会让「GUI 跑批时查状态」变成报错。
+    //    锁固定 `var/.lock`，不跟随 `--state`：不同状态文件仍共享 `var/report.csv`
+    //    与 `var/refs-cache.json`，拆开锁等于允许它们互相覆盖。
+    let _lock = crate::engine::lockfile::FileLock::acquire(&cwd.join("var/.lock"))?;
+
+    // 3. 日志：**从这里开始落盘**。
     //    只读命令（`--check` / `--dry-run` / `--status` / `--list-models`）在上面已返回，
     //    不会往挂机日志里插噪音。
     //    路径固定在 `var/run.log`：与 `--state` 无关 —— 换状态文件不该让日志换个地方找不到。
@@ -1066,7 +1073,7 @@ pub fn main_with_args(argv: &[String]) -> Result<(), String> {
         log_file.display()
     ));
 
-    // 3. 凭据（`.env` 已在本函数前半段载入：兜底参数要在解析提示词之前就位）
+    // 4. 凭据（`.env` 已在本函数前半段载入：兜底参数要在解析提示词之前就位）
     // 自动确认：命令行 > `.env` > 默认关。**不读进程环境变量**（见 docs/plan/01 §6）。
     let auto_confirm_override = auto_confirm_flag(&args)?;
     let (file_auto_confirm, auto_confirm_warning) = read_auto_confirm(&cwd.join(".env"));
@@ -1132,6 +1139,8 @@ pub fn main_with_args(argv: &[String]) -> Result<(), String> {
         auto_confirm: Arc::clone(&auto_confirm),
         log: Arc::new(|message: &str| log(message)),
         ports: None,
+        // 报告由调度器在**会话封口**时写（与 GUI 同一条路径）；这里只保留打印。
+        report_file: report_file.clone(),
     });
     // 花了钱就要报账：**错误路径也要打印**，所以先读计数再 `?`。
     if let Some(line) = auto_confirm_line(auto_confirm.count()) {
@@ -1165,13 +1174,8 @@ pub fn main_with_args(argv: &[String]) -> Result<(), String> {
         log("❌ 收尾时状态文件写不进去：本次进度可能续不上");
     }
 
-    if let Some(report_file) = report_file {
-        let tasks_by_id: BTreeMap<String, PromptTask> = tasks
-            .iter()
-            .map(|task| (task.id.clone(), task.clone()))
-            .collect();
-        write_report(&report_file, &summary.records, &tasks_by_id, &output_dir)
-            .map_err(|error| format!("写报告失败：{error}"))?;
+    if let Some(report_file) = &report_file {
+        // 文件已由调度器在会话封口时写好（与 GUI 同一条路径），这里只报路径。
         println!("报告文件 : {}", report_file.display());
     }
     println!("=====================================");

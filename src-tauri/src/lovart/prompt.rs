@@ -215,7 +215,9 @@ pub struct ParseOptions {
 const ALLOWED_KEYS: [&str; 5] = ["prompt", "model", "ratio", "size", "refs"];
 
 /// `w:h`，w / h 各 1–3 位数字（等价 TS 的 `/^\d{1,3}:\d{1,3}$/`）。
-fn is_valid_ratio(value: &str) -> bool {
+///
+/// 公开给 `engine::intake`：GUI 投喂走结构化字段，校验必须与解析文件**同一份**。
+pub fn is_valid_ratio(value: &str) -> bool {
     let Some((width, height)) = value.split_once(':') else {
         return false;
     };
@@ -232,7 +234,7 @@ fn is_valid_ratio(value: &str) -> bool {
 /// 删前已核实 `fixtures/` 与 `state.jsonl` **无一处**用到它 ⇒ 不会让既有文件失效。
 ///
 /// 三个档位全部大写，故归一化就是 `to_ascii_uppercase`（不再有小写特例）。
-fn normalize_size(value: &str) -> Option<&'static str> {
+pub fn normalize_size(value: &str) -> Option<&'static str> {
     match value.to_ascii_uppercase().as_str() {
         "1K" => Some("1K"),
         "2K" => Some("2K"),
@@ -245,9 +247,21 @@ fn normalize_size(value: &str) -> Option<&'static str> {
 ///
 /// ⚠️ **必须是 sha1**：换成 sha256 会让全部 id 改变 ⇒ 已有 `state.jsonl` 全部失效
 /// （断点续跑归零、整批重跑）。这是跨实现契约，不是安全选择。
-fn prompt_hash(text: &str) -> String {
+pub fn prompt_hash(text: &str) -> String {
     let digest = Sha1::digest(text.as_bytes());
     hex::encode(digest)[..12].to_string()
+}
+
+/// 同文本第 `occurrence` 次出现时的 id（1 = 首个，2 = `-2` …）。
+///
+/// 公开给 `engine::intake`：GUI 投喂与文件解析必须产出**同一个** id，
+/// 否则同一条提示词在两条路径上会变成两条记录。
+pub fn prompt_id(hash: &str, occurrence: u32) -> String {
+    if occurrence > 1 {
+        format!("{hash}-{occurrence}")
+    } else {
+        hash.to_string()
+    }
 }
 
 /// 未知模型告警（**失败可见**）。
@@ -527,11 +541,7 @@ pub fn parse_prompts(
         let hash = prompt_hash(&prompt_text);
         let occurrence = seen.entry(hash.clone()).or_insert(0);
         *occurrence += 1;
-        let id = if *occurrence > 1 {
-            format!("{hash}-{occurrence}")
-        } else {
-            hash
-        };
+        let id = prompt_id(&hash, *occurrence);
 
         tasks.push(PromptTask {
             id,

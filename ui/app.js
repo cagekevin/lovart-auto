@@ -45,6 +45,15 @@ const SIZES = ['1K', '2K', '4K'];
 const MAX_COPIES = 20;
 
 /**
+ * 粘贴图片的边界：单次张数与单张大小。
+ *
+ * 超过就**提示并丢弃**，不静默截断 —— `data:` URL 会原样进 IPC 与任务队列，
+ * 一张 10MB 的截图已经够大，再放任就会几十 MB 一起过桥。
+ */
+const MAX_PASTE_IMAGES = 8;
+const MAX_PASTE_BYTES = 10 * 1024 * 1024;
+
+/**
  * ⚠️ **这里刻意不定义任何状态清单。**
  *
  * 分组（`group`）· 异常三件套（`abnormal`）· **可做的动作（`actions`）**·
@@ -130,9 +139,16 @@ function parseCopies(raw) {
  * （那一条只用于「读不到任务状态」这个会持续存在的状况）。
  */
 function notice(message) {
+  // 所有提示共用**一个居顶宿主**：各自 `fixed` 会完全重叠，后来的把前一条盖死。
+  let host = document.getElementById('toastHost');
+  if (!host) {
+    host = el('div', 'toast-host');
+    host.id = 'toastHost';
+    document.body.appendChild(host);
+  }
   const box = el('div', 'toast', message);
   box.addEventListener('click', () => box.remove());
-  document.body.appendChild(box);
+  host.appendChild(box);
   setTimeout(() => box.remove(), 8000);
 }
 
@@ -511,23 +527,16 @@ function renderBoardNow() {
 }
 
 /**
- * 「正在取消所有未完成任务」—— 后端 `get_state.clearing` 的镜像（**只用于显示和禁用**，
- * 能不能开跑由后端判，前端不自己推）。
- */
-let boardClearing = false;
-
-/**
- * 有没有批次在跑 —— 后端 `get_state.running` 的镜像（同样只用于显示和禁用）。
+ * 有没有批次在跑 —— 后端 `get_state.running` 的镜像（只用于显示和禁用）。
  *
- * 唯一需要的场合是「清空所有已完成任务」：它要重写整个 `state.jsonl`，跑批中后端会拒，
- * 那就不该让人点（点了只会弹一句错）。
+ * 唯一需要的场合是「清空所有已完成任务」：清空已改成锁内同步完成，
+ * 但跑批中点它仍然会打断当前会话，所以照旧提示一句。
  */
 let boardLive = false;
 
 function renderBoard(data) {
   const tasks = data.tasks || [];
   lastTasks = tasks;
-  boardClearing = Boolean(data.clearing);
   boardLive = Boolean(data.running);
   // 分组判据来自 Rust（见文件头的说明），前端不自己算。
   const running = tasks.filter((task) => task.group === 'active');
@@ -555,20 +564,16 @@ function renderBoard(data) {
   // 本地没人跟的那几条：把**上游的真实情况**一并说出来（自动探测的结论）。
   // 只说「未跟进」只讲了本地半边 —— 用户真正要知道的是"那几条还有没有戏"。
   const upstreamNote = stranded > 0 ? ` · ${upstreamSummary()}` : '';
-  // 清空期间必须说出来：删除最坏要等 60 秒，界面不写这句就是"点了没反应"。
-  const clearingNote = boardClearing ? ' · 正在取消所有未完成任务' : '';
   $('runningMeta').textContent =
     (live
       ? `${followed} 在跑 · ${queued.length} 排队${stranded > 0 ? ` · ${stranded} 未跟进` : ''}`
-      : `${running.length + queued.length} 条待续跑 · 本地未跟进`) + upstreamNote + clearingNote;
+      : `${running.length + queued.length} 条待续跑 · 本地未跟进`) + upstreamNote;
   $('runningDot').classList.toggle('dot-idle', !live);
 
   // 「接着查」= README 里「下次自动复查」的兑现按钮。
   // 只在**真有没人跟的**未完成记录时出现：正常跑批时它根本不显示，不会诱导乱点。
   show($('btnResume'), stranded > 0);
   $('btnResume').textContent = `接着查 ${stranded}`;
-  // 清空期间会写状态文件的按钮一律禁用（后端也拒，这里是别让人白点）。
-  $('btnResume').disabled = boardClearing;
 
   // 在跑：卡片
   const runningList = $('runningList');
@@ -609,7 +614,6 @@ function renderBoard(data) {
   $('btnDone').setAttribute('aria-expanded', String(doneOpen));
   show($('btnRetry'), retryable.length > 0);
   $('btnRetry').textContent = `重跑异常 ${retryable.length}`;
-  $('btnRetry').disabled = boardClearing;
   // 「发布」的判据只有一份（`syncPublishButton`）：清空开始/结束都要重算，
   // 否则清空结束后按钮会一直灰着（那一次没有队列变化来触发 renderQueue）。
   syncPublishButton();
@@ -628,10 +632,9 @@ function renderBoard(data) {
   // 「停止」只在**真的能停**的时候出现 —— 没有批次在跑时它是个死按钮，
   // 常驻只会让人以为「点了能停」（上一版就是这样：显示 5 在跑 + 灰按钮）。
   // 藏起来不是「少了功能」：那 5 条要的不是停止，是**续跑**（再发布一次就会续上）。
-  // 清空期间它已经在停了，再给一个「停止」只会让人以为还能改主意。
   const stop = $('btnStop');
-  stop.hidden = !live || boardClearing;
-  stop.disabled = !live || boardClearing;
+  stop.hidden = !live;
+  stop.disabled = !live;
   stop.textContent = '停止';
 }
 
@@ -1024,12 +1027,12 @@ function bindBoardMenu() {
     menu.appendChild(menuItem('取消所有未完成任务', () => {
       closeMenu();
       cancelAllTasks();
-    }, true, boardClearing));
+    }, true, false));
     menu.appendChild(el('div', 'menu-sep'));
     menu.appendChild(menuItem('清空所有已完成任务', () => {
       closeMenu();
       clearFinishedTasks();
-    }, true, boardClearing || boardLive));
+    }, true, boardLive));
     anchor.appendChild(menu);
     openMenu = menu;
   });
@@ -1123,7 +1126,7 @@ function refSrc(ref) {
  * （`renderBoard`）。两处各写一份表达式，迟早会有一处漏掉清空那一项。
  */
 function syncPublishButton() {
-  $('btnPublish').disabled = queue.length === 0 || busy || boardClearing;
+  $('btnPublish').disabled = queue.length === 0 || busy;
 }
 
 function renderQueue() {
@@ -1214,11 +1217,12 @@ function addToQueue() {
       refs: refs.map((ref) => ({ ...ref })),
     });
   }
-  clear(input);
+  // ⚠️ **不清空编辑框**：文字与垫图留着，只有人点删除才消失（需求 2）。
+  //    代价：同一条再点发送会命中同一个 id，后端会明确拒绝并说明原因，不会静默重复。
   closeMentions();
   input.focus();
   renderQueue();
-  syncComposerState(); // 输入框已清空 ⇒ 占位符回来、「发送」变灰
+  syncComposerState(); // 输入框仍有内容 ⇒ 占位符隐藏、「发送」保持可用
   if (copies > 1) notice(`已加入待发 ${copies} 条`);
 }
 
@@ -1608,6 +1612,7 @@ function closeMask(id) { show($(id), false); }
 
 async function publish() {
   if (busy || queue.length === 0) return;
+  const count = queue.length;
   closeMask('maskPublish');
   busy = true;
   renderQueue();
@@ -1617,15 +1622,17 @@ async function publish() {
       model: item.model,
       ratio: item.ratio,
       size: item.size,
-      // 后端要的是 **url 字符串数组**（`write_queue_file` 按 `as_str` 取）——
-      // 前端内部的 `{url,label}` 只活在界面上，不往契约里塞。
+      // 后端收 `refs: string[]`（`intake::TaskInput`）；前端内部的 `{url,label}`
+      // 只活在界面上，不往契约里塞。
       refs: (item.refs || []).map((ref) => ref.url),
     })) });
     queue.length = 0;
-    draft.refs = [];
+    // ⚠️ 编辑框的垫图**不清**：发送后仍留在那儿，等你决定删不删（需求 2）。
     renderRefs();
     closeMentions();
     await refreshBoard();
+    // 提交后不再等跑完：调度器常驻，后面还可以继续提交、进同一会话排队。
+    notice(`已提交 ${count} 条，正在排队`);
   } catch (error) {
     $('boardNoticeText').textContent = `发布失败：${error}`;
     show($('boardNotice'), true);
@@ -2181,9 +2188,32 @@ window.addEventListener('DOMContentLoaded', async () => {
     }
   });
   promptInput.addEventListener('paste', (event) => {
-    // 只取纯文本：富文本粘贴会把 `<span style=…>` 之类的东西带进编辑器。
+    // 富文本粘贴会把 `<span style=…>` 之类的东西带进编辑器 ⇒ 一律 preventDefault，
+    // 图片与纯文本由我们自己插。
     event.preventDefault();
     event.stopPropagation();
+
+    // 截图直接粘成垫图：`clipboardData.items` 才看得到图片，`getData('text/plain')` 看不到。
+    const files = Array.from(event.clipboardData?.items || [])
+      .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+      .map((item) => item.getAsFile())
+      .filter(Boolean);
+    if (files.length) {
+      if (files.length > MAX_PASTE_IMAGES) {
+        notice(`一次最多粘贴 ${MAX_PASTE_IMAGES} 张图片，超出的已忽略`);
+      }
+      for (const file of files.slice(0, MAX_PASTE_IMAGES)) {
+        if (file.size > MAX_PASTE_BYTES) {
+          notice(`「${file.name || '粘贴的图片'}」超过 10MB，已跳过`);
+          continue;
+        }
+        const reader = new FileReader();
+        reader.onload = () => addRefs([reader.result]);
+        reader.readAsDataURL(file);
+      }
+      return;
+    }
+
     const text = event.clipboardData.getData('text/plain');
     const selection = window.getSelection();
     if (!selection || selection.rangeCount === 0) return;

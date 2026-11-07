@@ -28,28 +28,19 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
 use crate::engine::download::{download_artifact, slugify, DownloadedFile};
+use crate::engine::intake;
+use crate::engine::session::SessionState;
 use crate::engine::state::{
-    clear, is_terminal, is_unfinished, new_record, reset_for_retry, row as status_row, set,
-    slots_in_use, Clearable, Job as JobKind, PersistOutcome, RecordPatch, StateStore, TaskRecord,
-    TaskStatus,
+    is_unfinished, row as status_row, slots_in_use, Job as JobKind, PersistOutcome, RecordPatch,
+    StateStore, TaskRecord, TaskStatus,
 };
 
-/// 垫图地址的补丁值：**有就给、没有就显式清空**。
-///
-/// 「没有就清空」是刻意的：换了提示词/参考图之后，旧地址必须消失 ——
-/// 留着它，界面会拿**上一张垫图**冒充这一张，而用户正是靠这个地址去核对垫图的。
-fn ref_urls_of(task: &PromptTask) -> Clearable<Vec<String>> {
-    match task.refs.clone() {
-        Some(urls) if !urls.is_empty() => set(urls),
-        _ => clear(),
-    }
-}
 use crate::lovart::client::{set_mode, ClientDeps};
 use crate::lovart::contract::SendInput;
 use crate::lovart::errors::{classify_error, is_retryable_error, ErrorClass, ErrType, LovartError};
@@ -72,9 +63,6 @@ const RATE_LIMIT_TOTAL_WAIT_ALERT_MS: u64 = 6 * 3600 * 1000;
 
 /// 无活可干时的空转上限（ms）。
 const IDLE_POLL_MS: u64 = 1_000;
-
-/// 取消检查粒度（ms）。
-const CANCEL_POLL_MS: u64 = 200;
 
 // ── 端口（外部副作用出口）──────────────────────────────────────────────
 
@@ -170,6 +158,9 @@ impl Ports for RealPorts {
 
 pub type LogFn = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// 会话封口时的回调（GUI 用它把「本会话跑完」变成告警与日志）；CLI 不传。
+pub type SessionEndFn = Arc<dyn Fn(&SchedulerSummary) + Send + Sync>;
+
 /// 这一批要处理的**是什么** —— 两种意图，两种语义。
 ///
 /// ── 为什么要分开（2026-10-01 系统性修）────────────────────────────
@@ -250,6 +241,14 @@ impl AutoConfirm {
     pub fn count(&self) -> usize {
         self.confirmed.load(Ordering::Relaxed)
     }
+
+    /// 会话开始时清零「本会话已自动确认」计数。
+    ///
+    /// 计数器的语义是**每次会话**，而调度器常驻 ⇒ 不重置的话第二会话的告警
+    /// 会把第一会话的条数也算进去。
+    pub fn reset(&self) {
+        self.confirmed.store(0, Ordering::Relaxed);
+    }
 }
 
 /// 调度器的全部可调数值 —— **一处定义，两个入口共用**。
@@ -317,6 +316,8 @@ pub struct SchedulerOptions {
     pub log: LogFn,
     /// 外部副作用出口；缺省用 [`RealPorts`]。
     pub ports: Option<Arc<dyn Ports>>,
+    /// 会话封口时写报告 CSV；`None` = 不写（`--no-report`）。
+    pub report_file: Option<PathBuf>,
 }
 
 /// 队列里的一件活。
@@ -458,11 +459,90 @@ struct Ctx {
     task_by_id: BTreeMap<String, PromptTask>,
     /// 唯一的待处理列表。**工作类型由记录的 `status` 派生**，不再分三个队列。
     queue: Vec<String>,
+    /// 已取走、还没收尾的 id。**「界面是否持有它」的唯一判据**
+    /// （`held_ids` = queue ∪ processing），不参与并发槽计算（那是 `slots_in_use`）。
+    processing: std::collections::BTreeSet<String>,
+    /// 已删除的 id（墓碑）。在飞任务收尾时若命中这里，**静默丢弃**写回 ——
+    /// 否则「取消全部未完成」会刷一串「状态更新失败（内部 bug）」假告警。
+    removed: std::collections::BTreeSet<String>,
     /// 全局提交闸门（间隔 + 429 熔断）。
     gate: SubmitGate,
     /// 本批是否已经记过「排队模式已设置」—— **只影响日志**，不影响行为。
     /// 每条提交前都会重设（见 [`Shared::ensure_mode`]），这里只是避免刷屏。
     mode_logged: bool,
+    /// 是否对「失败且无 threadId」的记录重置重跑（`--retry-failed` 的一次性快照）。
+    retry_failed: bool,
+    /// 会话封口时写报告；`None` = 不写。
+    report_file: Option<PathBuf>,
+    /// 会话统计（统计窗口，不参与调度）。放 Ctx 而不是 `Shared` 的另一把锁里：
+    /// 封口必须与「队列空」判定在同一把锁内，两把锁就会出现「刚判空又投喂」的窗口。
+    session: SessionState,
+}
+
+impl Ctx {
+    /// 按 id 集合生成会话摘要（封口与 `shutdown` 兜底共用）。
+    ///
+    /// 逐状态计数**由表生成** —— 不手抄具名字段，加状态时不会静默漏计。
+    fn summarize_ids(
+        &mut self,
+        ids: &std::collections::BTreeSet<String>,
+    ) -> SchedulerSummary {
+        let records: Vec<TaskRecord> = self
+            .state
+            .all()
+            .into_iter()
+            .filter(|record| ids.contains(&record.id))
+            .cloned()
+            .collect();
+        let mut counts = std::collections::BTreeMap::new();
+        for status in crate::engine::state::all() {
+            counts.insert(
+                crate::engine::state::json_key(status),
+                records
+                    .iter()
+                    .filter(|record| record.status == status)
+                    .count(),
+            );
+        }
+        SchedulerSummary {
+            total: ids.len(),
+            counts,
+            unfinished: records
+                .iter()
+                .filter(|record| is_unfinished(record.status))
+                .count(),
+            persist_failed: !self.state.flush().is_ok(),
+            records,
+        }
+    }
+}
+
+/// 启动修复：把「已认领、没拿到 threadId」的残留改回 `pending`。
+///
+/// `submitting` 在状态表里 `job` 为空 ⇒ 不会被取件；没有 threadId 也无处续查，
+/// 界面会永远显示「提交中」。**只改状态、不入队**，所以不花一分钱（09 §3.8）。
+fn fix_orphan_submitting(ctx: &mut Ctx) -> usize {
+    let ids: Vec<String> = ctx
+        .state
+        .all()
+        .into_iter()
+        .filter(|record| record.status == TaskStatus::Submitting && record.thread_id.is_none())
+        .map(|record| record.id.clone())
+        .collect();
+    for id in &ids {
+        let _ = ctx.state.update(
+            id,
+            RecordPatch {
+                status: Some(TaskStatus::Pending),
+                error: Some(Some("上次提交未完成，重新提交".to_string())),
+                ..Default::default()
+            },
+        );
+    }
+    if !ids.is_empty() {
+        let _ = ctx.state.flush();
+    }
+    ids.len()
 }
 
 fn now_ms() -> u64 {
@@ -476,11 +556,35 @@ fn error_text(error: &LovartError) -> String {
     error.message().to_string()
 }
 
+/// 会话封口时从锁内带出来的数据包 —— 锁外写报告用，避免持锁做磁盘 IO。
+struct ClosedSession {
+    session_id: String,
+    summary: SchedulerSummary,
+    report_file: Option<PathBuf>,
+    tasks: BTreeMap<String, PromptTask>,
+    output_dir: PathBuf,
+}
+
 /// 共享上下文。**只在取件 / 写状态这两小段持锁**，网络 I/O 一律在锁外。
 struct Shared {
     ctx: Mutex<Ctx>,
     log: LogFn,
+    /// 协议层取消（与 `ClientDeps.cancelled` 是同一份 `Arc`）：让在飞 HTTP 立刻跳出。
+    /// CLI 的 Ctrl+C 处理器也置它。
     cancelled: Arc<AtomicBool>,
+    /// 会话级停止：`stop_session` 置位、`enqueue` 复位。
+    /// ⚠️ 它**不**让 worker 退出 —— 退出只看 `shutdown`（`docs/plan/09` §1.2.2）。
+    stopped: AtomicBool,
+    /// 进程级关停：worker 唯一的退出条件，永不复位。
+    shutdown: AtomicBool,
+    /// worker 等待 / 唤醒。**必须与 `ctx: Mutex<Ctx>` 配对**（§1.5.1）。
+    wake: Condvar,
+    /// worker 句柄（`shutdown` 时 join；`start` 里填充）。
+    handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// 最近一次封口时生成的摘要（`shutdown` 优先取它，避免重复统计）。
+    last_summary: Mutex<Option<SchedulerSummary>>,
+    /// 会话封口回调（GUI 用它把「本会话跑完」变成告警与日志）；CLI 为 `None`。
+    on_session_end: Option<SessionEndFn>,
     /// 自动确认策略（全局开关 + 本批计数 + 本批许可）。
     auto_confirm: Arc<AutoConfirm>,
 }
@@ -494,8 +598,121 @@ impl Shared {
         (self.log)(message);
     }
 
-    fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
+    /// 会话是否已停止。协议层的 `cancelled` 也算：CLI 的 Ctrl+C 只置那一个。
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst) || self.cancelled.load(Ordering::SeqCst)
+    }
+
+    fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
+
+    /// 关停调度器：worker 在下一个检查点退出。**幂等**。
+    fn begin_shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.wake.notify_all();
+    }
+
+    /// 取一件活；`None` = 已关停（worker 退出）。**唯一的等待点**。
+    ///
+    /// ⚠️ 判空与等待必须在**同一个 guard** 上：先返回 `Empty`、放开锁再 `wait`，
+    /// 中间到达的唤醒会丢，worker 永久睡死（`docs/plan/09` §1.5.1）。
+    fn next_job(&self) -> Option<Job> {
+        let mut ctx = self.lock();
+        loop {
+            if self.is_shutdown() {
+                return None;
+            }
+            match self.take_job(&mut ctx) {
+                // 「在飞」由 `Ctx.processing` 记（`take_job` 取件时插入），
+                // 不再另用一个计数器 —— 否则同一个事实有两份。
+                TakeOutcome::Job(job) => return Some(job),
+                TakeOutcome::Empty => {
+                    // 没活 ⇒ 等下一次 `enqueue`。**不自动关停**：调度器是常驻的，
+                    // 退出只看 `shutdown`（否则「启动完还没投喂」的瞬间 worker 就全走了）。
+                    ctx = self.wake.wait(ctx).unwrap_or_else(|error| error.into_inner());
+                }
+                TakeOutcome::Wait(ms) => {
+                    let (guard, _) = self
+                        .wake
+                        .wait_timeout(ctx, Duration::from_millis(ms.max(1)))
+                        .unwrap_or_else(|error| error.into_inner());
+                    ctx = guard;
+                }
+            }
+        }
+    }
+
+    /// 一件活收尾：在飞数减一；会话若已无活则封口（写日志 + 报告 + 摘要）。
+    ///
+    /// ⚠️ 封口判定与「队列空」必须在**同一把锁**内，否则多个 worker 会同时
+    /// 判定空闲、各写一份报告（`docs/plan/09` §1.5.6）。`SessionState::close`
+    /// 用「会话号还在不在」做幂等。
+    fn finish_job(&self, id: &str) {
+        let closed = {
+            let mut ctx = self.lock();
+            ctx.processing.remove(id);
+            Self::take_closed_if_idle(&mut ctx)
+        };
+        self.publish_session_end(closed);
+        self.wake.notify_all();
+    }
+
+    /// 没有活就封口：**判定与封口在同一把锁内**（§1.5.6）。
+    ///
+    /// 两处调用：`finish_job`（正常跑完）与 `stop_session`（用户主动停）。
+    fn close_session_if_idle(&self) {
+        let closed = {
+            let mut ctx = self.lock();
+            Self::take_closed_if_idle(&mut ctx)
+        };
+        self.publish_session_end(closed);
+    }
+
+    /// 锁内：没有活就取走会话数据。`None` = 还有活 / 会话已封口（幂等）。
+    fn take_closed_if_idle(ctx: &mut Ctx) -> Option<ClosedSession> {
+        if !ctx.queue.is_empty() || !ctx.processing.is_empty() {
+            return None;
+        }
+        let (session_id, ids) = ctx.session.close()?;
+        // 会话结束 ⇒ 在飞任务必然已收尾 ⇒ 墓碑不再需要（不清会无限增长）。
+        ctx.removed.clear();
+        let summary = ctx.summarize_ids(&ids);
+        Some(ClosedSession {
+            session_id,
+            summary,
+            report_file: ctx.report_file.clone(),
+            tasks: ctx.task_by_id.clone(),
+            output_dir: ctx.output_dir.clone(),
+        })
+    }
+
+    /// 锁外：日志 + 摘要 + 写报告（文件 IO 不占调度器锁）。
+    fn publish_session_end(&self, closed: Option<ClosedSession>) {
+        let Some(closed) = closed else {
+            return;
+        };
+        self.log(&format!(
+            "===== 会话结束：{}（共 {} 条，未完成 {}）=====",
+            closed.session_id, closed.summary.total, closed.summary.unfinished
+        ));
+        *self
+            .last_summary
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(closed.summary.clone());
+        if let Some(path) = closed.report_file {
+            write_report_file(
+                &path,
+                &closed.summary,
+                &closed.tasks,
+                &closed.output_dir,
+                &self.log,
+            );
+        }
+        // 回调在锁外、报告写完之后：GUI 在这里把「本会话跑完」变成告警与日志。
+        if let Some(callback) = &self.on_session_end {
+            callback(&closed.summary);
+        }
     }
 
     /// 提交前把服务端模式设回排队（`unlimited`，免费）。**每条提交都调**。
@@ -572,6 +789,11 @@ impl Shared {
     /// 生产上的两个回调（CLI 的 println / GUI 的丢弃）都不碰它。
     fn update(&self, id: &str, patch: RecordPatch) {
         let mut ctx = self.lock();
+        // 墓碑：这条已被「取消全部未完成」删掉，在飞任务收尾时就地丢弃。
+        // 不在墓碑里又查不到记录 ⇒ 仍是内部 bug，照常告警。
+        if ctx.removed.contains(id) {
+            return;
+        }
         if let Err(error) = ctx.state.update(id, patch) {
             self.log(&format!("状态更新失败（内部 bug，请报告）：{error}"));
         }
@@ -583,6 +805,9 @@ impl Shared {
     fn finish(&self, id: &str, status: TaskStatus, mut patch: RecordPatch) {
         patch.status = Some(status);
         let mut ctx = self.lock();
+        if ctx.removed.contains(id) {
+            return;
+        }
         // 收住错误、**不吞**（理由见 `Shared::update`）。持锁期间不调 `log`，
         // 放锁后再报 —— 免得 `log` 回调万一碰 `ctx` 就成了死锁。
         let problem = ctx
@@ -600,12 +825,19 @@ impl Shared {
     fn requeue(&self, id: &str, status: TaskStatus, mut patch: RecordPatch) {
         patch.status = Some(status);
         let mut ctx = self.lock();
+        if ctx.removed.contains(id) {
+            return;
+        }
         let problem = ctx
             .state
             .update(id, patch)
             .err()
             .map(|error| format!("状态更新失败（内部 bug，请报告）：{error}"));
-        if !ctx.queue.iter().any(|queued| queued == id) {
+        // ⚠️ 停止时**只改状态、不入队**：否则在飞任务收尾会把刚清空的队列又填满，
+        //    于是 `is_live` 恒真、会话永远封不了口（`docs/plan/09` §1.5.7）。
+        // 退回队列 ⇒ 它不再是「已派出」的活。
+        ctx.processing.remove(id);
+        if !self.is_stopped() && !ctx.queue.iter().any(|queued| queued == id) {
             ctx.queue.push(id.to_string());
         }
         drop(ctx);
@@ -618,8 +850,7 @@ impl Shared {
     ///
     /// 闸门只在这里：Submit 必须过 `SubmitGate`；被挡住时**跳过 Submit 继续找非 Submit 候选**，
     /// 避免 `Redownload` / `RecheckFinal` 被饿死。
-    fn take_job(&self) -> TakeOutcome {
-        let mut ctx = self.lock();
+    fn take_job(&self, ctx: &mut Ctx) -> TakeOutcome {
         let now_ms_value = now_ms();
         let slots = slots_in_use(&ctx.state);
         let concurrency = ctx.concurrency;
@@ -698,6 +929,7 @@ impl Shared {
                 }
                 if let Some((index, _, kind)) = fallback {
                     let id = ctx.queue.remove(index);
+                    ctx.processing.insert(id.clone());
                     return TakeOutcome::Job(Job { kind, id });
                 }
                 // 闸门挡住时，也要为「更早到期的非 Submit 任务」醒来。
@@ -709,6 +941,8 @@ impl Shared {
         }
 
         let id = ctx.queue.remove(index);
+        // 记「已派出去」：界面是否持有它（进度条判据）与「还有没有活」都看这个集合。
+        ctx.processing.insert(id.clone());
         // 预占：变成**显式状态**，槽位计数随之派生 —— 不再需要 `slots_in_use += 1`
         if kind == JobKind::Submit {
             let _ = ctx.state.update(
@@ -743,21 +977,55 @@ pub struct SchedulerSummary {
     pub records: Vec<TaskRecord>,
 }
 
-// ── 单任务处理 ────────────────────────────────────────────────────────
+// ── 报告（会话封口时写）────────────────────────────────────────────────
 
-fn sleep_or_abort(shared: &Shared, total: Duration) -> Result<(), LovartError> {
-    let mut remaining = total;
-    let step = Duration::from_millis(CANCEL_POLL_MS);
-    while remaining > Duration::ZERO {
-        if shared.is_cancelled() {
-            return Err(LovartError::internal("已取消", ErrType::Abort));
-        }
-        let chunk = remaining.min(step);
-        std::thread::sleep(chunk);
-        remaining -= chunk;
+/// 写报告：**先归档旧的，再覆盖**。
+///
+/// 主路径固定（`var/report.csv` 永远是最新一次会话）；归档只为「清空任务记录后
+/// 还想翻历史」留一条后路（`docs/plan/08` §1.3.13）。
+fn write_report_file(
+    path: &Path,
+    summary: &SchedulerSummary,
+    tasks: &BTreeMap<String, PromptTask>,
+    output_dir: &Path,
+    log: &LogFn,
+) {
+    archive_previous_report(path, log);
+    if let Err(error) = crate::run::write_report(path, &summary.records, tasks, output_dir) {
+        log(&format!(
+            "写报告失败（图已经出了，只是这份 CSV 没生成）：{error}"
+        ));
     }
-    Ok(())
 }
+
+/// 覆盖前把旧报告挪进同级 `reports/`，用旧文件的 mtime 命名。
+///
+/// ⚠️ 失败**只告警**、不阻断：报告是副产品，不能因为它让一次跑批看起来失败。
+fn archive_previous_report(path: &Path, log: &LogFn) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return; // 不存在 = 首次写，无需归档
+    };
+    let stamp = meta
+        .modified()
+        .ok()
+        .map(chrono::DateTime::<chrono::Local>::from)
+        .map(|time| time.format("%Y%m%d-%H%M%S").to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let dir = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("reports");
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        log(&format!("建不了报告归档目录 {}：{error}", dir.display()));
+        return;
+    }
+    let target = dir.join(format!("report-{stamp}.csv"));
+    if let Err(error) = std::fs::rename(path, &target) {
+        log(&format!("归档旧报告失败（不影响本次报告）：{error}"));
+    }
+}
+
+// ── 单任务处理 ────────────────────────────────────────────────────────
 
 /// 下载一条记录的全部产物。**逐张隔离**：一张失败不影响其它张，
 /// 失败的 URL 原样返回供记账补下。
@@ -904,7 +1172,7 @@ fn handle_submit_error(
     shared: &Shared,
 ) {
     // 用户中断（Ctrl+C）：还没拿到 threadId，回退 pending，下次续跑重新提交。
-    if shared.is_cancelled() {
+    if shared.is_stopped() {
         shared.requeue(
             id,
             TaskStatus::Pending,
@@ -1240,7 +1508,7 @@ fn handle_poll_error(
     is_final_sweep: bool,
 ) {
     // 用户中断（Ctrl+C）：保留 threadId，下次续跑直接复查，**不判失败**。
-    if shared.is_cancelled() {
+    if shared.is_stopped() {
         shared.update(
             id,
             RecordPatch {
@@ -1444,334 +1712,518 @@ fn handle_poll_error(
 /// 返回的 [`PromptTask`] 由记录**无损投影**（[`TaskRecord::to_prompt_task`]），
 /// 供 worker 取用（提交时要拿垫图地址当 attachments）。
 ///
-/// 两条判据与声明路径**同源**（都读状态表）：终态不处理；`job` 为空的
-/// `submitting` 回退待提交（它没拿到 threadId，无从续查）。
-fn enqueue_records(
-    state: &mut StateStore,
-    ids: &[String],
-    queue: &mut Vec<String>,
-    log: &LogFn,
-) -> Vec<PromptTask> {
-    let mut tasks = Vec::with_capacity(ids.len());
-    for id in ids {
-        let Some(record) = state.get(id).cloned() else {
-            log(&format!("派工：{id} 没有记录，跳过"));
-            continue;
-        };
-        if is_terminal(record.status) {
-            continue;
-        }
-        if status_row(record.status).job.is_none() {
-            if let Err(error) = state.update(
-                id,
-                RecordPatch {
-                    status: Some(TaskStatus::Pending),
-                    error: Some(Some("上次提交未完成，重新提交".to_string())),
-                    ..Default::default()
-                },
-            ) {
-                log(&format!("重置「上次提交未完成」失败（内部 bug，请报告）：{error}"));
-            }
-        }
-        queue.push(id.clone());
-        tasks.push(record.to_prompt_task());
-    }
-    tasks
+
+
+// ── 常驻调度器 ────────────────────────────────────────────────────────
+
+/// 起调度器需要的全部配置（一次性给全，之后不再读环境）。
+pub struct SchedulerConfig {
+    pub deps: ClientDeps,
+    pub state: StateStore,
+    pub output_dir: PathBuf,
+    pub report_file: Option<PathBuf>,
+    pub tuning: SchedulerTuning,
+    pub retry_failed: bool,
+    pub auto_confirm: Arc<AutoConfirm>,
+    pub log: LogFn,
+    pub ports: Option<Arc<dyn Ports>>,
+    /// 会话封口回调（GUI 用）；CLI 传 `None`。
+    pub on_session_end: Option<SessionEndFn>,
 }
 
+/// 一次投喂的结果（日志与告警用）。
+pub struct EnqueueOutcome {
+    /// 本次投喂的任务（报告 `tasks_by_id` 的原料）。
+    pub tasks: Vec<PromptTask>,
+    /// 因参数变更而重置重跑的条数。
+    pub param_changed: usize,
+    /// 本次是否开启了新会话（`false` = 追加到已有会话）。
+    pub opened: bool,
+    pub session_id: Option<String>,
+    /// 被拒绝的条目（已结束 / 无记录等），由调用方转成给用户看的提示。
+    pub rejected: Vec<intake::Rejection>,
+}
+
+/// 进程内调度器。`start` 之后一直活着，直到 `shutdown`。
+///
+/// ⚠️ **唯一**写 `state.jsonl` 的组件。`gui` / `run` 都不许直接
+/// `StateStore::open` 写 —— 那会与在飞任务互相覆盖（不变量 I1）。
+#[derive(Clone)]
+pub struct Scheduler {
+    shared: Arc<Shared>,
+}
+
+impl Scheduler {
+    /// 起 worker 池并进入空闲。**不**自动接管未完成记录（用户点了才跑）。
+    pub fn start(config: SchedulerConfig) -> Result<Self, LovartError> {
+        let SchedulerConfig {
+            deps,
+            state,
+            output_dir,
+            report_file,
+            tuning,
+            retry_failed,
+            auto_confirm,
+            log,
+            ports,
+            on_session_end,
+        } = config;
+        let SchedulerTuning {
+            concurrency,
+            task_timeout,
+            recheck_timeout,
+            max_timeouts,
+            download_retries,
+            max_attempts,
+            max_busy_retries,
+            busy_backoff_base,
+            task_interval,
+            rate_limit_backoff_base,
+        } = tuning;
+
+        let cancelled = Arc::clone(&deps.cancelled);
+        let mut ctx = Ctx {
+            deps,
+            ports: ports.unwrap_or_else(|| Arc::new(RealPorts::new())),
+            state,
+            output_dir,
+            concurrency,
+            // 值已由 `SchedulerTuning` 兜过底（Settings 层 + Default），这里不再 unwrap_or：
+            // 多一层兜底 = 多一份默认值 = 迟早和上面对不上。
+            task_timeout,
+            recheck_timeout,
+            max_timeouts: max_timeouts.max(1),
+            download_retries: download_retries.max(1),
+            max_attempts,
+            max_busy_retries: max_busy_retries.max(1),
+            busy_backoff_base,
+            task_by_id: BTreeMap::new(),
+            queue: Vec::new(),
+            processing: std::collections::BTreeSet::new(),
+            removed: std::collections::BTreeSet::new(),
+            gate: SubmitGate::new(task_interval, rate_limit_backoff_base),
+            mode_logged: false,
+            retry_failed,
+            report_file,
+            session: SessionState::new(),
+        };
+
+        // 启动修复：`submitting` 残留（进程被杀）改回 `pending`。
+        // **只改状态、不入队** —— 不消耗积分，不算自动接管（09 §3.8）。
+        let fixed = fix_orphan_submitting(&mut ctx);
+        if fixed > 0 {
+            log(&format!(
+                "启动修复：{fixed} 条「提交中」残留已改回待提交（不会自动开跑）"
+            ));
+        }
+
+        let shared = Arc::new(Shared {
+            ctx: Mutex::new(ctx),
+            log,
+            cancelled,
+            stopped: AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
+            wake: Condvar::new(),
+            handles: Mutex::new(Vec::new()),
+            last_summary: Mutex::new(None),
+            on_session_end,
+            auto_confirm,
+        });
+
+        let mut handles = Vec::new();
+        for worker_id in 1..=concurrency {
+            let worker_shared = Arc::clone(&shared);
+            handles.push(std::thread::spawn(move || {
+                worker_loop(worker_id, &worker_shared);
+            }));
+        }
+        *shared
+            .handles
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = handles;
+
+        Ok(Self { shared })
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Ctx> {
+        self.shared.lock()
+    }
+
+    fn log(&self, message: &str) {
+        self.shared.log(message);
+    }
+
+    /// 唯一投喂入口：建队 + 唤醒。
+    ///
+    /// ⚠️ 建队（记录创建 / 参数变更检测）与「队列空」判定在同一把锁内，
+    /// 所以不存在「刚判定空闲、随后又被投喂」的窗口。
+    pub fn enqueue(&self, batch: Batch) -> Result<EnqueueOutcome, LovartError> {
+        let declared = matches!(batch, Batch::Declared(_));
+        let (outcome, log_line) = {
+            let mut ctx = self.lock();
+            // 投喂即恢复：`stop_session` 置的两个标志在这里复位。
+            // ⚠️ 不复位的话，停止一次之后所有「失败重试」都会被 `requeue` 丢掉
+            //    （`requeue` 在 stopped 时不入队）⇒ 任务静默消失，不报错。
+            self.shared.stopped.store(false, Ordering::SeqCst);
+            self.shared.cancelled.store(false, Ordering::SeqCst);
+            let mut new_ids: Vec<String> = Vec::new();
+            let mut rejected: Vec<intake::Rejection> = Vec::new();
+            let tasks = match batch {
+                Batch::Declared(tasks) => tasks,
+                // 派工：**一个字段都不写回记录** —— 只把 id 送进队列；
+                // 任务由记录**无损投影**得到（含已上传的垫图 URL 与指纹）。
+                Batch::Records(ids) => {
+                    let (records, rejects) = intake::enqueue_records(
+                        &mut ctx.state,
+                        &ids,
+                        &mut new_ids,
+                        &self.shared.log,
+                    );
+                    rejected.extend(rejects);
+                    records
+                }
+            };
+            let retry_failed = ctx.retry_failed;
+            // 声明路径：参数以本次投喂为准（创建 / 重置 / 同步 + 入队）。
+            // ⚠️ 只对「声明」生效，派工进来会按"声明里没有垫图"覆盖记录。
+            let param_changed = if declared {
+                let (changed, rejects) = intake::sync_declared(
+                    &mut ctx.state,
+                    &mut new_ids,
+                    &tasks,
+                    retry_failed,
+                    &self.shared.log,
+                );
+                rejected.extend(rejects);
+                changed
+            } else {
+                0
+            };
+
+            // 初始化落盘：写不进去就**别开跑** —— 跑了也续不上，等于白跑几小时。
+            if let PersistOutcome::Failed {
+                message,
+                failed_writes,
+            } = ctx.state.flush()
+            {
+                return Err(LovartError::transport(format!(
+                    "状态文件写不进去（{message}，失败 {failed_writes} 次）：断点续跑会失效，已中止启动"
+                )));
+            }
+
+            for task in &tasks {
+                ctx.task_by_id.insert(task.id.clone(), task.clone());
+            }
+            let mut seen: std::collections::BTreeSet<String> = ctx.queue.iter().cloned().collect();
+            for id in new_ids {
+                if seen.insert(id.clone()) {
+                    ctx.queue.push(id);
+                } else {
+                    // 已在队列里（重复投喂正在跑的那条）：也要**明说**，
+                    // 否则界面报"已提交 N 条"，实际一条都没加（还是假成功）。
+                    let label = tasks
+                        .iter()
+                        .find(|task| task.id == id)
+                        .map(|task| task.prompt.as_str())
+                        .unwrap_or(id.as_str());
+                    rejected.push(intake::Rejection::new(label, "已在队列里，没有重复排队"));
+                }
+            }
+            let ids: Vec<String> = tasks.iter().map(|task| task.id.clone()).collect();
+            let opened = ctx.session.record(ids);
+            let session_id = ctx.session.id().map(str::to_string);
+            // 自动确认计数按**会话**算：新会话从 0 开始（否则告警会把上一会话的算进来）。
+            if opened {
+                self.shared.auto_confirm.reset();
+            }
+            let queue_len = ctx.queue.len();
+            let concurrency = ctx.concurrency;
+            let log_line = format!(
+                "任务 {} 条：待处理 {queue_len}，并发 {concurrency}{}",
+                tasks.len(),
+                if param_changed > 0 {
+                    format!("（参数变更重跑 {param_changed} 条）")
+                } else {
+                    String::new()
+                }
+            );
+            (
+                EnqueueOutcome {
+                    tasks,
+                    param_changed,
+                    opened,
+                    session_id,
+                    rejected,
+                },
+                log_line,
+            )
+        };
+        self.log(&log_line);
+        self.shared.wake.notify_all();
+        Ok(outcome)
+    }
+
+    /// 有活：队列非空或有在飞任务。**会话封口判据**（不变量 I3）。
+    pub fn is_live(&self) -> bool {
+        let ctx = self.lock();
+        !ctx.queue.is_empty() || !ctx.processing.is_empty()
+    }
+
+    /// 取一份 `ClientDeps` 克隆（参考图上传等锁外工作要用）。
+    pub(crate) fn deps(&self) -> ClientDeps {
+        self.lock().deps.clone()
+    }
+
+    /// 本会话已自动确认条数（看板与告警用）。
+    pub fn auto_confirmed(&self) -> usize {
+        self.shared.auto_confirm.count()
+    }
+
+    /// 当前被持有的 id（待处理 ∪ 在飞）。界面进度条的**唯一**判据。
+    pub fn held_ids(&self) -> std::collections::BTreeSet<String> {
+        let ctx = self.lock();
+        let mut held: std::collections::BTreeSet<String> = ctx.queue.iter().cloned().collect();
+        held.extend(ctx.processing.iter().cloned());
+        held
+    }
+
+    /// 停止本会话：置标志 + 清队列，**不删记录**（可重跑）。
+    ///
+    /// ⚠️ worker **不退出**（退出只看 `shutdown`）；下一次 `enqueue` 会复位
+    /// `stopped` 与协议层 `cancelled`，所以「停止后再提交」是正常路径。
+    pub fn stop_session(&self) {
+        self.shared.stopped.store(true, Ordering::SeqCst);
+        self.shared.cancelled.store(true, Ordering::SeqCst);
+        {
+            let mut ctx = self.lock();
+            ctx.queue.clear();
+        }
+        self.shared.wake.notify_all();
+        // 停止即「这次会话到此为止」（08 §1.3.4）：没有在飞任务就当场封口写报告；
+        // 还有在飞任务时封不了，它们收尾时会各自走 `close_session_if_idle`。
+        self.shared.close_session_if_idle();
+    }
+
+    /// 重跑某一条：锁内重置为待提交（**垫图与指纹原样保留**）。
+    ///
+    /// 走调度器而不是外部 `StateStore::open` —— 后者是第二个写者（不变量 I1）。
+    pub fn reset_for_retry(&self, id: &str) -> Result<(), LovartError> {
+        let mut ctx = self.lock();
+        if ctx.removed.contains(id) {
+            return Ok(());
+        }
+        crate::engine::state::reset_for_retry(&mut ctx.state, id)
+            .map_err(|error| LovartError::transport(format!("重置失败：{error}")))?;
+        let _ = ctx.state.flush();
+        Ok(())
+    }
+
+    /// 外部改一条记录（「确认」后推回 `running`）。锁内执行，保持单写者。
+    pub fn update_record(&self, id: &str, patch: RecordPatch) -> Result<(), LovartError> {
+        let mut ctx = self.lock();
+        if ctx.removed.contains(id) {
+            return Ok(());
+        }
+        ctx.state
+            .update(id, patch)
+            .map_err(|error| LovartError::transport(format!("更新失败：{error}")))?;
+        let _ = ctx.state.flush();
+        Ok(())
+    }
+
+    /// 删除指定 id 的记录（锁内，唯一写者）。在飞的会给它留墓碑。
+    pub fn remove(&self, ids: &[String]) -> Result<usize, LovartError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut ctx = self.lock();
+        let count = ctx
+            .state
+            .remove(ids)
+            .map_err(|error| LovartError::transport(format!("删任务失败：{error}")))?;
+        let set: std::collections::BTreeSet<String> = ids.iter().cloned().collect();
+        ctx.queue.retain(|id| !set.contains(id));
+        for id in &set {
+            if ctx.processing.remove(id) {
+                ctx.removed.insert(id.clone());
+            }
+            ctx.task_by_id.remove(id);
+        }
+        Ok(count)
+    }
+
+    /// 删除**已结束**的记录（锁内）。
+    pub fn remove_finished(&self) -> Result<usize, LovartError> {
+        let ids: Vec<String> = {
+            let ctx = self.lock();
+            ctx.state
+                .all()
+                .into_iter()
+                // 与旧的「清空已完成」同一条判据（看板的 `finished` 组），
+                // 不用 `is_terminal`：后者会把终态的 `needs_confirm` 也算进来。
+                .filter(|record| crate::run::is_board_finished(record.status))
+                .map(|record| record.id.clone())
+                .collect()
+        };
+        self.remove(&ids)
+    }
+
+    /// 取消所有未完成：**锁内**删除看板未结束的记录（含终态的 `needs_confirm`），
+    /// 返回删除条数。
+    ///
+    /// 与旧实现（先停批 → 等线程退出 → 再删）相比不再需要等待：写者只有调度器自己，
+    /// 删除与 worker 的写入天然串行。在飞任务随后收尾时命中墓碑，静默丢弃（§2.5）。
+    pub fn remove_open(&self) -> Result<usize, LovartError> {
+        self.shared.stopped.store(true, Ordering::SeqCst);
+        self.shared.cancelled.store(true, Ordering::SeqCst);
+        let removed = {
+            let mut ctx = self.lock();
+            let ids: Vec<String> = ctx
+                .state
+                .all()
+                .into_iter()
+                .filter(|record| crate::run::is_board_open(record.status))
+                .map(|record| record.id.clone())
+                .collect();
+            if ids.is_empty() {
+                0
+            } else {
+                let count = ctx
+                    .state
+                    .remove(&ids)
+                    .map_err(|error| LovartError::transport(format!("删任务失败：{error}")))?;
+                let set: std::collections::BTreeSet<String> = ids.into_iter().collect();
+                ctx.queue.retain(|id| !set.contains(id));
+                for id in &set {
+                    // 只有**正在跑**的才需要墓碑（它收尾时会写回）；已结束的直接删。
+                    if ctx.processing.remove(id) {
+                        ctx.removed.insert(id.clone());
+                    }
+                    ctx.task_by_id.remove(id);
+                }
+                // 取消全部 = 这次会话到此为止（下一条投喂开新会话）。
+                // 不写报告：用户要的是「清空」，一份空报告没有意义。
+                let _ = ctx.session.close();
+                count
+            }
+        };
+        self.shared.wake.notify_all();
+        Ok(removed)
+    }
+
+    /// 等空闲（`queue` 空且在飞归零）。**只给 CLI 的一次性跑批用**。
+    ///
+    /// 用轮询而不是 `Condvar`：若持锁等待，worker 收尾时要抢同一把锁 ⇒ 死锁。
+    pub(crate) fn wait_idle(&self) {
+        loop {
+            {
+                let ctx = self.lock();
+                if ctx.queue.is_empty() && ctx.processing.is_empty() {
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// 关停：worker 退出 → join → 统计会话 → 写报告。
+    ///
+    /// 幂等：第二次调用时 `handles` 已空、摘要已取走 ⇒ 返回空摘要。
+    pub fn shutdown(&self) -> Result<SchedulerSummary, LovartError> {
+        self.shared.begin_shutdown();
+        let handles = {
+            let mut slot = self
+                .shared
+                .handles
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            std::mem::take(&mut *slot)
+        };
+        for handle in handles {
+            if handle.join().is_err() {
+                self.log("调度器内部错误：worker 线程异常退出");
+            }
+        }
+
+        let (summary, report_file, tasks, output_dir, already_written) = {
+            let mut ctx = self.lock();
+            let last = self
+                .shared
+                .last_summary
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+            let already_written = last.is_some();
+            let summary = match last {
+                Some(summary) => summary,
+                None => {
+                    let ids = ctx.session.all_ids().clone();
+                    ctx.summarize_ids(&ids)
+                }
+            };
+            (
+                summary,
+                ctx.report_file.clone(),
+                ctx.task_by_id.clone(),
+                ctx.output_dir.clone(),
+                already_written,
+            )
+        };
+        // 封口已经写过报告就不再写：否则每跑一批都会在主文件之外多留一份归档副本。
+        if !already_written {
+            if let Some(path) = report_file {
+                write_report_file(&path, &summary, &tasks, &output_dir, &self.shared.log);
+            }
+        }
+        Ok(summary)
+    }
+}
+
+/// 一次性跑完：起调度器 → 投喂 → 等空闲 → 关停。**CLI 专用**。
 pub fn run_scheduler(options: SchedulerOptions) -> Result<SchedulerSummary, LovartError> {
     let SchedulerOptions {
         deps,
         batch,
-        mut state,
+        state,
         output_dir,
         tuning,
         retry_failed,
         auto_confirm,
         log,
         ports,
+        report_file,
     } = options;
-
-    // 解构进 `Ctx` 的扁平字段：`ctx.task_timeout` 那十几处引用一行都不用改。
-    let SchedulerTuning {
-        concurrency,
-        task_timeout,
-        recheck_timeout,
-        max_timeouts,
-        download_retries,
-        max_attempts,
-        max_busy_retries,
-        busy_backoff_base,
-        task_interval,
-        rate_limit_backoff_base,
-    } = tuning;
-
-    let mut queue: Vec<String> = Vec::new();
-    let mut param_changed = 0usize;
-
-    // ── 建队：两种意图，两条路（理由见 [`Batch`]）──────────────────────
-    let declared = matches!(batch, Batch::Declared(_));
-    let tasks: Vec<PromptTask> = match batch {
-        Batch::Declared(tasks) => tasks,
-        // 派工：**一个字段都不写回记录** —— 只把 id 送进队列；
-        // 任务由记录**无损投影**得到（含已上传的垫图 URL 与指纹）。
-        Batch::Records(ids) => enqueue_records(&mut state, &ids, &mut queue, &log),
-    };
-    let task_by_id: BTreeMap<String, PromptTask> = tasks
-        .iter()
-        .map(|task| (task.id.clone(), task.clone()))
-        .collect();
-
-    // ⚠️ 这个循环**只对"声明"生效**。派工若进来，就会按"声明里没有垫图"去覆盖记录
-    //    —— 那正是 2026-10-01 那个 bug（点确认后垫图消失）。派工的 id 已入队。
-    let to_sync: &[PromptTask] = if declared { &tasks } else { &[] };
-    for task in to_sync {
-        let existing = state.get(&task.id).cloned();
-        let Some(existing) = existing else {
-            state.create(new_record(task));
-            queue.push(task.id.clone());
-            continue;
-        };
-
-        // 参数（模型/比例/尺寸/参考图）被改过：以当前文件为准。
-        // id 只哈希提示词文本，不检测的话终态记录会静默沿用旧参数/旧参考图的产物。
-        let ref_signature = task.ref_signature.clone().unwrap_or_default();
-        let same_params = existing.model == task.model
-            && existing.aspect_ratio == task.aspect_ratio
-            && existing.image_size == task.image_size
-            && existing.ref_signature.clone().unwrap_or_default() == ref_signature;
-
-        if !same_params && is_terminal(existing.status) {
-            if let Err(error) = state.update(
-                &task.id,
-                RecordPatch {
-                    status: Some(TaskStatus::Pending),
-                    model: Some(task.model.clone()),
-                    aspect_ratio: Some(task.aspect_ratio.clone()),
-                    image_size: Some(task.image_size.clone()),
-                    attempts: Some(0),
-                    timeout_count: Some(0),
-                    busy_retries: Some(0),
-                    ready_at: Some(0),
-                    thread_id: clear(),
-                    // 一并清掉 30% 锚点：重跑会拿到**新** threadId，进度应重新计时。
-                    submitted_at: clear(),
-                    project_id: clear(),
-                    artifacts: clear(),
-                    files: clear(),
-                    error: clear(),
-                    ref_signature: if ref_signature.is_empty() {
-                        clear()
-                    } else {
-                        set(ref_signature.clone())
-                    },
-                    ref_urls: ref_urls_of(task),
-                    ..Default::default()
-                },
-            ) {
-                log(&format!("参数变更重置失败（内部 bug，请报告）：{error}"));
-            }
-            queue.push(task.id.clone());
-            param_changed += 1;
-            continue;
-        }
-
-        let mut patch = RecordPatch::default();
-        if !same_params {
-            patch.model = Some(task.model.clone());
-            patch.aspect_ratio = Some(task.aspect_ratio.clone());
-            patch.image_size = Some(task.image_size.clone());
-            patch.ref_signature = if ref_signature.is_empty() {
-                clear()
-            } else {
-                set(ref_signature.clone())
-            };
-            // 垫图地址与指纹**必须同进同退**：只改指纹不改地址，界面就会拿旧垫图当新的
-            // （图换了、显示的地址没换 ⇒ 用户对着错的图查）。见 `TaskRecord::ref_urls`。
-            patch.ref_urls = ref_urls_of(task);
-        }
-        if existing.line != Some(task.line) {
-            patch.line = Some(task.line);
-        }
-        if patch != RecordPatch::default() {
-            if let Err(error) = state.update(&task.id, patch) {
-                log(&format!("参数同步失败（内部 bug，请报告）：{error}"));
-            }
-        }
-
-        if is_terminal(existing.status) {
-            if retry_failed
-                && existing.status == TaskStatus::Failed
-                && existing.thread_id.is_none()
-            {
-                match reset_for_retry(&mut state, &task.id) {
-                    Ok(_) => {
-                        queue.push(task.id.clone());
-                        log(&format!("[retry-failed] 🔁 {} 已重置为待提交", task.id));
-                    }
-                    Err(error) => {
-                        log(&format!("[retry-failed] 重置失败（内部 bug）：{error}"));
-                    }
-                }
-            } else if retry_failed
-                && existing.status == TaskStatus::Failed
-                && existing.thread_id.is_some()
-            {
-                log(&format!(
-                    "⚠️ {} 失败但已有 threadId，跳过 --retry-failed",
-                    task.id
-                ));
-            }
-            continue;
-        }
-
-        // ⚠️ 判据**读表**：非终态里**只有 `submitting` 不进队列**（`job` 为空）。
-        //    它是「已认领、还没拿到 threadId」的那个 —— 进程在上次提交中途被杀，
-        //    没有 threadId 无从续查 ⇒ 只能重新提交。
-        //    （提交可能已成功但没落盘 —— 这个窗口无法消除，只能缩到最小。）
-        //    上面 `is_terminal` 已经放行过，所以这里 `job` 为空 ⟺ `submitting`。
-        //    原先写的是 `existing.status == Submitting` —— 同一个问题的第五份答案。
-        if status_row(existing.status).job.is_none() {
-            if let Err(error) = state.update(
-                &task.id,
-                RecordPatch {
-                    status: Some(TaskStatus::Pending),
-                    error: Some(Some("上次提交未完成，重新提交".to_string())),
-                    ..Default::default()
-                },
-            ) {
-                log(&format!("重置「上次提交未完成」失败（内部 bug，请报告）：{error}"));
-            }
-            queue.push(task.id.clone());
-            continue;
-        }
-
-        queue.push(task.id.clone());
-    }
-
-    // 初始化落盘：写不进去就**别开跑** —— 跑了也续不上，等于白跑几小时。
-    if let PersistOutcome::Failed {
-        message,
-        failed_writes,
-    } = state.flush()
-    {
-        return Err(LovartError::transport(format!(
-            "状态文件写不进去（{message}，失败 {failed_writes} 次）：断点续跑会失效，已中止启动"
-        )));
-    }
-
-    let cancelled = Arc::clone(&deps.cancelled);
-    let ctx = Ctx {
+    let scheduler = Scheduler::start(SchedulerConfig {
         deps,
-        ports: ports.unwrap_or_else(|| Arc::new(RealPorts::new())),
         state,
         output_dir,
-        concurrency,
-        // 值已由 `SchedulerTuning` 兜过底（Settings 层 + Default），这里不再 unwrap_or：
-        // 多一层兜底 = 多一份默认值 = 迟早和上面对不上。
-        task_timeout,
-        recheck_timeout,
-        max_timeouts: max_timeouts.max(1),
-        download_retries: download_retries.max(1),
-        max_attempts,
-        max_busy_retries: max_busy_retries.max(1),
-        busy_backoff_base,
-        task_by_id,
-        queue,
-        gate: SubmitGate::new(task_interval, rate_limit_backoff_base),
-        mode_logged: false,
-    };
-    let queue_len = ctx.queue.len();
-
-    log(&format!(
-        "任务 {} 条：待处理 {queue_len}，并发 {concurrency}{}",
-        tasks.len(),
-        if param_changed > 0 {
-            format!("（参数变更重跑 {param_changed} 条）")
-        } else {
-            String::new()
-        }
-    ));
-
-    let shared = Arc::new(Shared {
-        ctx: Mutex::new(ctx),
-        log: Arc::clone(&log),
-        cancelled,
+        report_file,
+        tuning,
+        retry_failed,
         auto_confirm,
-    });
-
-    let mut handles = Vec::new();
-    for worker_id in 1..=concurrency {
-        let shared = Arc::clone(&shared);
-        handles.push(std::thread::spawn(move || {
-            worker_loop(worker_id, &shared);
-        }));
-    }
-    for handle in handles {
-        let _ = handle.join();
-    }
-
-    // 收回 state 做摘要
-    let shared = Arc::try_unwrap(shared)
-        .map_err(|_| LovartError::transport("调度器内部错误：worker 未全部退出"))?;
-    let ctx = shared
-        .ctx
-        .into_inner()
-        .unwrap_or_else(|error| error.into_inner());
-    let final_flush = ctx.state.flush();
-
-    // 只统计「当前提示词文件」对应的记录，避免和 state 里的历史记录串味
-    let current_ids: std::collections::BTreeSet<&str> =
-        tasks.iter().map(|task| task.id.as_str()).collect();
-    let records: Vec<TaskRecord> = ctx
-        .state
-        .all()
-        .into_iter()
-        .filter(|record| current_ids.contains(record.id.as_str()))
-        .cloned()
-        .collect();
-    // 逐状态计数**由表生成** —— 不再手抄 7 个具名字段（那是第二份状态清单）。
-    let mut counts = std::collections::BTreeMap::new();
-    for status in crate::engine::state::all() {
-        counts.insert(
-            crate::engine::state::json_key(status),
-            records
-                .iter()
-                .filter(|record| record.status == status)
-                .count(),
-        );
-    }
-
-    Ok(SchedulerSummary {
-        total: tasks.len(),
-        counts,
-        unfinished: records
-            .iter()
-            .filter(|record| is_unfinished(record.status))
-            .count(),
-        persist_failed: !final_flush.is_ok(),
-        records,
-    })
+        log,
+        ports,
+        // CLI 自己打印摘要，不需要回调。
+        on_session_end: None,
+    })?;
+    scheduler.enqueue(batch)?;
+    scheduler.wait_idle();
+    scheduler.shutdown()
 }
 
 fn worker_loop(worker_id: usize, shared: &Shared) {
-    while !shared.is_cancelled() {
-        match shared.take_job() {
-            TakeOutcome::Job(job) => match job.kind {
-                JobKind::Submit => run_submit(worker_id, &job.id, shared),
-                JobKind::Recheck => run_recheck(worker_id, &job.id, shared),
-                // 收尾两件活（只补下载 / 兜底复查）走同一入口，进去按 `kind` 分派。
-                JobKind::Redownload | JobKind::RecheckFinal => {
-                    run_final(worker_id, &job.id, job.kind, shared)
-                }
-            },
-            TakeOutcome::Wait(ms) => {
-                if sleep_or_abort(shared, Duration::from_millis(ms)).is_err() {
-                    break;
-                }
+    // ⚠️ 退出条件**只有** `next_job` 返回 `None`（= shutdown）。
+    //    「队列空」不再等于退出 —— 那正是「运行中加任务」必须改掉的一条。
+    while let Some(job) = shared.next_job() {
+        match job.kind {
+            JobKind::Submit => run_submit(worker_id, &job.id, shared),
+            JobKind::Recheck => run_recheck(worker_id, &job.id, shared),
+            // 收尾两件活（只补下载 / 兜底复查）走同一入口，进去按 `kind` 分派。
+            JobKind::Redownload | JobKind::RecheckFinal => {
+                run_final(worker_id, &job.id, job.kind, shared)
             }
-            TakeOutcome::Empty => break,
         }
+        shared.finish_job(&job.id);
     }
 }
 

@@ -463,6 +463,8 @@ pub fn run_fixture(dir: &Path) -> FixtureRun {
                 auto_confirm: AutoConfirm::disabled(),
                 log: Arc::clone(&log),
                 ports: Some(Arc::clone(&ports)),
+                // 测试不写报告：报告是会话封口的副产品，与调度行为无关。
+                report_file: None,
             })
             .expect("调度器不应报错"),
         );

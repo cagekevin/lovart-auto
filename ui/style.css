@@ -426,12 +426,33 @@ button { cursor: pointer; color: inherit; }
  * 所以提示与确认都由页面自己画（原生 DOM，零内联样式）。
  */
 
-.toast {
+/* 提示条的宿主：**固定居顶**，不跟着触发点走。
+ *
+ * ── 为什么不能是右下角 ──────────────────────────────────────────────
+ * 右下角正好压在编辑区的「发布任务」上：点完发送，提示条盖住刚点的按钮，
+ * 想连点第二次就得等它消失。顶部居中既避开顶栏，也避开底部编辑区。
+ * ── 为什么要有宿主 ──────────────────────────────────────────────────
+ * 多条提示各自 `fixed` 会**完全重叠**（同一坐标），后来的把前一条盖死。
+ * 宿主用 flex 列排，天然按顺序堆叠。
+ */
+.toast-host {
   position: fixed;
-  right: var(--sp-4);
-  bottom: var(--sp-4);
-  z-index: 90;
-  max-width: 420px;
+  top: 64px;                 /* 顶栏之下 */
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 200;              /* 高于顶栏（90）与弹窗遮罩（100）之外的可点层 */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-2);
+  width: max-content;
+  max-width: min(560px, calc(100vw - 2 * var(--sp-4)));
+  pointer-events: none;      /* 宿主不拦截点击，只有单条提示可点 */
+}
+
+.toast {
+  pointer-events: auto;      /* 点一下即可关闭 */
+  max-width: 100%;
   padding: var(--sp-2) var(--sp-3);
   border: 1px solid var(--line);
   border-radius: var(--r-md);

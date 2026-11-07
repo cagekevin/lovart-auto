@@ -20,8 +20,9 @@ use serde_json::{json, Value};
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 
+use crate::engine::lockfile::FileLock;
 use crate::engine::scheduler::{
-    run_scheduler, AutoConfirm, Batch, SchedulerOptions, SchedulerTuning,
+    AutoConfirm, Batch, Scheduler, SchedulerConfig, SchedulerSummary, SchedulerTuning,
 };
 use crate::engine::settings::{self, Settings};
 use crate::engine::state::{
@@ -35,139 +36,6 @@ use crate::lovart::connection::{
 };
 use crate::lovart::prompt::{parse_prompts, ParseOptions, PromptDefaults};
 use crate::run::build_status_json;
-
-/// 运行中的一个批次。
-struct RunningBatch {
-    /// 调度器的取消标志。
-    cancelled: Arc<AtomicBool>,
-    /// 本批的自动确认机制（与调度器共享同一个 Arc；`get_state` 读计数）。
-    auto_confirm: Arc<AutoConfirm>,
-    label: String,
-    /// **本批次交给调度器的任务 id**（= 这批真会去提交/复查的那些）。
-    ///
-    /// 它是「进度条转不转」的**唯一判据**（`get_state` 把它逐条下发成 `following`）。
-    ///
-    /// ── 为什么必须有它 ────────────────────────────────────────────────
-    /// `state.jsonl` 里会有**没人跟**的未完成记录：调度器的队列**只由当前提示词文件
-    /// 派生**（见 `engine::scheduler` 的建队逻辑），上次被中断留下的 `running`
-    /// 只要不在这份文件里，就永远没人再查它 —— 既不会完成，也不会变红。
-    /// 原先界面按 `status` 判断，于是给这些记录也画一条 **CSS 无限循环**的进度条：
-    /// 「一直在转」= **宣告一件没发生的事**（本仓「成功必须为真」那条红线的反面）。
-    /// ⇒ 判据从「状态是什么」改成「**本批次有没有接管它**」。
-    ids: BTreeSet<String>,
-}
-
-/// 「正在取消所有未完成任务」期间，**任何**写任务表的命令都返回这一句。
-///
-/// 唯一一份文案：连点、发布、重跑、接着查、确认、单删都走它 ——
-/// 四处各写一句就会出现"有的说停止有的说清空"的口径分叉。
-const CLEARING_BLOCK: &str = "正在取消所有未完成任务，请稍候";
-
-/// 看板槽：**谁在跑** 与 **是否正在清空** 的同一份状态。
-///
-/// ── 为什么必须是一个 Mutex ────────────────────────────────────────────
-/// 删除（重写 `state.jsonl`）与跑批（追加写同一个文件）**结构上**要互斥。
-/// 拆成两个锁或两个原子量，就必然有"判定完还没置位"的空窗 ——
-/// 那正是「点了取消全部，任务又被写回来」的成因。
-/// 一把锁里一次判定，插队的路根本不存在。
-#[derive(Default)]
-struct Board {
-    batch: Option<RunningBatch>,
-    /// 「取消全部」意图。
-    ///
-    /// ⚠️ **只由 `clear_done` 复位** —— 必须横跨整个删除过程：
-    /// 批次已退出、还没删完的那几毫秒里若放过 `start_run`，
-    /// 新批次会把记录写回刚清空的表（用户看到"取消完又冒出来"）。
-    wipe: bool,
-    /// 内存侧变更计数：批次起停 / 清空意图的每一次变化都 +1。
-    ///
-    /// 用途只有一个 —— `get_state` 缓存判「看板内存态变了没」（见 [`view_key`]）。
-    /// 为什么不用「有没有批次 + id 条数」：新一批恰好同条数时判不出来，
-    /// 界面会继续用上一批的 `following`（进度条撒谎）。计数器没这个问题，
-    /// 而且**四个变更点全在 Board 自己的方法里**，加不进新字段也不会漏。
-    rev: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Gate {
-    Idle,
-    Running,
-    /// 正在取消所有未完成任务：要么在等批次退出，要么正在删。
-    Clearing,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClearIntent {
-    /// 没有批次：`wipe` 已置位，调用方在锁外立刻删。
-    Now,
-    /// 有批次：已置取消标志 + `wipe`，批次收尾时删。
-    Waiting,
-    /// 已经在清空：拒绝，不产生第二个删除者。
-    Already,
-}
-
-impl Board {
-    /// `wipe` **优先**于 `batch`：清空期间即使批次还在，也要报 `Clearing`
-    /// （否则错误文案会变成"跑批中，先停止"——而它已经在停了）。
-    fn gate(&self) -> Gate {
-        if self.wipe {
-            Gate::Clearing
-        } else if self.batch.is_some() {
-            Gate::Running
-        } else {
-            Gate::Idle
-        }
-    }
-
-    fn batch(&self) -> Option<&RunningBatch> {
-        self.batch.as_ref()
-    }
-
-    fn set_batch(&mut self, batch: RunningBatch) {
-        self.batch = Some(batch);
-        self.rev += 1;
-    }
-
-    /// 请求「取消全部」。锁内**只改内存**，不碰磁盘。
-    fn request_clear(&mut self) -> ClearIntent {
-        if self.wipe {
-            return ClearIntent::Already;
-        }
-        self.wipe = true;
-        self.rev += 1;
-        match self.batch.as_ref() {
-            Some(batch) => {
-                // 与「停止」是**同一个标志**：不新增第二套取消机制。
-                batch.cancelled.store(true, Ordering::SeqCst);
-                ClearIntent::Waiting
-            }
-            None => ClearIntent::Now,
-        }
-    }
-
-    /// 批次收尾：清掉 `batch`，返回「要不要清空」。
-    ///
-    /// ⚠️ `wipe` **保持置位**（不 take）—— 调用方还要在锁外删；删完再 [`Self::clear_done`]。
-    fn take_finished(&mut self) -> bool {
-        self.batch = None;
-        self.rev += 1;
-        self.wipe
-    }
-
-    /// 删除结束（成功或失败都必须调）：复位意图。忘了调 ⇒ 永久禁写。
-    fn clear_done(&mut self) {
-        self.wipe = false;
-        self.rev += 1;
-    }
-
-    fn clear_block(&self) -> Option<&'static str> {
-        if self.wipe {
-            Some(CLEARING_BLOCK)
-        } else {
-            None
-        }
-    }
-}
 
 /// `get_state` 的「没变就别重算」缓存。
 ///
@@ -229,8 +97,6 @@ fn view_key(
 /// GUI 全局状态。
 pub struct GuiState {
     cwd: PathBuf,
-    /// 看板槽（批次 + 清空意图）。**唯一**一份；不要再加第二个"是否在跑"的原子量。
-    board: Mutex<Board>,
     /// 全局自动确认开关（运行态真源；与每个批次的 `AutoConfirm` 共享）。
     auto_confirm: Arc<AtomicBool>,
     /// `.env` 读-改-写互斥：保存设置与切开关会同时改同一个文件。
@@ -257,6 +123,17 @@ pub struct GuiState {
     alerts: Mutex<Vec<String>>,
     /// 看板载荷的「没变就别重算」缓存（见 [`ViewCache`]）。
     view: Mutex<ViewCache>,
+    /// 单实例锁（`engine::lockfile`）。由 `setup` 注入，**必须活到窗口关闭** ——
+    /// 句柄一关，另一个进程就能进来写 `state.jsonl`。
+    ///
+    /// 用 `Mutex<Option<_>>` 而不是直接持有：`GuiState::new` 时 Tauri 还没起来，
+    /// 拿不到对话框，抢锁失败要根据平台给用户一句人话（见 `run` 的 `setup`）。
+    single_instance: Mutex<Option<FileLock>>,
+    /// 常驻调度器（**惰性启动**：第一次投喂时才建，没配凭据的用户启动不报错）。
+    scheduler: Mutex<Option<Scheduler>>,
+    /// 投喂串行锁：`refs-cache.json` 是「读-合并-写」，两次并发投喂会互相覆盖
+    /// （`docs/plan/09` §1.5.4）。代价可接受 —— 投喂是人工动作。
+    intake_lock: Mutex<()>,
 }
 
 impl GuiState {
@@ -265,11 +142,13 @@ impl GuiState {
         let (auto_confirm, auto_confirm_warning) = read_auto_confirm(&cwd.join(".env"));
         let state = Self {
             cwd,
-            board: Mutex::new(Board::default()),
             alerts: Mutex::new(Vec::new()),
             view: Mutex::new(ViewCache::default()),
             auto_confirm: Arc::new(AtomicBool::new(auto_confirm)),
             env_lock: Mutex::new(()),
+            single_instance: Mutex::new(None),
+            scheduler: Mutex::new(None),
+            intake_lock: Mutex::new(()),
         };
 
         // ⚠️ 启动就把 `.env` 载进来：设置里的「并发数 / 输出文件夹」也住在那里，
@@ -292,13 +171,121 @@ impl GuiState {
         state
     }
 
-    fn state_file(&self) -> PathBuf {
-        self.cwd.join("var/state.jsonl")
+    /// 收下单实例锁（`run` 的 `setup` 调用，抢到之后）。
+    ///
+    /// ⚠️ 不提供「没锁也能跑」的分支：抢锁失败时调用方必须让进程退出，
+    /// 而不是带着半个锁继续（两个写者 = 记录被覆盖）。
+    fn hold_lock(&self, lock: FileLock) {
+        let mut slot = self
+            .single_instance
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *slot = Some(lock);
     }
 
-    /// 看板槽的唯一取用口（锁中毒按全仓惯例就地恢复）。
-    fn board(&self) -> std::sync::MutexGuard<'_, Board> {
-        self.board.lock().unwrap_or_else(|error| error.into_inner())
+    /// 取（必要时创建）常驻调度器。
+    ///
+    /// ⚠️ 返回**克隆**而不是 guard：调用方随后会锁 `Mutex<Ctx>`，若拿着槽锁去锁它，
+    /// 任何反向路径都会死锁（`docs/plan/09` §1.5.3）。
+    fn ensure_scheduler(&self, app: &tauri::AppHandle) -> Result<Scheduler, String> {
+        let mut slot = self
+            .scheduler
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(scheduler) = slot.as_ref() {
+            return Ok(scheduler.clone());
+        }
+
+        // 每次创建前重新载入 `.env`（覆盖语义）：手改后点提交仍要用新值。
+        reload_dot_env(&self.cwd.join(".env"))?;
+        let (settings, warnings) = Settings::from_file(&self.cwd.join(".env"))
+            .map_err(|error| format!("读不了 .env：{error}"))?;
+        for warning in &warnings {
+            self.push_alert(&format!("⚠️ {warning}"));
+        }
+        let connection = resolve_connection()?;
+        let deps = to_client_deps(&connection)?;
+        crate::engine::runlog::init(self.cwd.join("var/run.log"));
+
+        // 落盘失败 ⇒ 跑的中途就上报一次（`on_write_error` 只调一次，不刷屏）。
+        let alert_handle = app.clone();
+        let store = StateStore::open_with(
+            &self.state_file(),
+            StateStoreOptions {
+                on_write_error: Some(Box::new(move |message: &str| {
+                    if let Some(state) = alert_handle.try_state::<GuiState>() {
+                        state.push_alert(&format!(
+                            "状态写不进磁盘（断点续跑会失效，重启后进度可能全丢）：{message}"
+                        ));
+                    }
+                })),
+            },
+        )
+        .map_err(|error| format!("打不开状态文件：{error}"))?;
+
+        let auto_confirm = AutoConfirm::new(Arc::clone(&self.auto_confirm));
+        // 会话封口回调：把「本会话跑完」变成告警与日志行（原先这段在 `run_scheduler` 返回后）。
+        let auto_for_cb = Arc::clone(&auto_confirm);
+        let end_handle = app.clone();
+        let on_session_end: crate::engine::scheduler::SessionEndFn = Arc::new(
+            move |summary: &SchedulerSummary| {
+                let counts: Vec<String> = summary
+                    .counts
+                    .iter()
+                    .filter(|(_, count)| **count > 0)
+                    .map(|(key, count)| format!("{key}={count}"))
+                    .collect();
+                crate::engine::runlog::line(&format!(
+                    "会话结束：共 {} 条（{}），未完成 {} 条",
+                    summary.total,
+                    counts.join(" "),
+                    summary.unfinished
+                ));
+                let Some(state) = end_handle.try_state::<GuiState>() else {
+                    return;
+                };
+                if summary.persist_failed {
+                    state.push_alert(
+                        "收尾时状态文件写不进去：本次进度可能续不上，重启后需要重新提交",
+                    );
+                }
+                let confirmed = auto_for_cb.count();
+                if confirmed > 0 {
+                    state.push_alert(&format!(
+                        "本会话自动确认 {confirmed} 条（已扣积分，明细以上游账单为准）"
+                    ));
+                }
+            },
+        );
+
+        let scheduler = Scheduler::start(SchedulerConfig {
+            deps,
+            state: store,
+            output_dir: self.cwd.join(&settings.output_dir),
+            report_file: Some(self.cwd.join("var/report.csv")),
+            tuning: SchedulerTuning::from_settings(&settings),
+            retry_failed: false,
+            auto_confirm,
+            log: Arc::new(|message: &str| crate::engine::runlog::line(message)),
+            ports: None,
+            on_session_end: Some(on_session_end),
+        })
+        .map_err(|error| format!("调度器启动失败：{}", error.message()))?;
+
+        *slot = Some(scheduler.clone());
+        Ok(scheduler)
+    }
+
+    /// 取调度器克隆（`None` = 还没创建）。不把 guard 交出去，避免与 ctx 锁嵌套。
+    fn scheduler_snapshot(&self) -> Option<Scheduler> {
+        self.scheduler
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    fn state_file(&self) -> PathBuf {
+        self.cwd.join("var/state.jsonl")
     }
 
     /// 作废看板缓存 ⇒ 下一轮 `get_state` 强制全量重算。
@@ -308,50 +295,6 @@ impl GuiState {
     fn invalidate_view(&self) {
         let mut view = self.view.lock().unwrap_or_else(|error| error.into_inner());
         view.key.clear();
-    }
-
-    /// 「清空中」统一写闸：**4 个**写任务表的命令在动手前各调一次。
-    ///
-    /// ⚠️ 只判"正在清空"，**不重写**原有的"跑批中"文案 ——
-    /// 那些是已经对外的原文案，没必要为了统一而改口径。
-    /// ⚠️ 调用点不得已经持有 `board` 锁（本函数内部加锁，std 的 Mutex 不可重入）。
-    fn ensure_not_clearing(&self) -> Result<(), String> {
-        match self.board().clear_block() {
-            Some(message) => Err(message.to_string()),
-            None => Ok(()),
-        }
-    }
-
-    /// 批次收尾的**唯一出口**（3 个收尾点全部走它）。
-    ///
-    /// 顺序就是契约：
-    /// ① 锁内摘掉 `batch`（此后 `get_state.running` 为 false，也没人再写状态文件）；
-    /// ② 若 `wipe` 为真，在**锁外、无写者**的情况下删未结束记录；
-    /// ③ 无论成功失败都 `clear_done` 复位（忘了它就永久禁写）；
-    /// ④ 把结果告诉用户。
-    ///
-    /// 任何一步换位置都会破掉"删除与跑批互斥"（见 `Board` 的注释）。
-    fn finish_batch(&self) {
-        let need_clear = {
-            let mut board = self.board();
-            board.take_finished()
-        };
-        if !need_clear {
-            return;
-        }
-
-        let outcome = remove_open_tasks_core(&self.state_file());
-        self.board().clear_done();
-
-        match outcome {
-            Ok(count) if count > 0 => self.push_alert(&format!(
-                "已取消并删除 {count} 条未结束任务记录（已结束的任务与图片未删除）"
-            )),
-            Ok(_) => self.push_alert("没有未结束的任务可删"),
-            Err(message) => {
-                self.push_alert(&format!("清空任务失败：{message}；记录仍在，可以重试"))
-            }
-        }
     }
 
     fn output_dir(&self) -> PathBuf {
@@ -412,22 +355,23 @@ fn view_input(state: &GuiState) -> ViewInput {
     let output_dir = state.output_dir();
     let auto_confirm = state.auto_confirm.load(Ordering::Relaxed);
 
-    // 计数只在本批存在时有意义；没有批次就是 0（不伪造"上次跑到多少"）。
-    let (batch_label, batch_ids, auto_confirmed, clearing, board_rev) = {
-        let board = state.board();
-        // `clearing` 与 `running` 是**两件事**：清空期间批次往往还在收尾，
-        // 所以 `running` 仍为 true（不撒谎），`clearing` 才是"正在取消全部"。
-        let clearing = board.gate() == Gate::Clearing;
-        match board.batch() {
-            Some(batch) => (
-                Some(batch.label.clone()),
-                batch.ids.clone(),
-                batch.auto_confirm.count(),
-                clearing,
-                board.rev,
-            ),
-            None => (None, BTreeSet::new(), 0, clearing, board.rev),
-        }
+    // 判据只有一处：**调度器**说的是不是真话。先克隆再放槽锁，避免与 ctx 锁长嵌套。
+    let scheduler = {
+        let slot = state
+            .scheduler
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        slot.clone()
+    };
+    // 计数只在本会话存在时有意义；没有就是 0（不伪造"上次跑到多少"）。
+    let (batch_label, batch_ids, auto_confirmed, running) = match scheduler {
+        Some(scheduler) if scheduler.is_live() => (
+            Some("处理中".to_string()),
+            scheduler.held_ids(),
+            scheduler.auto_confirmed(),
+            true,
+        ),
+        _ => (None, BTreeSet::new(), 0, false),
     };
 
     ViewInput {
@@ -436,9 +380,11 @@ fn view_input(state: &GuiState) -> ViewInput {
         batch_label,
         batch_ids,
         auto_confirmed,
-        clearing,
+        // 清空已改成锁内同步完成，不再有"清空中"这个中间态。
+        clearing: false,
         auto_confirm,
-        board_rev,
+        // 指纹只要「起停」这一位：`held_ids` 每秒都在变，进指纹会让缓存永远失效。
+        board_rev: u64::from(running),
     }
 }
 
@@ -703,269 +649,78 @@ fn start_run(
     state: tauri::State<'_, GuiState>,
     source: RunSource,
 ) -> Result<(), String> {
-    // 第一道闸：清空中 / 已有批次。放在读文件、解析、读 `.env` **之前** ——
-    // 这些是有成本的失败，没必要等做完才告诉用户"开不了"。
-    state.ensure_not_clearing()?;
-    {
-        let board = state.board();
-        if board.batch().is_some() {
-            return Err("已有批次在跑，先停止它".to_string());
-        }
-    }
-
     // ── 两种来源：声明 / 派工（理由见 [`RunSource`]）─────────────────
-    let (mut batch, label) = match source {
-        RunSource::File(file) => {
-            let prompts_file = PathBuf::from(&file);
-            if !prompts_file.is_file() {
-                return Err(format!("找不到提示词文件：{file}"));
-            }
-            // 校验先做：有错就别开跑（与 CLI 的 `--check` 同一条路径）。
-            let text = std::fs::read_to_string(&prompts_file).map_err(|error| error.to_string())?;
-            let parsed =
-                parse_prompts(&text, &PromptDefaults::from_env().0, &ParseOptions::default());
-            if !parsed.errors.is_empty() {
-                return Err(format!(
-                    "提示词文件有 {} 处问题，已拒绝开跑：\n{}",
-                    parsed.errors.len(),
-                    parsed.errors.join("\n")
-                ));
-            }
-            if parsed.tasks.is_empty() {
-                return Err("提示词文件里没有有效内容".to_string());
-            }
-            let label = prompts_file
-                .file_name()
-                .map(|value| value.to_string_lossy().to_string())
-                .unwrap_or_else(|| file.clone());
-            (Batch::Declared(parsed.tasks), label)
-        }
+    let batch = match source {
+        // 声明：编辑框投喂的任务，校验与 id 已在 `intake::tasks_from_inputs` 完成。
+        RunSource::Declared(tasks) => Batch::Declared(tasks),
         // 派工：**不解析参考图** —— 记录里的垫图已经是 CDN URL，重传一遍纯属浪费。
-        RunSource::Records(ids) => {
-            let label = format!("派工 {} 条", ids.len());
-            (Batch::Records(ids), label)
-        }
+        RunSource::Records(ids) => Batch::Records(ids),
     };
 
-    // ⚠️ 必须是 `reload_dot_env`（覆盖语义）：`load_dot_env` 对已经载入过的键是**空操作**，
-    // 用户手改 `.env` 后点「开始」仍会用旧值（`docs/plan/07` N1）。
-    reload_dot_env(&state.cwd.join(".env"))?;
-    // 设置以**文件**为准，与设置页同一个入口（N7）。本批用一个快照，跑批中不再读。
-    let (current_settings, settings_warnings) = Settings::from_file(&state.cwd.join(".env"))
-        .map_err(|error| format!("读不了 .env：{error}"))?;
-    let connection = resolve_connection()?;
-    let deps = to_client_deps(&connection)?;
-    let cancelled = Arc::clone(&deps.cancelled);
-    // 每批一份机制：开关与 `GuiState` 共享（热更新），计数与许可按批隔离。
-    let auto_confirm = AutoConfirm::new(Arc::clone(&state.auto_confirm));
+    // **惰性启动**：第一次投喂才读凭据 / 开状态文件。没配凭据的用户此刻才看到错，
+    // 与改造前「点发布才报错」一致。
+    let scheduler = state.ensure_scheduler(&app)?;
 
-    let cwd = state.cwd.clone();
-
-    // 运行日志：`var/run.log`（进程级只绑一次）。
-    // GUI 原先把调度器的过程输出**全部丢掉**（见下面那个空闭包），结果是挂机出问题时
-    // 第二天只剩 `state.jsonl` 的最终快照、没有任何时间线。这里把它接上。
-    crate::engine::runlog::init(cwd.join("var/run.log"));
-
-    // 本批次**接管**的任务 id（逐条下发给前端的 `following` 取它）。
-    // 用**全量**而不是"调度器真正入队的那部分"：已终态的那几条会被调度器跳过，
-    // 而它们本来就在 `finished` 组里、不画进度条 —— 多带几个 id 不会让任何一条
-    // 进度条多转一下，却省掉一次与调度器建队逻辑的重复实现。
-    let ids: BTreeSet<String> = match &batch {
-        Batch::Declared(tasks) => tasks.iter().map(|task| task.id.clone()).collect(),
-        Batch::Records(ids) => ids.iter().cloned().collect(),
-    };
-
-    // 批次边界写进日志：第二天先找这一行，就知道「那一晚开了几批、每批多少条」。
-    crate::engine::runlog::line(&format!(
-        "===== 批次开始：{label}（{} 条，并发 {}）=====",
-        ids.len(),
-        current_settings.concurrency
-    ));
-
-    {
-        let mut board = state.board();
-        // 复核一次：上面那道闸之后，可能有人点了「取消所有未完成任务」（空闲路径会立刻删）。
-        // **置位与判定在同一把锁里** —— 否则批次会挂在清空之后，把记录又写回空表。
-        if board.clear_block().is_some() {
-            return Err(CLEARING_BLOCK.to_string());
-        }
-        board.set_batch(RunningBatch {
-            cancelled: Arc::clone(&cancelled),
-            auto_confirm: Arc::clone(&auto_confirm),
-            label: label.clone(),
-            ids,
-        });
-    }
-
-    // 参考图解析 + 调度都在后台线程：不能阻塞 UI 线程。
+    // 参考图解析要联网 + 读写缓存 ⇒ 后台线程；投喂也在同一线程并持有 `intake_lock`
+    // （`refs-cache.json` 是「读-合并-写」，并发投喂会互相覆盖）。
     let app_for_thread = app.clone();
     std::thread::spawn(move || {
-        let state_file = cwd.join("var/state.jsonl");
-        // 用本批的**设置快照**，不重新读环境：跑批中途改设置不该影响当前批次。
-        let output_dir = cwd.join(&current_settings.output_dir);
-        let report_file = cwd.join("var/report.csv");
+        let Some(state) = app_for_thread.try_state::<GuiState>() else {
+            return;
+        };
+        let _guard = state
+            .intake_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
 
-        // 参考图：与 CLI **同一条路径**（本机路径读盘 → CDN → 写回 task.refs）。
-        // 命令行没有 `--ref`，所以整批默认参考图为空，只用行内 `refs`。
-        let refs_cache = cwd.join("var/refs-cache.json");
-        // ⚠️ **只有"声明"要解析参考图**（派工的垫图已经是 CDN URL，重传一遍纯属浪费）
-        //    —— `if let` 这一句本身就是那条分界。
+        let mut batch = batch;
+        // ⚠️ **只有"声明"要解析参考图**（派工的垫图已经是 CDN URL，重传一遍纯属浪费）。
         if let Batch::Declared(tasks) = &mut batch {
-            if let Err(message) =
-                crate::run::resolve_refs_core(&deps, tasks, &cwd, &[], Some(refs_cache.as_path()))
-            {
-                // 批次**根本没跑起来** ⇒ 批次级失败 ⇒ 必须让用户看到（原先只写进没人读的日志）。
-                if let Some(state) = app_for_thread.try_state::<GuiState>() {
-                    state.push_alert(&format!("参考图处理失败，这一批没有开跑：{message}"));
-                    // 收尾点 #1：这里也必须走 finish_batch —— 直接清 `running` 会让
-                    // 「取消全部」的 wipe 永远没人执行 ⇒ 之后所有写命令永久被拒。
-                    state.finish_batch();
-                }
+            let refs_cache = state.cwd.join("var/refs-cache.json");
+            let deps = scheduler.deps();
+            if let Err(message) = crate::run::resolve_refs_core(
+                &deps,
+                tasks,
+                &state.cwd,
+                &[],
+                Some(refs_cache.as_path()),
+            ) {
+                state.push_alert(&format!("参考图处理失败，这一批没有开跑：{message}"));
                 return;
             }
         }
 
-        // 调度器的过程输出 → **只进 `var/run.log`，不进界面**。
-        //
-        // 边界没变：任务级结果仍以 `state.jsonl` 为唯一真相、看板是它的显示器；
-        // 界面也不再灌第二份过程日志（原 `get_log` 通道就是这么变成幽灵的）。
-        // 区别只在「有没有一个**离线**读者」：挂机出问题时人不在电脑前，
-        // 终端/界面都留不下任何东西 —— 日志文件是唯一能回答「几点断的」的介质。
-        let log: crate::engine::scheduler::LogFn = Arc::new(|message: &str| {
-            crate::engine::runlog::line(message);
-        });
-
-        // 落盘失败 ⇒ **跑的中途**就上报一次（`StateStore` 的 `on_write_error` 只调一次，
-        // 不刷屏）。这是 `PersistOutcome` 那套机制的**唯一接线口** ——
-        // 原先它一个消费者都没有（DEBT TD-06-04）。
-        let alert_handle = app_for_thread.clone();
-        let state_store = match StateStore::open_with(
-            &state_file,
-            StateStoreOptions {
-                on_write_error: Some(Box::new(move |message: &str| {
-                    if let Some(state) = alert_handle.try_state::<GuiState>() {
-                        state.push_alert(&format!(
-                            "状态写不进磁盘（断点续跑会失效，重启后进度可能全丢）：{message}"
-                        ));
-                    }
-                })),
-            },
-        ) {
-            Ok(store) => store,
-            Err(error) => {
-                if let Some(state) = app_for_thread.try_state::<GuiState>() {
-                    state.push_alert(&format!("打不开状态文件，这一批没有开跑：{error}"));
-                    // 收尾点 #2：同 #1，必须走统一出口。
-                    state.finish_batch();
+        match scheduler.enqueue(batch) {
+            Ok(outcome) => {
+                if !outcome.opened {
+                    // 会话内追加：与「批次开始」分开记，第二天能看出是中途加过任务。
+                    crate::engine::runlog::line(&format!(
+                        "===== 会话内追加：{} 条 =====",
+                        outcome.tasks.len()
+                    ));
                 }
-                return;
-            }
-        };
-
-        // 报告（CSV）用：id → 任务。**两种来源各用各的权威** ——
-        // 声明批用文件里的（文件是权威）；派工批用**记录的无损投影**（记录是权威）。
-        // 要在 `batch` 被移进 `run_scheduler` **之前**算好。
-        let tasks_by_id: std::collections::BTreeMap<_, _> = match &batch {
-            Batch::Declared(tasks) => tasks
-                .iter()
-                .map(|task| (task.id.clone(), task.clone()))
-                .collect(),
-            Batch::Records(_) => {
-                let mut map = std::collections::BTreeMap::new();
-                match StateStore::open_read_only(&state_file) {
-                    Ok(store) => {
-                        for record in store.all() {
-                            map.insert(record.id.clone(), record.to_prompt_task());
-                        }
+                // 被拒绝的条目必须**明说**：编辑框保留文字后用户会重复点提交，
+                // 静默跳过就是「假成功」（界面说已提交，实际什么都没发生）。
+                if !outcome.rejected.is_empty() {
+                    let mut lines: Vec<String> = outcome
+                        .rejected
+                        .iter()
+                        .take(3)
+                        .map(|rejection| rejection.describe())
+                        .collect();
+                    if outcome.rejected.len() > 3 {
+                        lines.push(format!("……另有 {} 条", outcome.rejected.len() - 3));
                     }
-                    // 报告里的 `line` / `mode` 两列会因此为空 —— **说出来**，不静默。
-                    Err(error) => {
-                        if let Some(state) = app_for_thread.try_state::<GuiState>() {
-                            state.push_alert(&format!(
-                                "读不到状态文件，这次报告里的 line/mode 会缺：{error}"
-                            ));
-                        }
-                    }
+                    state.push_alert(&format!(
+                        "有 {} 条没有提交：{}",
+                        outcome.rejected.len(),
+                        lines.join("；")
+                    ));
                 }
-                map
-            }
-        };
-
-        let auto_for_count = Arc::clone(&auto_confirm);
-        // `.env` 的告警在跑批日志里也说一遍：手改坏了但没重启时，这是唯一的线索。
-        for warning in &settings_warnings {
-            log(&format!("⚠️ {warning}"));
-        }
-        let result = run_scheduler(SchedulerOptions {
-            deps,
-            batch,
-            state: state_store,
-            // 留一份给收尾的 `write_report`（它要把记录里的相对路径拼成绝对路径）
-            output_dir: output_dir.clone(),
-            // 本批的全部可调数值：**一次性**从设置快照来，跑批中不再读环境。
-            tuning: SchedulerTuning::from_settings(&current_settings),
-            retry_failed: false,
-            auto_confirm,
-            log: Arc::clone(&log),
-            ports: None,
-        });
-
-        // 花了钱就要报账：**Ok / Err 两个分支都读**，且必须在清 `running` 之前。
-        let auto_count = auto_for_count.count();
-        if auto_count > 0 {
-            if let Some(state) = app_for_thread.try_state::<GuiState>() {
-                state.push_alert(&format!(
-                    "本批自动确认 {auto_count} 条（已扣积分，明细以上游账单为准）"
-                ));
-            }
-        }
-
-        match result {
-            Ok(summary) => {
-                // 报告与 CLI 同一份格式（`tasks_by_id` 在上面按来源备好了）
-                if let Err(error) =
-                    crate::run::write_report(&report_file, &summary.records, &tasks_by_id, &output_dir)
-                {
-                    if let Some(state) = app_for_thread.try_state::<GuiState>() {
-                        state.push_alert(&format!(
-                            "写报告失败（图已经出了，只是这份 CSV 没生成）：{error}"
-                        ));
-                    }
-                }
-                // 收尾落盘失败 ⇒ 本次进度可能续不上。**必须说**：
-                // 不说的话用户以为跑完了就没事，重启才发现进度全丢（DEBT TD-06-04）。
-                if summary.persist_failed {
-                    if let Some(state) = app_for_thread.try_state::<GuiState>() {
-                        state.push_alert(
-                            "收尾时状态文件写不进去：本次进度可能续不上，重启后需要重新提交",
-                        );
-                    }
-                }
-                // 批次对账行进日志 —— 与 CLI 同一句话，第二天只看这一行就知道停在哪一类。
-                let counts: Vec<String> = summary
-                    .counts
-                    .iter()
-                    .filter(|(_, count)| **count > 0)
-                    .map(|(key, count)| format!("{key}={count}"))
-                    .collect();
-                crate::engine::runlog::line(&format!(
-                    "批次结束：共 {} 条（{}），未完成 {} 条",
-                    summary.total,
-                    counts.join(" "),
-                    summary.unfinished
-                ));
             }
             Err(error) => {
-                // 批次级失败 —— 原先是 `log(...)`，而那条通道没人读 ⇒ 界面显示「发布成功」。
-                if let Some(state) = app_for_thread.try_state::<GuiState>() {
-                    state.push_alert(&format!("批次失败：{}", error.message()));
-                }
+                state.push_alert(&format!("投喂失败：{}", error.message()));
             }
-        }
-
-        if let Some(state) = app_for_thread.try_state::<GuiState>() {
-            // 收尾点 #3（正常结束 / 取消 / 批次失败）：唯一出口。
-            state.finish_batch();
         }
     });
 
@@ -1079,78 +834,15 @@ fn move_to_imported(cwd: &Path, file: &Path) -> Result<(), String> {
     std::fs::rename(file, &target).map_err(|error| format!("搬去 inbox/imported 失败：{error}"))
 }
 
-/// 把前端队列落成一个提示词文件，返回路径。
-///
-/// 只写**非默认值**：默认模型/比例/尺寸不落进文件，这样用户拿去 CLI 跑也一样。
-///
-/// ⚠️ 这里的"默认值"必须是 [`PromptDefaults::from_env`] 解析后的**生效值**，不能是内置值：
-/// 用户把兜底模型改成 `nano-bn-pro` 后，一条**显式**写了 `nano-bn-2` 的任务若被当成
-/// "等于默认"而省掉，回头解析时会被补成 `nano-bn-pro` —— 参数静默换了个人。
-fn write_queue_file(cwd: &std::path::Path, tasks: &[Value]) -> Result<PathBuf, String> {
-    if tasks.is_empty() {
-        return Err("待发是空的".to_string());
-    }
-    let (defaults, _) = PromptDefaults::from_env();
-    let mut text = String::new();
-    for task in tasks {
-        let object = task.as_object().ok_or("任务格式不对")?;
-        let prompt = object
-            .get("prompt")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim();
-        if prompt.is_empty() {
-            return Err("有一条任务没有提示词".to_string());
-        }
-        let mut line = serde_json::Map::new();
-        line.insert("prompt".to_string(), Value::String(prompt.to_string()));
-        let model = object.get("model").and_then(Value::as_str).unwrap_or("");
-        if !model.is_empty() && model != defaults.model {
-            line.insert("model".to_string(), Value::String(model.to_string()));
-        }
-        let ratio = object.get("ratio").and_then(Value::as_str).unwrap_or("");
-        if !ratio.is_empty() && ratio != defaults.aspect_ratio {
-            line.insert("ratio".to_string(), Value::String(ratio.to_string()));
-        }
-        let size = object.get("size").and_then(Value::as_str).unwrap_or("");
-        if !size.is_empty() && size != defaults.image_size {
-            line.insert("size".to_string(), Value::String(size.to_string()));
-        }
-        let refs: Vec<Value> = object
-            .get("refs")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.as_str())
-                    .filter(|item| !item.trim().is_empty())
-                    .map(|item| Value::String(item.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !refs.is_empty() {
-            line.insert("refs".to_string(), Value::Array(refs));
-        }
-        text.push_str(&serde_json::to_string(&Value::Object(line)).map_err(|error| error.to_string())?);
-        text.push('\n');
-    }
-
-    let dir = cwd.join("var");
-    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
-    let path = dir.join("queue.jsonl");
-    std::fs::write(&path, text).map_err(|error| error.to_string())?;
-    Ok(path)
-}
-
 /// 起一批要跑的活 —— **两种来源**（语义分界见 `engine::scheduler::Batch`）。
 ///
 /// ⚠️ **派工不走文件**：原先「重跑 / 接着查 / 确认」都是先**伪造**一份单行提示词文件
 ///    再交给调度器。伪造用的 `record_to_task` 只挑 4 个字段 ⇒ 垫图在那份"声明"里为空
 ///    ⇒ 调度器按「以文件为准」把记录里的垫图覆盖掉（2026-10-01 实测：确认后垫图消失）。
-///    这里把两种来源分开：**声明以文件为准，派工以记录为准**。
+///    这里把两种来源分开：**声明以本次投喂为准，派工以记录为准**。
 enum RunSource {
-    /// 用户在待发里发布的那份提示词（**声明**）。
-    File(String),
+    /// 用户从编辑框投喂的任务（**声明**）：校验与 id 已由 `intake` 完成。
+    Declared(Vec<crate::lovart::prompt::PromptTask>),
     /// 对已有记录的派工：只处理这些 id（**记录才是真相**）。
     Records(Vec<String>),
 }
@@ -1160,10 +852,16 @@ enum RunSource {
 fn publish_queue(
     app: tauri::AppHandle,
     state: tauri::State<'_, GuiState>,
-    tasks: Vec<Value>,
+    tasks: Vec<crate::engine::intake::TaskInput>,
 ) -> Result<(), String> {
-    let path = write_queue_file(&state.cwd, &tasks)?;
-    start_run(app, state, RunSource::File(path.display().to_string()))
+    // 结构化入参：**不再**落 `queue.jsonl` 再读回来（那是同一份数据的第二次序列化）。
+    // 校验 / id / 默认值全部由 `intake` 一处完成，与 CLI 解析文件共用同一批函数。
+    let (defaults, _) = PromptDefaults::from_env();
+    let parsed = crate::engine::intake::tasks_from_inputs(&tasks, &defaults)?;
+    if parsed.is_empty() {
+        return Err("待发是空的".to_string());
+    }
+    start_run(app, state, RunSource::Declared(parsed))
 }
 
 /// 重跑 = **显式**把这条重置为待提交。
@@ -1175,14 +873,20 @@ fn publish_queue(
 ///
 /// ⚠️ 必须做在起批**之前**：派工只处理**非终态**记录，终态的没重置就不会被处理。
 fn reset_for_retry(state: &tauri::State<'_, GuiState>, id: &str) -> Result<(), String> {
-    state.ensure_not_clearing()?;
-    if state.board().batch().is_some() {
-        return Err("正在跑批，先停止再重跑（重跑要改状态文件，和跑批写的是同一个文件）".to_string());
+    match state.scheduler_snapshot() {
+        // 走调度器：锁内重置，与 worker 串行。跑批中也允许（旧的「先停止」闸撤掉）。
+        Some(scheduler) => scheduler
+            .reset_for_retry(id)
+            .map_err(|error| error.message().to_string()),
+        // 还没建调度器 ⇒ 没有写者，按旧路径。
+        None => {
+            let mut store =
+                StateStore::open(&state.state_file()).map_err(|error| error.to_string())?;
+            crate::engine::state::reset_for_retry(&mut store, id)
+                .map_err(|error| format!("重置失败：{error}"))?;
+            Ok(())
+        }
     }
-    let mut store = StateStore::open(&state.state_file()).map_err(|error| error.to_string())?;
-    crate::engine::state::reset_for_retry(&mut store, id)
-        .map_err(|error| format!("重置失败：{error}"))?;
-    Ok(())
 }
 
 /// 重跑某一条（异常行菜单里的「重跑这一条」）。
@@ -1310,10 +1014,7 @@ fn confirm_task(
     id: String,
 ) -> Result<String, String> {
     let (_record, thread_id) = confirmable(&state, &id)?;
-    state.ensure_not_clearing()?;
-    if state.board().batch().is_some() {
-        return Err("正在跑批，先停止再确认（确认要改状态文件，和跑批写的是同一个文件）".to_string());
-    }
+    // 跑批中也允许确认：写回走调度器锁内，与 worker 串行（旧的「先停止」闸撤掉）。
 
     // ⚠️ **花钱的那一下，全仓只此一处**。
     let deps = to_client_deps(&resolve_connection()?)?;
@@ -1321,18 +1022,24 @@ fn confirm_task(
         .map_err(|error| format!("确认失败：{error}"))?;
 
     // 上游会继续生成 ⇒ 推回 `running`，让轮询接管（表里 `running` 的 `job` = 复查）。
-    let mut store = StateStore::open(&state.state_file()).map_err(|error| error.to_string())?;
-    store
-        .update(
-            &id,
-            RecordPatch {
-                status: Some(TaskStatus::Running),
-                error: Some(None),
-                ..Default::default()
-            },
-        )
-        .map_err(|error| format!("确认成功但状态没落盘（请报告）：{error}"))?;
-    drop(store);
+    // 走调度器（锁内）而不是外部 `StateStore::open`：保持「只有一个写者」（不变量 I1）。
+    let patch = RecordPatch {
+        status: Some(TaskStatus::Running),
+        error: Some(None),
+        ..Default::default()
+    };
+    match state.scheduler_snapshot() {
+        Some(scheduler) => scheduler
+            .update_record(&id, patch)
+            .map_err(|error| error.message().to_string())?,
+        None => {
+            let mut store =
+                StateStore::open(&state.state_file()).map_err(|error| error.to_string())?;
+            store
+                .update(&id, patch)
+                .map_err(|error| format!("确认成功但状态没落盘（请报告）：{error}"))?;
+        }
+    }
 
     // A 方案：**立刻单独把这一条跑掉** —— **派工，不经过提示词文件**
     // （经过文件就会按"以文件为准"把记录里的垫图覆盖掉，那是本次修的 bug）。
@@ -1489,14 +1196,17 @@ fn remove_tasks(state: tauri::State<'_, GuiState>, ids: Vec<String>) -> Result<u
     if ids.is_empty() {
         return Ok(0);
     }
-    // 清空期间连单删也拒绝：两者都是"整体重写 state.jsonl"，并发会互相覆盖。
-    state.ensure_not_clearing()?;
-    if state.board().batch().is_some() {
-        return Err("正在跑批，先停止再删除（删除要重写状态文件，和跑批写的是同一个文件）".to_string());
+    // 跑批中也能删：删除走调度器锁内执行，与 worker 的写入天然串行；
+    // 在飞的那条会被记进墓碑，收尾时静默丢弃（不会再「复活」）。
+    match state.scheduler_snapshot() {
+        Some(scheduler) => scheduler
+            .remove(&ids)
+            .map_err(|error| error.message().to_string()),
+        None => {
+            let mut store = StateStore::open(&state.state_file()).map_err(|error| error.to_string())?;
+            store.remove(&ids).map_err(|error| error.to_string())
+        }
     }
-
-    let mut store = StateStore::open(&state.state_file()).map_err(|error| error.to_string())?;
-    store.remove(&ids).map_err(|error| error.to_string())
 }
 
 /// 删除**看板未结束**的记录（`active` / `queued` / `waiting`），返回删除条数。
@@ -1552,11 +1262,14 @@ pub fn remove_finished_tasks_core(state_file: &Path) -> Result<usize, String> {
 /// 只删记录，图片文件与报告都不动。
 #[tauri::command]
 fn clear_finished_tasks(state: tauri::State<'_, GuiState>) -> Result<usize, String> {
-    state.ensure_not_clearing()?;
-    if state.board().batch().is_some() {
-        return Err("正在跑批，先停止再清空（清空要重写状态文件，和跑批写的是同一个文件）".to_string());
+    match state.scheduler_snapshot() {
+        // 调度器在 ⇒ 删除必须走它（唯一写者），否则重写文件会冲掉在飞任务刚写的行。
+        Some(scheduler) => scheduler
+            .remove_finished()
+            .map_err(|error| error.message().to_string()),
+        // 还没建调度器 ⇒ 没有写者在跑，按旧路径删。
+        None => remove_finished_tasks_core(&state.state_file()),
     }
-    remove_finished_tasks_core(&state.state_file())
 }
 
 /// 取消所有未完成任务：停掉当前批次（若有）→ 等它退出 → 删除全部未结束记录。
@@ -1569,18 +1282,16 @@ fn clear_finished_tasks(state: tauri::State<'_, GuiState>) -> Result<usize, Stri
 /// 等下去会把 UI 线程挂住（用户看到的是"点了没反应"）。
 #[tauri::command]
 fn cancel_all_tasks(state: tauri::State<'_, GuiState>) -> Result<Value, String> {
-    let intent = state.board().request_clear();
-    match intent {
-        ClearIntent::Already => Err(CLEARING_BLOCK.to_string()),
-        ClearIntent::Waiting => Ok(json!({ "cleared": 0, "stopping": true })),
-        ClearIntent::Now => {
-            // 锁已释放，且 `wipe` 置位 ⇒ 期间没有任何写者能进来（`start_run` 被拒）。
-            let outcome = remove_open_tasks_core(&state.state_file());
-            // 成功失败都要复位：失败不复位 = 永久禁写。
-            state.board().clear_done();
-            outcome.map(|cleared| json!({ "cleared": cleared, "stopping": false }))
-        }
-    }
+    let cleared = match state.scheduler_snapshot() {
+        // 调度器在 ⇒ 锁内删：与 worker 的写入天然串行，不再需要「先停批、等退出」。
+        Some(scheduler) => scheduler
+            .remove_open()
+            .map_err(|error| error.message().to_string())?,
+        // 还没建调度器 ⇒ 没有写者在跑。
+        None => remove_open_tasks_core(&state.state_file())?,
+    };
+    state.invalidate_view();
+    Ok(json!({ "cleared": cleared }))
 }
 
 /// 在系统文件管理器里定位到某个文件（图片菜单的「打开所在位置」）。
@@ -1720,16 +1431,23 @@ fn set_auto_confirm(state: tauri::State<'_, GuiState>, enabled: bool) -> Result<
 /// 停止当前批次（协作式取消：调度器会在下一个检查点退出）。
 #[tauri::command]
 fn stop_run(state: tauri::State<'_, GuiState>) -> Result<(), String> {
-    // 清空期间也允许按「停止」：同一个标志，幂等，不产生第二条取消路径。
-    let board = state.board();
-    match board.batch() {
-        Some(batch) => {
-            batch.cancelled.store(true, Ordering::SeqCst);
+    let scheduler = {
+        let slot = state
+            .scheduler
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        slot.clone()
+    };
+    match scheduler {
+        Some(scheduler) => {
+            scheduler.stop_session();
+            state.invalidate_view();
             // 取消是**协作式**的：最坏要等当前那次 HTTP 请求超时（60 秒）才真的退出。
             // 这句必须让用户看到 —— 否则点完界面没动静，用户以为按钮坏了。
             state.push_alert("已请求停止：最坏要等当前这次请求结束（约 60 秒）才真正退出");
             Ok(())
         }
+        // 调度器还没建 ⇒ 从来没投喂过，没有在跑的会话。
         None => Err("当前没有在跑的批次".to_string()),
     }
 }
@@ -1833,10 +1551,29 @@ pub fn run() {
             std::process::exit(1);
         }
     };
+    // 单实例锁的路径先算好：`cwd` 随后被 move 进 `GuiState`。
+    let lock_path = cwd.join("var/.lock");
     tauri::Builder::default()
         // 原生文件对话框（`pick_prompt_file` 用它）：提示词文件不绑定 `inbox/`。
         .plugin(tauri_plugin_dialog::init())
         .manage(GuiState::new(cwd))
+        .setup(move |app| {
+            // `state.jsonl` 只有一个写者（`engine::lockfile` 文件头）。
+            // 放在 setup 而不是 `run()` 开头：抢不到时要能弹对话框 ——
+            // GUI 没有可见终端（`windows_subsystem = "windows"`），
+            // 只 `eprintln!` 就是「双击没反应」。
+            match FileLock::acquire(&lock_path) {
+                Ok(lock) => app.state::<GuiState>().hold_lock(lock),
+                Err(message) => {
+                    app.dialog()
+                        .message(message)
+                        .title("lovart · 已有实例在运行")
+                        .blocking_show();
+                    std::process::exit(1);
+                }
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_state,
             take_alerts,
@@ -1870,91 +1607,6 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn batch(cancelled: Arc<AtomicBool>) -> RunningBatch {
-        RunningBatch {
-            cancelled,
-            auto_confirm: AutoConfirm::disabled(),
-            label: "测试批次".to_string(),
-            ids: BTreeSet::new(),
-        }
-    }
-
-    #[test]
-    fn b1_空闲请求清空_立刻可删且闸已落下() {
-        let mut board = Board::default();
-        assert_eq!(board.gate(), Gate::Idle);
-        assert_eq!(board.request_clear(), ClearIntent::Now);
-        assert_eq!(board.gate(), Gate::Clearing);
-        assert!(board.clear_block().is_some());
-    }
-
-    #[test]
-    fn b2_有批次请求清空_置同一个取消标志并进入清空() {
-        let flag = Arc::new(AtomicBool::new(false));
-        let mut board = Board::default();
-        board.set_batch(batch(Arc::clone(&flag)));
-        assert_eq!(board.gate(), Gate::Running);
-        assert_eq!(board.request_clear(), ClearIntent::Waiting);
-        assert!(
-            flag.load(Ordering::SeqCst),
-            "「取消所有未完成任务」必须复用「停止」的那个标志"
-        );
-        assert_eq!(board.gate(), Gate::Clearing, "wipe 必须优先于 batch");
-    }
-
-    #[test]
-    fn b3_连点只产生一个删除者() {
-        let mut board = Board::default();
-        assert_eq!(board.request_clear(), ClearIntent::Now);
-        assert_eq!(board.request_clear(), ClearIntent::Already);
-    }
-
-    #[test]
-    fn b4_收尾摘批次但清空意图必须留到删除结束() {
-        let flag = Arc::new(AtomicBool::new(false));
-        let mut board = Board::default();
-        board.set_batch(batch(flag));
-        board.request_clear();
-        assert!(board.take_finished(), "批次结束后应当执行删除");
-        assert!(board.batch().is_none());
-        assert_eq!(
-            board.gate(),
-            Gate::Clearing,
-            "删除期间必须仍然禁写，否则新批会把记录写回刚清空的表"
-        );
-    }
-
-    #[test]
-    fn b5_删除结束必须恢复可写() {
-        let mut board = Board::default();
-        board.request_clear();
-        board.clear_done();
-        assert_eq!(board.gate(), Gate::Idle);
-        assert!(board.clear_block().is_none());
-    }
-
-    #[test]
-    fn b6_正常收尾不误删() {
-        let mut board = Board::default();
-        board.set_batch(batch(Arc::new(AtomicBool::new(false))));
-        assert!(!board.take_finished(), "没人点取消就不该删任何记录");
-        assert_eq!(board.gate(), Gate::Idle);
-    }
-
-    #[test]
-    fn b7_清空闸只挡清空_不抢跑批的文案() {
-        let flag = Arc::new(AtomicBool::new(false));
-        let mut board = Board::default();
-        assert!(board.clear_block().is_none());
-        board.set_batch(batch(flag));
-        assert!(
-            board.clear_block().is_none(),
-            "跑批中由各命令自己的原文案拒绝，这里不许抢口径"
-        );
-        board.request_clear();
-        assert_eq!(board.clear_block(), Some(CLEARING_BLOCK));
-    }
 
     // ── `get_state` 的「没变就别重算」缓存（v1–v4）────────────────────
     //

@@ -389,6 +389,8 @@ fn run_fixture(fixture: &Fixture) -> String {
                 downloads: downloads.clone(),
                 download_count: AtomicUsize::new(0),
             })),
+            // 黄金对账只看状态文件，不关心报告。
+            report_file: None,
         });
     }
 
