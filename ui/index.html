@@ -135,7 +135,9 @@
 
       <!-- 输入 + 参数 = 一个整体 -->
       <div class="composer">
-        <div class="composer-top">
+        <!-- `id` 是给「从看板卡片把图拖进垫图区」用的落点（`startRefPull`）：
+             判据是**整块**而不是 `#refs` —— 垫图条为空时高度是 0，只认它等于拖不进去。 -->
+        <div class="composer-top" id="composerTop">
           <!-- 垫图（参考图）在**提示词输入框上方、左对齐** —— 形态与 maomao 生图节点
               一致（那边是 `ResourceStrip` 素材区在 `PromptInput` 之上，见
                `src/components/image/nodes/ImageGenerate.tsx`）。

@@ -791,7 +791,7 @@ function taskCard(task) {
     for (const url of refUrls) {
       const item = el('button', 'task-ref');
       item.type = 'button';
-      item.title = `垫图：${url}\n（点击看大图）`;
+      item.title = `垫图：${url}\n（点击看大图，拖进垫图区可复用）`;
       const img = document.createElement('img');
       // ⚠️ 必须走 [`refSrc`]：`refFiles` 存的是**本机绝对路径**，
       //    裸路径塞进 `src` 会被当成相对地址（`file://` 又被 webview 禁掉）⇒ 一片破图。
@@ -799,7 +799,11 @@ function taskCard(task) {
       img.alt = '垫图';
       img.loading = 'lazy';
       img.decoding = 'async';
+      // ⚠️ 关掉浏览器原生的图片拖拽：它会在 `pointerdown` 之后抢走整个手势
+      //    （与 `renderRefs` 里那条同一个理由）。
+      img.draggable = false;
       item.appendChild(img);
+      item.addEventListener('pointerdown', (event) => startRefPull(event, url));
       item.addEventListener('click', () => openRefViewer(url, task.prompt));
       refs.appendChild(item);
     }
@@ -844,14 +848,17 @@ function taskCard(task) {
   if (first) {
     const thumb = el('button', 'task-thumb');
     thumb.type = 'button';
-    thumb.title = '查看大图';
+    thumb.title = '查看大图（拖进垫图区可复用）';
     const img = document.createElement('img');
     img.src = toFileUrl(first.file);
     img.alt = '';
     img.loading = 'lazy';
     // 解码放到别的线程：几千张卡重建时，主线程不该被图片解码占住
     img.decoding = 'async';
+    // ⚠️ 同 `.task-ref`：原生图片拖拽会抢走 `pointerdown` 之后的手势。
+    img.draggable = false;
     thumb.appendChild(img);
+    thumb.addEventListener('pointerdown', (event) => startRefPull(event, first.file));
     thumb.addEventListener('click', () => openViewer(first.file, task.prompt));
     card.appendChild(thumb);
   } else if (task.missingArtifact) {
@@ -1309,7 +1316,11 @@ function refLabelOf(url, index) {
     if (name) return decodeURIComponent(name);
   }
   if (/^data:/.test(url)) return `图片${index}`;
-  const name = url.split('/').pop() || '';
+  // ⚠️ 两种分隔符都要认：Windows 的本机路径是 `\`，只按 `/` 切会得到**整条路径**当名字。
+  const name = url.split(/[/\\]/).pop() || '';
+  // ⚠️ `var/refs` 里的文件名是内容哈希（`engine/refs.rs::materialize_data_url`），
+  //    拿它当芯片名等于让人对着一串十六进制认图。
+  if (/^[0-9a-f]{16}(\.[a-z]+)?$/i.test(name)) return `图片${index}`;
   return name.replace(/\.[^.]+$/, '') || `图片${index}`;
 }
 
@@ -1364,37 +1375,39 @@ function addRefs(list) {
   for (const url of list) {
     if (typeof url !== 'string' || !url) continue;
     if (!url.startsWith('data:')) {
-      pushRef(url, refLabelOf(url, draft.refs.length + 1));
+      if (!pushRef(url, refLabelOf(url, draft.refs.length + 1))) notice('这张已经在垫图里了');
       continue;
     }
     // 命中缓存时 `saveRefImage` 内部直接返回 —— 这里不再先查一遍（同一件事两处判）。
     // 名字在落盘前算好：落盘后的文件名是内容哈希，界面上不该显示哈希。
     const label = refLabelOf(url, draft.refs.length + 1);
     const saving = saveRefImage(url)
-      .then((path) => pushRef(path, label))
+      .then((path) => {
+        if (!pushRef(path, label)) notice('这张已经在垫图里了');
+      })
       .catch((error) => notice(`垫图保存失败：${error}`))
       .finally(() => pendingRefSaves.delete(saving));
     pendingRefSaves.add(saving);
   }
-  renderRefs();
-  renderMentions(); // `@` 弹层正开着的话，那份列表要跟着更新
 }
 
-/** 放一张垫图进编辑区（**按 url 去重**：同一张图加两次没有意义，还会占两份参考图额度）。 */
+/**
+ * 放一张垫图进编辑区（**按 url 去重**：同一张图加两次没有意义，还会占两份参考图额度）。
+ *
+ * 返回有没有真的加进去：重复时由调用方提示一句 —— 静默丢弃会让
+ * 「拖进来了吗？」永远得不到回答（`addRefs` 的四个入口共用这一条判据）。
+ */
 function pushRef(url, label) {
-  if (!url || draft.refs.some((ref) => ref.url === url)) return;
+  if (!url || draft.refs.some((ref) => ref.url === url)) return false;
   refSeq += 1;
   draft.refs.push({ id: `ref-${refSeq}`, url, label });
   renderRefs();
   renderMentions();
+  return true;
 }
 
-/**
- * 拖拽排序的进行中状态（同一时刻只会有一个）。
- *
- * ⚠️ 拖拽期间**不许调 `renderRefs()`**：节点会被整个换掉，指针捕获跟着失效，手势当场断。
- */
-let refDrag = null;
+// ⚠️ 拖拽期间**不许调 `renderRefs()`**：节点会被整个换掉，手势当场断。
+//    进行中状态不存全局变量 —— [`startPointerDrag`] 用闭包持着，只此一份。
 
 function renderRefs() {
   const box = $('refs');
@@ -1429,7 +1442,18 @@ function renderRefs() {
       renderMentions();
     });
     node.appendChild(remove);
-    node.addEventListener('pointerdown', (event) => startRefDrag(event, node));
+    node.addEventListener('pointerdown', (event) => {
+      if (event.target.closest('.ref-remove')) return; // 删除键上是点击，不是拖拽
+      node.classList.add('is-armed');
+      startPointerDrag(event, {
+        onStart: () => node.classList.add('is-dragging'),
+        onMove: (moveEvent) => placeRefNode(node, moveEvent),
+        onEnd: (_endEvent, moved) => {
+          node.classList.remove('is-armed', 'is-dragging');
+          if (moved) commitRefOrder();
+        },
+      });
+    });
     box.appendChild(node);
   });
 
@@ -1442,36 +1466,51 @@ function renderRefs() {
 }
 
 /**
- * 起手：按下记坐标，**位移不到 4px 不算拖拽**（否则点一下想删除都会把顺序抖乱）。
+ * 指针拖拽骨架：阈值 / 事件源 / 收尾**只此一份**（编辑区排序与「从看板拖进垫图区」共用）。
  *
  * ⚠️ 不用 HTML5 `draggable`：窗口的 `dragDropEnabled` 默认开着（拖文件进窗口靠它，
  *    见 `src-tauri/capabilities/default.json`），webview 内部的 dragstart / drop 会被吃掉。
- * ⚠️ 不用 `el.style.*`（文件头写死的零内联样式）：拖拽预览靠**直接挪 DOM 节点**，
- *    松手时读 DOM 顺序回写 `draft.refs`，不需要 ghost 元素、也不需要任何坐标样式。
+ * ⚠️ 监听挂 `window` 而**不是** `setPointerCapture`：源节点可能被看板轮询（每 3 秒重建卡片）
+ *    整个换掉，捕获跟着丢、手势当场断；挂在 window 上与节点生死无关。
+ * ⚠️ 4px 阈值是「点击」与「拖拽」的唯一分界 —— 源都是 `<button>`（点一下 = 看大图），
+ *    没有它点一下也会被判成拖动。
+ * ⚠️ 不用 `el.style.*`（文件头写死的零内联样式）：拖拽反馈只靠 class，不跟指针画 ghost。
  */
-function startRefDrag(event, node) {
+function startPointerDrag(event, handlers) {
   if (event.button !== 0) return;
-  if (event.target.closest('.ref-remove')) return; // 删除键上是点击，不是拖拽
-  refDrag = { node, x: event.clientX, y: event.clientY, moved: false };
-  node.setPointerCapture(event.pointerId);
-  node.classList.add('is-armed');
-  node.addEventListener('pointermove', onRefDragMove);
-  node.addEventListener('pointerup', endRefDrag);
-  node.addEventListener('pointercancel', endRefDrag);
+  const fromX = event.clientX;
+  const fromY = event.clientY;
+  let moved = false;
+  const onMove = (moveEvent) => {
+    if (!moved) {
+      if (Math.hypot(moveEvent.clientX - fromX, moveEvent.clientY - fromY) < 4) return;
+      moved = true;
+      handlers.onStart();
+    }
+    handlers.onMove(moveEvent);
+  };
+  const onEnd = (endEvent) => {
+    window.removeEventListener('pointermove', onMove);
+    window.removeEventListener('pointerup', onEnd);
+    window.removeEventListener('pointercancel', onEnd);
+    window.removeEventListener('blur', onEnd);
+    handlers.onEnd(endEvent, moved);
+  };
+  window.addEventListener('pointermove', onMove);
+  window.addEventListener('pointerup', onEnd);
+  window.addEventListener('pointercancel', onEnd);
+  // 拖到窗口外松手时收不到 `pointerup`，靠失焦收尾 —— 否则这轮手势永远挂着。
+  window.addEventListener('blur', onEnd);
 }
 
-function onRefDragMove(event) {
-  if (!refDrag) return;
-  const { node } = refDrag;
-  if (!refDrag.moved) {
-    if (Math.hypot(event.clientX - refDrag.x, event.clientY - refDrag.y) < 4) return;
-    refDrag.moved = true;
-    node.classList.add('is-dragging');
-  }
+/**
+ * 把拖着的那一格挪到离指针**最近的兄弟**前/后（顺序的唯一来源仍是 DOM）。
+ *
+ * 比"逐格算下标"稳：`flex-wrap` 换行、缩略图尺寸变化都不用另算一遍。
+ */
+function placeRefNode(node, event) {
   const siblings = Array.from($('refs').querySelectorAll('.ref')).filter((item) => item !== node);
   if (!siblings.length) return;
-  // 落点 = 离指针**最近的兄弟**；指针在它中心右侧 ⇒ 放它后面。
-  // 比"逐格算下标"稳：`flex-wrap` 换行、缩略图尺寸变化都不用另算一遍。
   let nearest = siblings[0];
   let best = Infinity;
   for (const item of siblings) {
@@ -1489,16 +1528,12 @@ function onRefDragMove(event) {
   else nearest.before(node);
 }
 
-function endRefDrag() {
-  if (!refDrag) return;
-  const { node, moved } = refDrag;
-  refDrag = null;
-  node.classList.remove('is-armed', 'is-dragging');
-  node.removeEventListener('pointermove', onRefDragMove);
-  node.removeEventListener('pointerup', endRefDrag);
-  node.removeEventListener('pointercancel', endRefDrag);
-  if (!moved) return;
-  // 读 DOM 顺序回写 `draft.refs`：**id 不许变**（`@` 芯片按 id 引用，换 id 等于把芯片指到别的图上）。
+/**
+ * 松手后读 DOM 顺序回写 `draft.refs`。
+ *
+ * ⚠️ **id 不许变**：`@` 芯片按 id 引用，换 id 等于把芯片指到别的图上。
+ */
+function commitRefOrder() {
   const order = Array.from($('refs').querySelectorAll('.ref')).map((item) => item.dataset.refId);
   const byId = new Map(draft.refs.map((ref) => [ref.id, ref]));
   draft.refs = order.map((id) => {
@@ -1508,6 +1543,41 @@ function endRefDrag() {
   });
   renderRefs();
   renderMentions(); // `@` 候选的顺序跟着走
+}
+
+/**
+ * 从看板卡片把一张图拖进垫图区（结果图、卡片上的垫图都能拖）。
+ *
+ * ⚠️ 只认 `url`：`refFiles` 是本机路径、老记录是 CDN 地址，`addRefs` 两种都接
+ *    —— 在这里按形态分支写一遍，等于给同一件事造第二份判据。
+ * ⚠️ 落点判据是**整块** `.composer-top` 而不是 `#refs`：垫图条为空时高度是 0，
+ *    只认它等于"怎么拖都拖不进去"。
+ */
+function startRefPull(event, url) {
+  if (!url) return;
+  const zone = $('composerTop');
+  startPointerDrag(event, {
+    onStart: () => document.body.classList.add('is-ref-pulling'),
+    onMove: (moveEvent) => zone.classList.toggle('is-drop-target', hitsRect(zone, moveEvent)),
+    onEnd: (endEvent, moved) => {
+      document.body.classList.remove('is-ref-pulling');
+      zone.classList.remove('is-drop-target');
+      // 没动过（只是点了一下看大图）/ 落在区域外 ⇒ 什么都不做。
+      if (moved && hitsRect(zone, endEvent)) addRefs([url]);
+    },
+  });
+}
+
+/** 指针是否落在 `node` 的矩形里（外扩 8px：不要求像素级对准边缘）。 */
+function hitsRect(node, event) {
+  const rect = node.getBoundingClientRect();
+  const slack = 8;
+  return (
+    event.clientX >= rect.left - slack &&
+    event.clientX <= rect.right + slack &&
+    event.clientY >= rect.top - slack &&
+    event.clientY <= rect.bottom + slack
+  );
 }
 
 // ── 提示词富文本：`@` 调出垫图 → 行内芯片 ──────────────────────────────

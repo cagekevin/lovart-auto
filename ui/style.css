@@ -1084,6 +1084,25 @@ button { cursor: pointer; color: inherit; }
    没有这段 padding，打满的行会**贴住** `.composer-bar` 的 `border-top`。 */
 .composer-top { padding: var(--sp-3) var(--sp-4) var(--sp-3); }
 
+/* 「从看板卡片把图拖进来」的落点高亮（`app.js` 的 `startRefPull`）。
+ * ⚠️ 用 `outline` 不用 `border`：border 会改盒模型，高亮一起来整块输入区就往下跳一行。
+ * ⚠️ 判据是**整块 `.composer-top`**：垫图条为空时高度为 0，只高亮 `#refs` 等于没反馈。 */
+.composer-top.is-drop-target {
+  outline: 2px dashed var(--run);
+  outline-offset: -2px;
+  background: var(--run-bg);
+}
+
+/* 拖拽期间：光标给手感，同时禁掉文字选择 —— 否则整块界面会被刷成蓝色选区。 */
+body.is-ref-pulling,
+body.is-ref-pulling * { cursor: grabbing; user-select: none; }
+
+/* 卡片上的两种图都能往垫图区拖 ⇒ 抓手光标是唯一的"可拖"提示。
+ * ⚠️ `.task-thumb` 收窄到 `button`：缺图占位用的是同名的 `<div>`（拖不动），
+ *    给它抓手光标等于骗人。 */
+.task-ref,
+button.task-thumb { cursor: grab; }
+
 /* 查2：工具条上边线 —— 分隔「写什么」与「怎么生成」 */
 .composer-bar {
   display: flex;
@@ -1280,7 +1299,7 @@ button { cursor: pointer; color: inherit; }
   margin-bottom: var(--sp-3);
 }
 
-/* 顺序 = 提交顺序（见 `app.js` 的 `startRefDrag`）⇒ 抓手光标 + 关掉触摸滚动/文字选择。
+/* 顺序 = 提交顺序（见 `app.js` 的 `placeRefNode` / `commitRefOrder`）⇒ 抓手光标 + 关掉触摸滚动/文字选择。
  * 拖拽反馈不用 `style.transform`（零内联样式）：节点被直接挪进 DOM，靠 `.is-dragging` 变淡。 */
 .ref {
   position: relative;
