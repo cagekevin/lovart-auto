@@ -2171,6 +2171,34 @@ function applyDefaultSettings(settings) {
   draft.size = renderParamSelect('sizeSelect', SIZES, draft.size);
 }
 
+/**
+ * 编辑框里改了模型/比例/尺寸 ⇒ **写回设置**，下次启动就是它。
+ *
+ * 为什么必须有：用户改的是编辑框，不是设置页。不写回的话，下次启动
+ * `applyDefaultSettings` 又从 `.env` 读出旧值 —— 用户会以为"改了没用"。
+ *
+ * 三个下拉连续改（先比例后尺寸）合并成一次写：`save_updates` 是差异写，幂等；
+ * 只传这三个键，其余字段"缺 ⇒ 不改"。
+ */
+let persistDefaultsTimer = null;
+function persistDraftDefaults() {
+  clearTimeout(persistDefaultsTimer);
+  persistDefaultsTimer = setTimeout(async () => {
+    try {
+      await invoke('save_settings', {
+        payload: {
+          defaultModel: draft.model,
+          defaultRatio: draft.ratio,
+          defaultSize: draft.size,
+        },
+      });
+    } catch (error) {
+      // 不打断操作，但必须说出来 —— 否则用户以为已经记住了。
+      notice(`兜底参数没保存（下次启动会变回去）：${error}`);
+    }
+  }, 300);
+}
+
 /** 设置弹窗里的三个兜底下拉：选项来自后端模型表 + 前端的合法值清单（与合成器同一份）。 */
 function renderDefaultSelects(value) {
   const modelBox = $('setDefaultModel');
@@ -2335,7 +2363,10 @@ async function loadModels(settings) {
     ? preferred
     : (models[0]?.alias ?? preferred);
   select.value = draft.model;
-  select.addEventListener('change', () => { draft.model = select.value; });
+  select.addEventListener('change', () => {
+    draft.model = select.value;
+    persistDraftDefaults();
+  });
 }
 
 window.addEventListener('DOMContentLoaded', async () => {
@@ -2485,8 +2516,14 @@ window.addEventListener('DOMContentLoaded', async () => {
   });
   // 比例 / 尺寸：与模型下拉同款 —— 改了就写进 `draft`。**不重画控件**
   // （`<select>` 自己维护选中态，重画会把焦点抢走）。
-  $('ratioSelect').addEventListener('change', () => { draft.ratio = $('ratioSelect').value; });
-  $('sizeSelect').addEventListener('change', () => { draft.size = $('sizeSelect').value; });
+  $('ratioSelect').addEventListener('change', () => {
+    draft.ratio = $('ratioSelect').value;
+    persistDraftDefaults();
+  });
+  $('sizeSelect').addEventListener('change', () => {
+    draft.size = $('sizeSelect').value;
+    persistDraftDefaults();
+  });
 
   // 数量：上限取自 `MAX_COPIES`（HTML 里不写第二份 20）；说明文案同理，
   // 免得改了常量、界面还在说旧数字。
