@@ -265,12 +265,12 @@ fn 兜底_429_只落_unresolved_不_requeue() {
 }
 
 #[test]
-fn retry_failed_保留_refs_且跳过有_threadid的() {
+fn retry_failed_保留垫图_且跳过有_threadid的() {
     let prompts = "{\"prompt\":\"a\"}\n{\"prompt\":\"b\"}\n";
     let ids = prompt_ids(prompts);
     let defaults = support::defaults();
     let first = format!(
-        "{{\"id\":\"{}\",\"prompt\":\"a\",\"line\":1,\"model\":\"{}\",\"aspectRatio\":\"{}\",\"imageSize\":\"{}\",\"status\":\"failed\",\"attempts\":0,\"timeoutCount\":0,\"busyRetries\":61,\"readyAt\":0,\"refUrls\":[\"https://cdn.invalid/ref.png\"],\"stateSince\":\"2026-10-01T06:55:44.506Z\",\"updatedAt\":\"2026-10-01T06:55:44.506Z\",\"error\":\"旧错误\"}}\n",
+        "{{\"id\":\"{}\",\"prompt\":\"a\",\"line\":1,\"model\":\"{}\",\"aspectRatio\":\"{}\",\"imageSize\":\"{}\",\"status\":\"failed\",\"attempts\":0,\"timeoutCount\":0,\"busyRetries\":61,\"readyAt\":0,\"refFiles\":[\"C:/refs/ref.png\"],\"stateSince\":\"2026-10-01T06:55:44.506Z\",\"updatedAt\":\"2026-10-01T06:55:44.506Z\",\"error\":\"旧错误\"}}\n",
         ids[0], defaults.model, defaults.aspect_ratio, defaults.image_size
     );
     let second = format!(
@@ -285,11 +285,11 @@ fn retry_failed_保留_refs_且跳过有_threadid的() {
     assert_eq!(first.get("status").and_then(Value::as_str), Some("done"));
     assert_eq!(
         first
-            .get("refUrls")
+            .get("refFiles")
             .and_then(Value::as_array)
             .map(Vec::len),
         Some(1),
-        "重置必须保留垫图地址"
+        "重置必须保留垫图路径"
     );
     let second = last_record(&run.state_text, &ids[1]);
     assert_eq!(

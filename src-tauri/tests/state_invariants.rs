@@ -296,7 +296,8 @@ fn 追加写_同一_id_以最后一条为准() {
             )
             .unwrap();
     }
-    assert!(store.flush().is_ok());
+    // 攒批写：`flush()` 只读健康度，要读盘必须先 `flush_now()`。
+    assert!(store.flush_now().is_ok());
 
     let lines = read_lines(&path);
     assert_eq!(lines.len(), 6, "1 次 create + 5 次 update = 6 行追加");
@@ -382,13 +383,14 @@ fn 落盘失败_立刻告警一次且_flush_如实报告() {
     store.create(new_record(&make_task("a")));
     store.update("a", patch_status(TaskStatus::Running)).unwrap();
 
-    let outcome = store.flush();
+    // 攒批：上面两次变更合成**一批**，所以是「一次写、失败一次」。
+    let outcome = store.flush_now();
     match outcome {
         PersistOutcome::Failed {
             message,
             failed_writes,
         } => {
-            assert_eq!(failed_writes, 2, "两次写入都失败，必须都计数");
+            assert_eq!(failed_writes, 1, "一批一次写，失败计数 1");
             assert!(!message.is_empty(), "失败原因不能是空串");
         }
         PersistOutcome::Ok => panic!("写不进去却报 ok ⇒ 静默丢断点续跑数据"),
