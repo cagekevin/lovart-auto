@@ -171,53 +171,33 @@
   }
 
   /**
-   * 生成前解析：把 `@{id:label}` 芯片解析成「纯文本 + 参考图」。
+   * 生成前解析：把 `@{id:label}` 芯片换成纯文本里的显式垫图引用 `[img=图片N]`。
    *
-   * · 图片芯片 → 其 url 进参考图列表（同 id 去重），位置换成显式垫图引用
-   *   `[img=图片N]` —— 编号就是它在文本里**首次出现**的顺序；
+   * · N = **这张图的 url 在 `refImages` 里的位次 + 1** —— 与编辑区缩略图的序号角标、
+   *   提交给后端的 `refs` 数组顺序是同一个口径（`refImages` 就传 `draft.refs`，顺序由人拖出来）；
    * · 找不到对应素材的芯片 → 替换为空（不产生垃圾字符）。
    *
+   * ⚠️ N **不是「芯片在文本里首次出现的顺序」**：那样把第 3 张拖到最左，文本里还写着
+   *    「图片3」，上游的参考图与引用对不上 —— 垫图排序功能等于白做。
    * ⚠️ 为什么不是裸词「图片N」：那样模型会把「图片1」当成画面描述词汇而忽略垫图。
    */
   function resolvePromptChips(rawPrompt, refImages) {
     const urlById = new Map();
+    const indexByUrl = new Map();
     for (const ref of refImages || []) {
-      if (ref && ref.id && ref.url) urlById.set(ref.id, ref.url);
+      if (!ref || !ref.url) continue;
+      if (!indexByUrl.has(ref.url)) indexByUrl.set(ref.url, indexByUrl.size + 1);
+      if (ref.id) urlById.set(ref.id, ref.url);
     }
-    const indexById = new Map();
-    const resolved = [];
     const text = String(rawPrompt || '').replace(
       promptChipRe(),
       (_match, id) => {
         const url = urlById.get(id);
         if (!url) return '';
-        let index = indexById.get(id);
-        if (index === undefined) {
-          index = indexById.size + 1;
-          indexById.set(id, index);
-          resolved.push({ id, url });
-        }
-        return `[img=图片${index}]`;
+        return `[img=图片${indexByUrl.get(url)}]`;
       },
     );
-    return { text: text.trim(), refImages: resolved };
-  }
-
-  /**
-   * 参考图合并去重：**芯片图在前、其余在后**。
-   * ⚠️ 顺序是语义的一部分：芯片顺序对应文本里的「图片N」编号，重排就会错位垫图引用。
-   */
-  function mergeReferenceImageUrls(chipImages, otherImages) {
-    const out = [];
-    const seen = new Set();
-    for (const item of [...(chipImages || []), ...(otherImages || [])]) {
-      const url = item && item.url;
-      if (typeof url !== 'string' || url === '') continue;
-      if (seen.has(url)) continue;
-      seen.add(url);
-      out.push(url);
-    }
-    return out;
+    return { text: text.trim() };
   }
 
   window.PromptChips = {
@@ -232,6 +212,5 @@
     buildChipEl,
     renderPromptToNodes,
     resolvePromptChips,
-    mergeReferenceImageUrls,
   };
 })();

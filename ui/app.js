@@ -1248,8 +1248,8 @@ function renderQueue() {
 function addToQueue() {
   const input = $('promptInput');
   const chips = window.PromptChips;
-  // 输入框是**富文本**（含 `@` 芯片）⇒ 先序列化成 `@{id:label}` 串，再解析成
-  // 「纯文本 + 参考图」。芯片在文本里的位置换成 `[img=图片N]`（N = 首次出现顺序）。
+  // 输入框是**富文本**（含 `@` 芯片）⇒ 先序列化成 `@{id:label}` 串，再解析成纯文本。
+  // 芯片在文本里的位置换成 `[img=图片N]`（N = 该图在**垫图条里的位次**）。
   const resolved = chips.resolvePromptChips(chips.serializeDOM(input), draft.refs);
   if (!resolved.text) return;
   // 数量**先校验再入队**，与「从 inbox 导入」的份数同一口径（`parseCopies`）：
@@ -1259,15 +1259,10 @@ function addToQueue() {
     notice(`数量要填 1–${MAX_COPIES} 的整数，这条没有加入待发`);
     return;
   }
-  const labelOf = (url) => {
-    const hit = draft.refs.find((ref) => ref.url === url);
-    return hit ? hit.label : '';
-  };
-  // ⚠️ **顺序是语义**：`@` 芯片引用的在前（对应文本里的「图片N」编号），其余垫图在后；
-  //    按 url 去重（同一张图既是芯片又整张垫着，只算一次）。
-  const refs = chips
-    .mergeReferenceImageUrls(resolved.refImages, draft.refs)
-    .map((url) => ({ url, label: labelOf(url) }));
+  // ⚠️ **顺序是语义**：`refs` 的数组顺序 = 上游参考图列表顺序 = 文本里 `[img=图片N]` 的 N，
+  //    唯一来源是编辑区那条 `draft.refs`（人拖出来的顺序）。这里**不许再排序**：
+  //    原先按「芯片引用的在前」重排过一次，条里看到的顺序和发出去的不是一回事。
+  const refs = draft.refs.map((ref) => ({ url: ref.url, label: ref.label }));
   // 数量 N = 同一条 push N 次，且**每份都是独立对象**（`refs` 各拷一份）——
   // 共用引用会让「改一条」联动全部（与 `importFile` 的份数同一口径）。
   for (let copy = 0; copy < copies; copy += 1) {
@@ -1377,17 +1372,32 @@ function pushRef(url, label) {
   renderMentions();
 }
 
+/**
+ * 拖拽排序的进行中状态（同一时刻只会有一个）。
+ *
+ * ⚠️ 拖拽期间**不许调 `renderRefs()`**：节点会被整个换掉，指针捕获跟着失效，手势当场断。
+ */
+let refDrag = null;
+
 function renderRefs() {
   const box = $('refs');
   clear(box);
-  for (const ref of draft.refs) {
+  draft.refs.forEach((ref, index) => {
     const node = el('div', 'ref');
+    node.dataset.refId = ref.id;
+    node.title = `第 ${index + 1} 张 · 拖动可调整顺序`;
     // ⚠️ 走 [`refSrc`]：拖进来的垫图是**本机路径**，原来只认 `data:` ⇒ 一片空白。
     const img = document.createElement('img');
     img.src = refSrc(ref.url);
     img.alt = ref.label;
     img.loading = 'lazy';
+    // ⚠️ 必须关掉：浏览器原生的图片拖拽会抢走 pointer 手势，拖起来只剩一张半透明幽灵图。
+    img.draggable = false;
     node.appendChild(img);
+
+    // 序号 = **提交位次**（文本里 `[img=图片N]` 的 N 就是它）。
+    // 没有它，拖完也核不出"文本里的图片2到底是哪张" —— 它是这条功能唯一的核对面。
+    node.appendChild(el('span', 'ref-num', index + 1));
 
     // 查8：删除键**常显**
     const remove = el('button', 'ref-remove', '×');
@@ -1402,8 +1412,9 @@ function renderRefs() {
       renderMentions();
     });
     node.appendChild(remove);
+    node.addEventListener('pointerdown', (event) => startRefDrag(event, node));
     box.appendChild(node);
-  }
+  });
 
   // 「+」和缩略图一起换行 —— 垫图可以有任意多张，它必须跟在最后而不是被挤出去。
   const add = el('button', 'ref-add', '+');
@@ -1411,6 +1422,75 @@ function renderRefs() {
   add.title = '添加参考图（可多选）';
   add.addEventListener('click', () => $('refPicker').click());
   box.appendChild(add);
+}
+
+/**
+ * 起手：按下记坐标，**位移不到 4px 不算拖拽**（否则点一下想删除都会把顺序抖乱）。
+ *
+ * ⚠️ 不用 HTML5 `draggable`：窗口的 `dragDropEnabled` 默认开着（拖文件进窗口靠它，
+ *    见 `src-tauri/capabilities/default.json`），webview 内部的 dragstart / drop 会被吃掉。
+ * ⚠️ 不用 `el.style.*`（文件头写死的零内联样式）：拖拽预览靠**直接挪 DOM 节点**，
+ *    松手时读 DOM 顺序回写 `draft.refs`，不需要 ghost 元素、也不需要任何坐标样式。
+ */
+function startRefDrag(event, node) {
+  if (event.button !== 0) return;
+  if (event.target.closest('.ref-remove')) return; // 删除键上是点击，不是拖拽
+  refDrag = { node, x: event.clientX, y: event.clientY, moved: false };
+  node.setPointerCapture(event.pointerId);
+  node.classList.add('is-armed');
+  node.addEventListener('pointermove', onRefDragMove);
+  node.addEventListener('pointerup', endRefDrag);
+  node.addEventListener('pointercancel', endRefDrag);
+}
+
+function onRefDragMove(event) {
+  if (!refDrag) return;
+  const { node } = refDrag;
+  if (!refDrag.moved) {
+    if (Math.hypot(event.clientX - refDrag.x, event.clientY - refDrag.y) < 4) return;
+    refDrag.moved = true;
+    node.classList.add('is-dragging');
+  }
+  const siblings = Array.from($('refs').querySelectorAll('.ref')).filter((item) => item !== node);
+  if (!siblings.length) return;
+  // 落点 = 离指针**最近的兄弟**；指针在它中心右侧 ⇒ 放它后面。
+  // 比"逐格算下标"稳：`flex-wrap` 换行、缩略图尺寸变化都不用另算一遍。
+  let nearest = siblings[0];
+  let best = Infinity;
+  for (const item of siblings) {
+    const rect = item.getBoundingClientRect();
+    const dx = event.clientX - (rect.left + rect.width / 2);
+    const dy = event.clientY - (rect.top + rect.height / 2);
+    const distance = dx * dx + dy * dy;
+    if (distance < best) {
+      best = distance;
+      nearest = item;
+    }
+  }
+  const rect = nearest.getBoundingClientRect();
+  if (event.clientX > rect.left + rect.width / 2) nearest.after(node);
+  else nearest.before(node);
+}
+
+function endRefDrag() {
+  if (!refDrag) return;
+  const { node, moved } = refDrag;
+  refDrag = null;
+  node.classList.remove('is-armed', 'is-dragging');
+  node.removeEventListener('pointermove', onRefDragMove);
+  node.removeEventListener('pointerup', endRefDrag);
+  node.removeEventListener('pointercancel', endRefDrag);
+  if (!moved) return;
+  // 读 DOM 顺序回写 `draft.refs`：**id 不许变**（`@` 芯片按 id 引用，换 id 等于把芯片指到别的图上）。
+  const order = Array.from($('refs').querySelectorAll('.ref')).map((item) => item.dataset.refId);
+  const byId = new Map(draft.refs.map((ref) => [ref.id, ref]));
+  draft.refs = order.map((id) => {
+    const hit = byId.get(id);
+    if (!hit) throw new Error(`拖拽排序后找不到垫图 ${id}`);
+    return hit;
+  });
+  renderRefs();
+  renderMentions(); // `@` 候选的顺序跟着走
 }
 
 // ── 提示词富文本：`@` 调出垫图 → 行内芯片 ──────────────────────────────

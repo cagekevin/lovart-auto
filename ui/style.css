@@ -1280,6 +1280,8 @@ button { cursor: pointer; color: inherit; }
   margin-bottom: var(--sp-3);
 }
 
+/* 顺序 = 提交顺序（见 `app.js` 的 `startRefDrag`）⇒ 抓手光标 + 关掉触摸滚动/文字选择。
+ * 拖拽反馈不用 `style.transform`（零内联样式）：节点被直接挪进 DOM，靠 `.is-dragging` 变淡。 */
 .ref {
   position: relative;
   flex: none;
@@ -1289,9 +1291,32 @@ button { cursor: pointer; color: inherit; }
   border-radius: var(--r-sm);
   background: var(--bg);
   overflow: hidden;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
 }
 
+.ref.is-armed { cursor: grabbing; }
+.ref.is-dragging { opacity: 0.55; border-color: var(--ink); z-index: 1; }
+
 .ref img { width: 100%; height: 100%; object-fit: cover; display: block; }
+
+/* 序号 = **提交位次**（文本里 `[img=图片N]` 的 N 就是它）。
+ * 没有它，拖完也核不出"文本里的图片2到底是哪张" —— 它是这条功能唯一的核对面，不是装饰。 */
+.ref-num {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  min-width: 14px;
+  padding: 0 3px;
+  border-radius: 0 var(--r-sm) 0 0;
+  background: var(--ink);
+  color: var(--bg);
+  font-size: 10px;
+  line-height: 14px;
+  text-align: center;
+  pointer-events: none;
+}
 
 /* 查8：删除键**常显**，不做 hover 才冒出来 */
 .ref-remove {
