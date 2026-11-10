@@ -173,9 +173,9 @@ impl PromptDefaults {
 pub struct PromptTask {
     /// 由**提示词文本**的 sha1 前 12 位决定（同文本重号加 `-2` / `-3` 后缀）。
     ///
-    /// ⚠️ **只哈希文本**，不含 model / ratio / size / refs —— 所以改了这些参数
-    /// **不会**换 id，必须靠调度器的「参数变更检测」重跑，否则会静默沿用旧参数的产物。
-    /// 这条前提由 TS 的 `test/prompts.test.ts` 钉死，Rust 侧逐位对齐。
+    /// ⚠️ **只哈希文本**，不含 model / ratio / size / refs。改了这些参数**不会**换 id，
+    /// 但也不会覆盖旧记录：同一 id 再投一次一律**新建**一条（`-2` / `-3`…），
+    /// 旧图仍在（`intake::sync_declared`）。「参数变更检测」那套已经不存在了。
     pub id: String,
     pub prompt: String,
     pub model: String,
@@ -186,10 +186,8 @@ pub struct PromptTask {
     /// 本行 `refs` 声明的原始参考图输入（本机路径 / URL / `data:`），**相对 cwd**。
     /// 空 ⇒ 该行回退到命令行 `--ref`；两者都没有 ⇒ 文生图。
     pub ref_inputs: Option<Vec<String>>,
-    /// 解析后的 Lovart CDN URL（由启动阶段填充）。
-    pub refs: Option<Vec<String>>,
-    /// 参考图指纹（由启动阶段填充），用于「换了参考图就重跑」的判定。
-    pub ref_signature: Option<String>,
+    /// 垫图的**本机文件路径**（真相）。发送前才临时上传成 CDN 地址。
+    pub ref_files: Option<Vec<String>>,
 }
 
 /// 解析结果（对应 TS `ParsedPrompts`）。
@@ -536,8 +534,8 @@ pub fn parse_prompts(
         }
 
         // id 用提示词内容哈希，改文件顺序或增删行不会打乱已有进度。
-        // ⚠️ 只哈希文本，不含 model/ratio/size/refs —— 所以改了这些必须靠调度器的
-        //    「参数变更检测」重跑，否则会静默沿用旧参数的产物。
+        // ⚠️ 只哈希文本，不含 model/ratio/size/refs —— 但改了这些也不会「沿用旧产物」：
+        //    同一 id 再投一次一律新建（`-2` / `-3`…），旧图仍在。
         let hash = prompt_hash(&prompt_text);
         let occurrence = seen.entry(hash.clone()).or_insert(0);
         *occurrence += 1;
@@ -551,9 +549,8 @@ pub fn parse_prompts(
             image_size,
             line: line_no as u32,
             ref_inputs,
-            // 参考图解析（上传到 CDN + 算指纹）由启动阶段做，解析器不碰网络。
-            refs: None,
-            ref_signature: None,
+            // 参考图（本机路径）由启动阶段解析，解析器不碰网络。
+            ref_files: None,
         });
     }
 

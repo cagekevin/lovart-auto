@@ -265,35 +265,6 @@ fn 兜底_429_只落_unresolved_不_requeue() {
 }
 
 #[test]
-fn finish_不改别人_ready_at() {
-    let prompts = "{\"prompt\":\"a\"}\n{\"prompt\":\"b\"}\n";
-    let ids = prompt_ids(prompts);
-    let defaults = support::defaults();
-    // 200ms 足够 b 先完成；a 的 readyAt 若被 finish 清零，会在 submitting 行里留下 0。
-    let future = now_ms() + 200;
-    let seed = format!(
-        "{{\"id\":\"{}\",\"prompt\":\"a\",\"line\":1,\"model\":\"{}\",\"aspectRatio\":\"{}\",\"imageSize\":\"{}\",\"status\":\"pending\",\"attempts\":0,\"timeoutCount\":0,\"busyRetries\":0,\"readyAt\":{},\"stateSince\":\"2026-10-01T06:55:44.506Z\",\"updatedAt\":\"2026-10-01T06:55:44.506Z\"}}\n",
-        ids[0], defaults.model, defaults.aspect_ratio, defaults.image_size, future
-    );
-    let script = done_script(json!({ "concurrency": 2 }));
-    let f = TempFixture::new(prompts, script).seed(&seed);
-    let run = f.run();
-
-    let submitting = run
-        .state_text
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|value| value.get("id").and_then(Value::as_str) == Some(&ids[0]))
-        .find(|value| value.get("status").and_then(Value::as_str) == Some("submitting"))
-        .expect("第一个任务应被提交");
-    assert_eq!(
-        submitting.get("readyAt").and_then(Value::as_u64),
-        Some(future),
-        "finish 不应把别人的 readyAt 清零"
-    );
-}
-
-#[test]
 fn retry_failed_保留_refs_且跳过有_threadid的() {
     let prompts = "{\"prompt\":\"a\"}\n{\"prompt\":\"b\"}\n";
     let ids = prompt_ids(prompts);

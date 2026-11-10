@@ -103,12 +103,16 @@ pub fn tasks_from_inputs(
                 .ok_or_else(|| format!("第 {line} 条：尺寸「{value}」必须是 1K / 2K / 4K"))?
                 .to_string(),
         };
-        let refs: Vec<String> = input
-            .refs
-            .iter()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .collect();
+        // ⚠️ 空项**报错**，不静默丢掉：调用方给了空串说明它自己没校验，
+        //    丢掉就是"少一张垫图也照发"，用户看不出来。
+        let mut refs: Vec<String> = Vec::with_capacity(input.refs.len());
+        for value in &input.refs {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Err(format!("第 {line} 条：refs 里有空项"));
+            }
+            refs.push(trimmed.to_string());
+        }
         let hash = prompt_hash(prompt);
         let occurrence = seen.entry(hash.clone()).or_insert(0);
         *occurrence += 1;
@@ -120,8 +124,7 @@ pub fn tasks_from_inputs(
             image_size,
             line: line as u32,
             ref_inputs: if refs.is_empty() { None } else { Some(refs) },
-            refs: None,
-            ref_signature: None,
+            ref_files: None,
         });
     }
     Ok(tasks)

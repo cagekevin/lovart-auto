@@ -45,7 +45,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::cli::{arg_list, arg_number_opt, arg_string, has_arg, parse_args, ParsedArgs};
-use crate::engine::refs::{load_refs_cache, read_ref_inputs, refs_signature, save_refs_cache};
+use crate::engine::refs::read_ref_inputs;
 use crate::engine::scheduler::{
     run_scheduler, AutoConfirm, SchedulerOptions, SchedulerSummary, SchedulerTuning,
 };
@@ -53,7 +53,6 @@ use crate::engine::settings::{self, Settings};
 use crate::engine::state::{
     is_not_done, row as status_row, Action, StateStore, TaskRecord, TaskStatus, STATUS_TABLE,
 };
-use crate::lovart::attachments::resolve_attachments;
 use crate::lovart::client::{query_mode, set_mode, ClientDeps};
 use crate::lovart::connection::{load_dot_env, read_auto_confirm, resolve_connection, to_client_deps};
 use crate::lovart::models::MODEL_SPECS;
@@ -205,8 +204,8 @@ pub fn write_report(
             .unwrap_or_default();
         let mode = if tasks_by_id
             .get(&record.id)
-            .and_then(|task| task.refs.as_ref())
-            .is_some_and(|refs| !refs.is_empty())
+            .and_then(|task| task.ref_files.as_ref())
+            .is_some_and(|files| !files.is_empty())
         {
             "图生图"
         } else {
@@ -1202,11 +1201,11 @@ fn resolve_refs(
 ///
 /// ⚠️ 公开是为了让 GUI 复用 —— 抄第二份必然与 CLI 分叉（DEBT TD-11-01 的母体）。
 pub fn resolve_refs_core(
-    deps: &ClientDeps,
+    _deps: &ClientDeps,
     tasks: &mut [PromptTask],
     cwd: &Path,
     cli_refs: &[String],
-    refs_cache_file: Option<&Path>,
+    _refs_cache_file: Option<&Path>,
 ) -> Result<(), String> {
     let cli_refs = cli_refs.to_vec();
     let mut needed: Vec<String> = cli_refs.clone();
@@ -1221,28 +1220,19 @@ pub fn resolve_refs_core(
         return Ok(());
     }
 
+    // 只做「输入 → 来源（本机路径 / 公网 URL）」。**不在这里上传**：
+    // 上传推迟到真正发送那一刻，命中 `var/refs-cache.json` 就不重复传 ——
+    // 同一批同一张图只传一次，投喂也不会再被网络拖住。
     let entries = read_ref_inputs(&needed, cwd)?;
-    let mut cache = load_refs_cache(refs_cache_file);
-    let mut url_by_input: BTreeMap<String, String> = BTreeMap::new();
-    let mut key_by_input: BTreeMap<String, String> = BTreeMap::new();
-    let mut reused = 0usize;
-
+    let mut source_by_input: BTreeMap<String, String> = BTreeMap::new();
     for entry in &entries {
-        key_by_input.insert(entry.input.clone(), entry.key.clone());
-        if let Some(cached) = cache.get(&entry.key) {
-            url_by_input.insert(entry.input.clone(), cached.clone());
-            reused += 1;
-            continue;
-        }
-        let uploaded = resolve_attachments(deps, std::slice::from_ref(&entry.url))
-            .map_err(|error| error.message().to_string())?;
-        let Some(url) = uploaded.and_then(|urls| urls.into_iter().next()) else {
-            return Err(format!("参考图上传失败（未返回 CDN URL）：{}", entry.key));
-        };
-        cache.insert(entry.key.clone(), url.clone());
-        url_by_input.insert(entry.input.clone(), url);
+        // 公网 URL 上游能直接访问，原样留着；其余都在 `read_ref_inputs` 里落成了本机文件。
+        let source = entry
+            .local_path
+            .clone()
+            .unwrap_or_else(|| entry.input.clone());
+        source_by_input.insert(entry.input.clone(), source);
     }
-    save_refs_cache(refs_cache_file, &cache);
 
     let mut image_to_image = 0usize;
     for task in tasks.iter_mut() {
@@ -1251,27 +1241,20 @@ pub fn resolve_refs_core(
         if inputs.is_empty() {
             continue;
         }
-        let urls: Vec<String> = inputs
-            .iter()
-            .filter_map(|input| url_by_input.get(input).cloned())
-            .collect();
-        if urls.is_empty() {
-            continue;
+        let mut files: Vec<String> = Vec::with_capacity(inputs.len());
+        for input in &inputs {
+            let Some(source) = source_by_input.get(input) else {
+                return Err(format!("参考图没解析出地址（内部 bug）：{input}"));
+            };
+            files.push(source.clone());
         }
-        task.refs = Some(urls);
-        task.ref_signature = Some(refs_signature(
-            &inputs
-                .iter()
-                .map(|input| key_by_input.get(input).cloned().unwrap_or_else(|| input.clone()))
-                .collect::<Vec<_>>(),
-        ));
+        task.ref_files = Some(files);
         image_to_image += 1;
     }
 
     log(&format!(
-        "参考图：{} 个素材（缓存命中 {reused}，新上传 {}）；图生图任务 {image_to_image}/{} 条",
+        "参考图：{} 个素材；图生图任务 {image_to_image}/{} 条",
         entries.len(),
-        entries.len() - reused,
         tasks.len()
     ));
     Ok(())

@@ -21,15 +21,26 @@
 //! | `patch` 能否覆盖时间戳 | 靠 `update` 里显式赋值挡住 | `RecordPatch` **没有**这两个字段 ⇒ 结构上不可能 |
 //! | 读取失败 | `catch {}` 吞掉一切 ⇒ 权限错静默变"空状态"⇒ 重复提交 | **只吞 `NotFound`**，其余照抛 |
 //!
-//! ── 与 TS 版的一处**有意差异** ──────────────────────────────────────
-//! TS 的写入走 promise 链（`appendFile` 是异步的），Rust 的 `write` 是**同步**的
-//! ⇒ 天然串行，不需要写队列。但 [`StateStore::flush`] 这个**接口形状**保留：
-//! 调用方必须显式接住「状态没落盘」这件事，而不是靠"反正同步所以没事"。
+//! ── 落盘节奏：攒批写，不再逐条开文件（2026-11-09）──────────────────
+//! 原先是「每条状态变更 open + write + close」，200 条追加 = 200 次文件开关，
+//! 而且全部发生在调度器那把全局锁内 ⇒ 界面每秒的刷新与「发布」按钮都排在后面，
+//! 表现就是"追加时整窗卡死"。
+//!
+//! 现在 [`StateStore::write`] **不碰磁盘**：只把行攒进 `pending`，
+//! 攒够 [`PENDING_LINES_MAX`] 行 / 距上次落盘超过 [`PENDING_AGE_MAX`] 才写一次。
+//!
+//! - 花钱边界（入队、拿到 threadId、人工确认）必须调 [`StateStore::flush_now`]
+//!   —— 它是「等真的写完」；[`StateStore::flush`] 只是「读健康度」，**从不落盘**。
+//! - 进程退出由 `Drop` 兜底排空；只读实例（`open_read_only`）写方法一律 panic，
+//!   不许静默丢弃。
+//! - 代价：被强杀时最多丢 [`PENDING_AGE_MAX`] 内的非花钱状态；重启后这些任务
+//!   带着 threadId 走复查，**不会重复生成**。
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -37,7 +48,7 @@ use serde::{Deserialize, Serialize};
 use crate::lovart::prompt::PromptTask;
 
 impl TaskRecord {
-    /// 记录 → 任务（**无损**：含已上传的垫图 URL 与指纹）。
+    /// 记录 → 任务（**无损**：含已上传的垫图 URL）。
     ///
     /// ── 为什么这件事必须在这里做 ──────────────────────────────────────
     /// 它是**派工的输入** —— 调度器按 id 处理已有记录时用它。
@@ -56,8 +67,7 @@ impl TaskRecord {
             // 垫图**已经是 CDN URL**（提交时上传过）⇒ 不需要 `ref_inputs`：
             // 参考图解析那一步会因输入端为空而跳过，这些地址原样留着。
             ref_inputs: None,
-            refs: self.ref_urls.clone(),
-            ref_signature: self.ref_signature.clone(),
+            ref_files: self.ref_files.clone(),
         }
     }
 }
@@ -424,7 +434,7 @@ pub fn slots_in_use(state: &StateStore) -> usize {
         .count()
 }
 
-/// 把一条记录重置为待提交（重跑）。**保留 `ref_urls` / `ref_signature`** —— 重跑仍要带垫图。
+/// 把一条记录重置为待提交（重跑）。**保留 `ref_urls`** —— 重跑仍要带垫图。
 ///
 /// 唯一实现：GUI 的「重跑这一条」与 CLI 的 `--retry-failed` 共用。
 pub fn reset_for_retry(store: &mut StateStore, id: &str) -> Result<TaskRecord, StateError> {
@@ -442,7 +452,7 @@ pub fn reset_for_retry(store: &mut StateStore, id: &str) -> Result<TaskRecord, S
             artifacts: clear(),
             files: clear(),
             error: clear(),
-            // 刻意不动 ref_urls / ref_signature —— 重跑仍要带垫图。
+            // 刻意不动 ref_urls —— 重跑仍要带垫图。
             ..Default::default()
         },
     )
@@ -486,23 +496,13 @@ pub struct TaskRecord {
     /// 否则服务端卡住的任务会永久占住本地槽位，把并发拖垮。
     #[serde(default)]
     pub timeout_count: u32,
-    /// 参考图指纹（图生图用）。跨运行稳定，用于「换了参考图就重跑」的判定。
-    /// 空 = 文生图。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ref_signature: Option<String>,
-    /// 这次用的**垫图**（参考图）在 Lovart CDN 上的地址。空 = 文生图。
+    /// 这次用的**垫图**（参考图）的本机文件路径。空 = 文生图。
     ///
-    /// ── 为什么必须存**地址**，而不是只留指纹 ─────────────────────────
-    /// 任务发出去以后，「我当时垫的是哪张图」只有一个地方能回答，就是这里。
-    /// 原先只存 [`ref_signature`](Self::ref_signature) —— 那是单向哈希，
-    /// **反推不出图**：界面上连看一眼垫图都做不到（用户直接抱怨过这件事）。
-    ///
-    /// ⚠️ 存 **CDN URL** 而不是原图：原图在 `data:` 里动辄 1MB，塞进 `state.jsonl`
-    /// 会让它每行都变巨大（追加写的文件，膨胀是乘法）。而 CDN URL 本来就有 ——
-    /// 它是 `resolve_attachments` 那次上传的**真实产物地址**，正好就是
-    /// 「给我一个地址我就能查」要的那个地址。
+    /// 这是垫图的**唯一真相**：界面显示、重跑复用、发送前上传都读它。
+    /// CDN 地址**不落记录** —— 那是上传产物，会过期变破图；它只在发送那一刻
+    /// 现取（命中 `var/refs-cache.json` 就不重复上传）。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ref_urls: Option<Vec<String>>,
+    pub ref_files: Option<Vec<String>>,
     /// 累计「服务端并发满」重投次数。
     ///
     /// 刻意与 `attempts` 分开：并发满是**排队状态**，不是失败。
@@ -552,13 +552,9 @@ pub fn new_record(task: &PromptTask) -> TaskRecord {
         error: None,
         attempts: 0,
         timeout_count: 0,
-        // ⚠️ **必须从 task 带过来**（原来这里写死 `None`）：
-        //    参考图是在 `resolve_refs_core` 里解析好、随 `PromptTask` 传进调度器的，
-        //    新建记录时丢掉 ⇒ **第一次跑的任务永远没有垫图信息**
-        //    （后面只在"参数变了"的补丁分支里才会写上，而新任务根本走不到那里）。
-        //    症状就是：图生图发出去，界面上、记录里都看不到垫图（用户报过）。
-        ref_signature: task.ref_signature.clone(),
-        ref_urls: task.refs.clone(),
+        // ⚠️ **必须从 task 带过来**：垫图路径是 `resolve_refs_core` 解析好、随 `PromptTask`
+        //    传进调度器的；新建记录时丢掉 ⇒ 图生图发出去，界面上、记录里都看不到垫图。
+        ref_files: task.ref_files.clone(),
         busy_retries: 0,
         ready_at: 0,
         // 新记录已处于 pending，所以状态起点就是现在。submittedAt 等首次拿到 threadId 再写。
@@ -613,10 +609,8 @@ pub struct RecordPatch {
     pub artifacts: Clearable<Vec<String>>,
     pub files: Clearable<Vec<String>>,
     pub error: Clearable<String>,
-    pub ref_signature: Clearable<String>,
-    /// 垫图地址（与 [`ref_signature`](RecordPatch::ref_signature) 同步改）：
-    /// 换了参考图但提示词没变时，记录里的地址必须跟着换，否则界面会显示**旧垫图**。
-    pub ref_urls: Clearable<Vec<String>>,
+    /// 垫图的本机文件路径：换了参考图时要跟着换，否则界面会显示**旧垫图**。
+    pub ref_files: Clearable<Vec<String>>,
     /// `Some(None)` = 显式清空（重跑重置）；`None` = 沿用旧值。
     pub submitted_at: Clearable<String>,
 }
@@ -675,6 +669,17 @@ pub struct StateStoreOptions {
     pub on_write_error: Option<WriteErrorHandler>,
 }
 
+/// 攒批上限：攒够这么多行就落一次盘。
+const PENDING_LINES_MAX: usize = 200;
+
+/// 攒批时间上限：距上次落盘超过这么久就落一次盘（先到先落）。
+///
+/// 这是「被强杀最多丢多久的非花钱状态」的上界，不是性能参数 —— 调大要连注释一起改。
+const PENDING_AGE_MAX: Duration = Duration::from_secs(2);
+
+/// 攒批失败后允许保留的最大行数（防止磁盘长期不可写时内存无限增长）。
+const PENDING_LINES_BACKLOG_MAX: usize = 2_000;
+
 /// `state.jsonl` 的**唯一写者**。
 ///
 /// ⚠️ 记录用 `BTreeMap`（按 id 有序）而不是 `HashMap`：后者的迭代顺序**每次进程运行都不同**，
@@ -684,6 +689,17 @@ pub struct StateStore {
     file_path: PathBuf,
     records: BTreeMap<String, TaskRecord>,
     loaded_lines: usize,
+    /// 尚未落盘的行（攒批写）。**只有这里会变成磁盘上的字节**。
+    pending: String,
+    /// `pending` 里有多少行（判攒批阈值用，不靠 `matches('\n')` 数）。
+    pending_lines: usize,
+    /// 上次落盘时刻。
+    last_flush: Instant,
+    /// 只读实例（`open_read_only`）：写方法一律 panic。
+    ///
+    /// 为什么不"静默丢弃"：那等于数据无声消失（本仓最不能接受的一类错）；
+    /// 为什么不起一个隐式写者：那会造出第二个写者（不变量 I1）。
+    read_only: bool,
     /// 首次写失败的原文（用于立刻告警一次，不刷屏）。
     first_write_error: Option<String>,
     failed_writes: usize,
@@ -709,6 +725,10 @@ impl StateStore {
             file_path,
             records: BTreeMap::new(),
             loaded_lines: 0,
+            pending: String::new(),
+            pending_lines: 0,
+            last_flush: Instant::now(),
+            read_only: false,
             first_write_error: None,
             failed_writes: 0,
             on_write_error: options.on_write_error,
@@ -735,6 +755,11 @@ impl StateStore {
             file_path: path.as_ref().to_path_buf(),
             records: BTreeMap::new(),
             loaded_lines: 0,
+            pending: String::new(),
+            pending_lines: 0,
+            last_flush: Instant::now(),
+            // 只读：写方法 panic（见 `read_only` 字段注释）。
+            read_only: true,
             first_write_error: None,
             failed_writes: 0,
             on_write_error: None,
@@ -792,7 +817,8 @@ impl StateStore {
     pub fn create(&mut self, record: TaskRecord) -> &TaskRecord {
         let id = record.id.clone();
         self.records.insert(id.clone(), record);
-        // 先入内存再落盘：与 TS 同序（`records.set` → `append`）。
+        // 先入内存再记账：与 TS 同序（`records.set` → `append`）。
+        // 这里只进攒批缓冲，落盘时机见 `write` / `PENDING_AGE_MAX`。
         let snapshot = self.records[&id].clone();
         self.write(&snapshot);
         &self.records[&id]
@@ -865,11 +891,8 @@ impl StateStore {
         if let Some(value) = patch.error {
             next.error = value;
         }
-        if let Some(value) = patch.ref_signature {
-            next.ref_signature = value;
-        }
-        if let Some(value) = patch.ref_urls {
-            next.ref_urls = value;
+        if let Some(value) = patch.ref_files {
+            next.ref_files = value;
         }
 
         // ⚠️ 以下三个字段**由状态机自己决定**，显式赋值 —— 它们根本不在 `RecordPatch` 里，
@@ -895,10 +918,10 @@ impl StateStore {
         Ok(next)
     }
 
-    /// 如实报告落盘结果。
+    /// 读**健康度**：累计是否出过写失败。**不落盘、不等待。**
     ///
-    /// ⚠️ **接口形状刻意与 TS 一致**（返回判别联合而不是 `()`）：Rust 的写是同步的，
-    /// 但"调用方必须显式接住『状态没落盘』"这件事不能因为同步就省掉。
+    /// ⚠️ 名字有历史包袱：它从来不代表「已经写到磁盘」。
+    /// 要「等真的写完」用 [`flush_now`](Self::flush_now)。
     pub fn flush(&self) -> PersistOutcome {
         match &self.first_write_error {
             Some(message) => PersistOutcome::Failed {
@@ -907,6 +930,18 @@ impl StateStore {
             },
             None => PersistOutcome::Ok,
         }
+    }
+
+    /// 立刻落盘并如实报告 —— **花钱边界与退出前用这个**。
+    ///
+    /// 与 [`flush`](Self::flush) 的分工：那个只读健康度，这个真的写。
+    /// 漏用它的后果：进程被杀后重跑一条已经提交过的任务（重复扣积分）。
+    pub fn flush_now(&mut self) -> PersistOutcome {
+        if self.read_only {
+            panic!("只读实例被写：内部 bug（open_read_only 的调用方不许调 flush_now）");
+        }
+        self.flush_pending();
+        self.flush()
     }
 
     /// 首次写失败的原因（未失败则 `None`）。用于跑的中途**立刻**发现。
@@ -920,7 +955,16 @@ impl StateStore {
     }
 
     /// 把追加历史折叠成「每个 id 一行」，防止文件无限膨胀。
+    ///
+    /// ⚠️ 重写的是**全量内存记录**，`pending` 里那些行必然已包含在其中 ——
+    /// 必须先丢掉，否则下一次落盘会把它们**重复追加**一遍。
     pub fn compact(&mut self) -> io::Result<()> {
+        if self.read_only {
+            panic!("只读实例被写：内部 bug（open_read_only 的调用方不许调 compact）");
+        }
+        self.pending.clear();
+        self.pending_lines = 0;
+        self.last_flush = Instant::now();
         let mut body = String::new();
         for record in self.records.values() {
             let line = serde_json::to_string(record)
@@ -964,11 +1008,14 @@ impl StateStore {
         Ok(removed)
     }
 
-    /// 追加一行。
+    /// 记一行到待落盘缓冲 —— **不碰磁盘**。
     ///
-    /// ⚠️ **每次重新打开文件**，不缓存句柄：`compact()` 用 `rename` 换掉了 inode，
-    /// 缓存的句柄会继续往**已被解除链接的旧文件**里写 —— 那些数据会静默消失。
+    /// 攒批规则见 [`PENDING_LINES_MAX`] / [`PENDING_AGE_MAX`]；
+    /// 需要「立刻落盘」的调用点用 [`flush_now`](Self::flush_now)。
     fn write(&mut self, record: &TaskRecord) {
+        if self.read_only {
+            panic!("只读实例被写：内部 bug（open_read_only 的调用方不许调写方法）");
+        }
         let mut line = match serde_json::to_string(record) {
             Ok(text) => text,
             Err(error) => {
@@ -977,16 +1024,53 @@ impl StateStore {
             }
         };
         line.push('\n');
+        self.pending.push_str(&line);
+        self.pending_lines += 1;
+        self.maybe_flush();
+    }
 
-        let result = OpenOptions::new()
+    /// 到点了就落盘（攒够行数 / 隔得太久，先到先落）。
+    ///
+    /// 不在这里判空：`flush_pending` 自己会判（两处判同一件事 = 多一份口径）。
+    fn maybe_flush(&mut self) {
+        if self.pending_lines >= PENDING_LINES_MAX || self.last_flush.elapsed() >= PENDING_AGE_MAX {
+            self.flush_pending();
+        }
+    }
+
+    /// 把 `pending` 一次写进文件。
+    ///
+    /// 失败时**保留**这批行等下次重试（不丢数据）；只有积压超过
+    /// [`PENDING_LINES_BACKLOG_MAX`] 才丢弃并记错 —— 那是磁盘长期不可写，
+    /// 内存不能再涨。重复追加同一 id 是安全的：读侧以最后一行为准。
+    fn flush_pending(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let body = std::mem::take(&mut self.pending);
+        let lines = self.pending_lines;
+        self.pending_lines = 0;
+        self.last_flush = Instant::now();
+
+        if let Err(error) = self.append_to_file(&body) {
+            self.record_write_error(&error.to_string());
+            if lines <= PENDING_LINES_BACKLOG_MAX {
+                self.pending = body;
+                self.pending_lines = lines;
+            }
+        }
+    }
+
+    /// 真正的写：一次 open + 一次 `write_all` + close。
+    ///
+    /// ⚠️ **不缓存句柄**：`compact()` 用 `rename` 换了 inode，缓存的句柄会继续往
+    /// 已被解除链接的旧文件里写，那些数据会静默消失。
+    fn append_to_file(&self, body: &str) -> io::Result<()> {
+        let mut file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.file_path)
-            .and_then(|mut file| file.write_all(line.as_bytes()));
-
-        if let Err(error) = result {
-            self.record_write_error(&error.to_string());
-        }
+            .open(&self.file_path)?;
+        file.write_all(body.as_bytes())
     }
 
     /// 记一次写失败：计数 + **首次立刻回调一次**（跑的中途就暴露，不必等到收尾）。
@@ -998,6 +1082,20 @@ impl StateStore {
                 handler(message);
             }
         }
+    }
+}
+
+/// 析构时把攒着的行写掉 —— **GUI 那些「临时 open - 改 - 丢掉」的写者靠它兜底**。
+///
+/// ⚠️ 这里**静默写、不回调** `on_write_error`：析构可能发生在 panic 展开期，
+/// 回调会去碰告警通道与日志锁，那是二次伤害。失败只能丢，代价由文件头写明。
+impl Drop for StateStore {
+    fn drop(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let body = std::mem::take(&mut self.pending);
+        let _ = self.append_to_file(&body);
     }
 }
 

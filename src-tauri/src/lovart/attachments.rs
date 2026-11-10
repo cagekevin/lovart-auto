@@ -79,16 +79,10 @@ fn base64_to_bytes(b64: &str) -> Result<Vec<u8>, String> {
 
 /// 解析 `data:` URL → 字节 + 扩展名。
 fn bytes_from_data_url(data_url: &str) -> Result<(Vec<u8>, &'static str), String> {
-    let comma = data_url.find(',').unwrap_or(0);
-    let header = if data_url.contains(',') {
-        &data_url[..comma]
-    } else {
-        ""
-    };
-    let b64 = if data_url.contains(',') {
-        &data_url[comma + 1..]
-    } else {
-        ""
+    // 没有逗号 = 取不到图片数据。原先那三段 `contains` 判断会拿空串去解码（得到 0 字节），
+    // 然后"成功上传"一个空文件 —— 多余的防御换来的正是这个静默错误。
+    let Some((header, b64)) = data_url.split_once(',') else {
+        return Err("data: URL 缺少逗号（取不到图片数据）".to_string());
     };
     Ok((base64_to_bytes(b64)?, ext_from_mime(header)))
 }
@@ -143,10 +137,9 @@ pub fn resolve_attachments(
     let mut last_error: Option<String> = None;
 
     for raw in urls {
+        // 空项**不在这里跳过**：`intake` 已保证非空；万一漏了，会落到下面第 4 类
+        // 被计入 `failed` 并整批拒绝 —— 那比静默少一张图好。
         let url = raw.trim();
-        if url.is_empty() {
-            continue;
-        }
 
         // 1) http(s)
         if url.starts_with("http://") || url.starts_with("https://") {

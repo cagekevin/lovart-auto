@@ -210,7 +210,7 @@ function boardSignature(data) {
       // ⚠️ `following` **必须进签名**：批次开始/结束时，任务状态一个字都没变，
       //    变的是「谁在被跟」。签名漏了它就等于进度条停不下来（结构没变 ⇒ 不重建 DOM）。
       // 垫图条数同理：换垫图重跑时状态可能原地不动，但卡片内容必须变。
-      return `${task.id}:${task.status}:${present}:${task.following ? 'f' : '-'}:${(task.refUrls || []).length}`;
+      return `${task.id}:${task.status}:${present}:${task.following ? 'f' : '-'}:${(task.refFiles || task.refUrls || []).length}`;
     })
     .join('|');
   return [
@@ -264,15 +264,35 @@ function upstreamKey(data) {
   return (data.tasks || []).map((task) => `${task.id}:${task.status}`).join('|');
 }
 
-/** 有人没跟的未完成任务 ⇒ 探一次上游；都有人跟 / 没有未完成 ⇒ 不探。 */
+/** 上次真正探测的时刻（毫秒）。节流用 —— 探针是旁路，不许跟着每次刷新打上游。 */
+let upstreamAt = 0;
+/** 两次探测之间的最小间隔。 */
+const UPSTREAM_MIN_INTERVAL_MS = 60000;
+
+/**
+ * 有人没跟的未完成任务 ⇒ 探一次上游；都有人跟 / 没有未完成 ⇒ 不探。
+ *
+ * ⚠️ 调用方**不 await**（见 `refreshBoardOnce`）：它是旁路信息，
+ * 不能挡住看板刷新与「发布」按钮的解锁。以前它挂在刷新链上，探针一慢
+ * 整块界面就停在「探测中…」，按钮永远 disabled。
+ *
+ * ⚠️ 节流放在**改 `upstream.key` 之前**：先改 key 再被节流挡住，
+ * 会让这批数据永远不再探测（key 相同 ⇒ 每次早退）。
+ */
 async function probeUpstreamIfNeeded(data) {
   const tasks = data.tasks || [];
   const unfinished = tasks.filter((task) => task.group !== 'finished');
   const key = upstreamKey(data);
   const needed = unfinished.some((task) => !task.following);
   if (upstream.key === key) return; // 这版数据探过了
+  if (!needed) {
+    upstream = { key, byId: new Map(), error: '' };
+    return;
+  }
+  // 60 秒内最多探一次：跑批时任务状态每秒都在变，不节流就是每秒一整轮 HTTP。
+  if (Date.now() - upstreamAt < UPSTREAM_MIN_INTERVAL_MS) return;
+  upstreamAt = Date.now();
   upstream = { key, byId: new Map(), error: '' };
-  if (!needed) return;
   try {
     const probes = await invoke('probe_unfinished');
     for (const probe of probes) upstream.byId.set(probe.id, probe);
@@ -280,6 +300,8 @@ async function probeUpstreamIfNeeded(data) {
     // 探测失败**必须可见** —— 否则界面会拿"探不到"当"没事"（读不到 ≠ 没有）。
     upstream.error = String(error);
   }
+  // 结论到了要重画一次（标题行那句是结论拼的）；节流挡住递归，不会自激。
+  void refreshBoard();
 }
 
 /** 把探针结论压成一句人话（进了签名，所以只在真的变时重画）。 */
@@ -309,7 +331,15 @@ function upstreamSummary() {
  * 取走即清（后端 `std::mem::take`），所以不会重复弹。
  * 多条合并成一次弹窗 —— 逐条弹会连点好几次「确定」，反而让人不去看内容。
  */
+/** 上次弹告警的时刻（毫秒）。节流用 —— 告警连续弹会一直盖在按钮上。 */
+let alertShownAt = 0;
+/** 两次弹窗之间的最小间隔。 */
+const ALERT_MIN_INTERVAL_MS = 60000;
+
 async function flushAlerts() {
+  // ⚠️ 节流判断必须在**取走之前**：`take_alerts` 是取走即清，
+  //    取了却不弹 = 丢告警，那比弹窗频繁更糟（用户错过失败原因）。
+  if (Date.now() - alertShownAt < ALERT_MIN_INTERVAL_MS) return;
   let alerts = [];
   try {
     alerts = await invoke('take_alerts');
@@ -321,6 +351,7 @@ async function flushAlerts() {
     return;
   }
   if (!alerts.length) return;
+  alertShownAt = Date.now();
   notice(alerts.join('\n'));
 }
 
@@ -388,8 +419,12 @@ async function toggleAutoConfirm() {
  *
  * 窗口不可见时降到 `HIDDEN_REFRESH_MS`：后台每秒拉一次全量看板是纯白干
  * （用户看不见，还占着 CPU 与 IPC）。
+ *
+ * ⚠️ 2026-11-09：1 秒改 3 秒。`get_state` 是**全量**重算 + 序列化（记录上千条时
+ * 单次百毫秒级），1 秒一次等于每秒把主线程压一次。状态变化的可感知延迟从 1 秒
+ * 变成 3 秒，换来的是追加/点击期间不再抢资源 —— 这个交换在几百到两千条规模下划算。
  */
-const REFRESH_MS = 1000;
+const REFRESH_MS = 3000;
 const HIDDEN_REFRESH_MS = 5000;
 
 let boardTimer = null;
@@ -471,10 +506,10 @@ async function refreshBoardOnce() {
   // 顶栏开关状态（切换后另有命令返回值即时刷新）。
   renderAutoConfirm(data.autoConfirm, data.autoConfirmed);
 
-  // **自动探测上游**（只读、同一批数据只探一次）：给「本地没跟的那几条」一个交代，
-  // 而不是让用户（或维护者）自己拿密钥去上游问一遍。放在算签名之前 ——
-  // 探到的结论要进签名，标题行才会跟着更新。
-  await probeUpstreamIfNeeded(data);
+  // **自动探测上游**（只读、同一批数据 60 秒最多探一次）：给「本地没跟的那几条」
+  // 一个交代，而不是让用户（或维护者）自己拿密钥去上游问一遍。
+  // ⚠️ **不 await**：探针慢的时候不许把整块看板（以及「发布」按钮）一起拖住。
+  void probeUpstreamIfNeeded(data);
 
   const signature = boardSignature(data);
   if (signature === lastSignature) {
@@ -747,7 +782,9 @@ function taskCard(task) {
   //    原先记录里只有指纹，指纹是单向哈希、**反推不出图** ⇒ 界面上连看一眼都做不到。
   //    地址仍拿得到：悬停缩略图看 tooltip，或 ⋯ 菜单里的「复制垫图地址」。
   // 没有 `refUrls` 就不渲染这一列（文生图不该多出一块空白）。
-  const refUrls = task.refUrls || [];
+  // 垫图**优先显示本地文件**（`refFiles`）：CDN 地址是上传产物，会过期变破图；
+  // 本地文件永远在。老记录没有 `refFiles` 才退回 CDN。
+  const refUrls = (task.refFiles && task.refFiles.length) ? task.refFiles : (task.refUrls || []);
   const top = el('div', 'task-top');
   if (refUrls.length) {
     const refs = el('div', 'task-refs');
@@ -927,11 +964,12 @@ function moreButton(task, file) {
       }));
     }
     const actions = [];
-    // 垫图地址：**"我需要能查"** 的出口 —— 复制走，粘到哪儿都能打开。
-    if ((task.refUrls || []).length) {
+    // 垫图地址：**"我需要能查"** 的出口 —— 复制走。优先本地路径（永远有效）。
+    const refForCopy = (task.refFiles && task.refFiles.length) ? task.refFiles : (task.refUrls || []);
+    if (refForCopy.length) {
       actions.push(menuItem('复制垫图地址', () => {
         closeMenu();
-        copyPrompt((task.refUrls || []).join('\n'));
+        copyPrompt(refForCopy.join('\n'));
       }));
     }
     // 「重跑 / 接着查」**由 Rust 下发的 `actions` 决定**（状态表那一列）——
@@ -1263,20 +1301,80 @@ function refLabelOf(url, index) {
   return name.replace(/\.[^.]+$/, '') || `图片${index}`;
 }
 
-/** 加垫图：**按 url 去重**（同一张图加两次没有意义，还会占两份参考图额度）。 */
+/** `data:` 垫图 → 本机路径的缓存（同一张图只落盘一次）。 */
+const refPathCache = new Map();
+/** 仍在落盘的垫图。发布前必须等它们，否则这一批会**静默少图**。 */
+const pendingRefSaves = new Set();
+
+/**
+ * `data:` 垫图落盘换成本机路径（同一张只落一次）。
+ *
+ * **所有入口共用这一个实现**：编辑区（`addRefs`）与导入队列（`toRefItems`）。
+ * 各写一份的话，两处迟早有一处忘了换，发布时又炸。
+ */
+async function saveRefImage(dataUrl) {
+  const cached = refPathCache.get(dataUrl);
+  if (cached) return cached;
+  const path = await invoke('save_ref_image', { data: dataUrl });
+  refPathCache.set(dataUrl, path);
+  return path;
+}
+
+/**
+ * 一批垫图 url → 待发条目（`data:` 先落盘）。
+ *
+ * 只有「导入」这条入口用得到：编辑区走 `addRefs`（逐张异步 push，界面即时反馈）；
+ * 导入是整批替换，等完再 push 更简单。
+ */
+async function toRefItems(urls) {
+  const items = [];
+  for (const url of urls) {
+    // ⚠️ 空项**报错**，不静默跳过：给了空串说明上游没校验
+    //    （「没有垫图」的合法写法是省略 refs 字段，不是塞个空串）。
+    if (!url) throw new Error('导入的 refs 里有空项');
+    const resolved = url.startsWith('data:') ? await saveRefImage(url) : url;
+    items.push({ url: resolved, label: refLabelOf(resolved, items.length + 1) });
+  }
+  return items;
+}
+
+/**
+ * 加垫图：**入口就把 `data:` 落成文件**，再进编辑区。
+ *
+ * ⚠️ 为什么不等到发布时再换（2026-11-09 实测）：同一张 base64 会被塞进 N 条任务，
+ * 发布时序列化 N 遍直接超 V8 的字符串上限（`RangeError: Invalid string length`），
+ * 整批发不出去。入口落盘 ⇒ 队列 / 导出 / 发布三条路都只有路径，**只有一个转换点**。
+ *
+ * ⚠️ 落盘是异步的：粘贴 / 选择 / 拖入的调用方拿不到结果，所以发布前要
+ * `await` [`pendingRefSaves`]（见 `publish`）。漏了就是"图没进队列还发得出去"。
+ */
 function addRefs(list) {
   for (const url of list) {
     if (typeof url !== 'string' || !url) continue;
-    if (draft.refs.some((ref) => ref.url === url)) continue;
-    refSeq += 1;
-    draft.refs.push({
-      id: `ref-${refSeq}`,
-      url,
-      label: refLabelOf(url, draft.refs.length + 1),
-    });
+    if (!url.startsWith('data:')) {
+      pushRef(url, refLabelOf(url, draft.refs.length + 1));
+      continue;
+    }
+    // 命中缓存时 `saveRefImage` 内部直接返回 —— 这里不再先查一遍（同一件事两处判）。
+    // 名字在落盘前算好：落盘后的文件名是内容哈希，界面上不该显示哈希。
+    const label = refLabelOf(url, draft.refs.length + 1);
+    const saving = saveRefImage(url)
+      .then((path) => pushRef(path, label))
+      .catch((error) => notice(`垫图保存失败：${error}`))
+      .finally(() => pendingRefSaves.delete(saving));
+    pendingRefSaves.add(saving);
   }
   renderRefs();
   renderMentions(); // `@` 弹层正开着的话，那份列表要跟着更新
+}
+
+/** 放一张垫图进编辑区（**按 url 去重**：同一张图加两次没有意义，还会占两份参考图额度）。 */
+function pushRef(url, label) {
+  if (!url || draft.refs.some((ref) => ref.url === url)) return;
+  refSeq += 1;
+  draft.refs.push({ id: `ref-${refSeq}`, url, label });
+  renderRefs();
+  renderMentions();
 }
 
 function renderRefs() {
@@ -1641,7 +1739,9 @@ function queueToJsonl() {
     if (item.model) line.model = item.model;
     if (item.ratio) line.ratio = item.ratio;
     if (item.size) line.size = item.size;
-    const refs = (item.refs || []).map((ref) => ref.url).filter(Boolean);
+    // ⚠️ 不再 `filter(Boolean)`：空 url 说明队列里有一条坏数据，过滤掉
+    //    等于把它静默写进导出的 JSONL（少一张垫图，没人看得出来）。
+    const refs = (item.refs || []).map((ref) => ref.url);
     if (refs.length) line.refs = refs;
     return JSON.stringify(line);
   }).join('\n');
@@ -1703,7 +1803,7 @@ function openJsonlEditor() {
           model: task.model,
           ratio: task.ratio,
           size: task.size,
-          refs: (task.refs || []).map((url) => ({ url, label: '' })),
+          refs: await toRefItems(task.refs || []),
           copies: 1,
         });
       }
@@ -1747,7 +1847,7 @@ async function publish() {
   busy = true;
   renderQueue();
   try {
-    await invoke('publish_queue', { tasks: queue.map((item) => ({
+    const payload = queue.map((item) => ({
       prompt: item.prompt,
       model: item.model,
       ratio: item.ratio,
@@ -1755,14 +1855,21 @@ async function publish() {
       // 后端收 `refs: string[]`（`intake::TaskInput`）；前端内部的 `{url,label}`
       // 只活在界面上，不往契约里塞。
       refs: (item.refs || []).map((ref) => ref.url),
-    })) });
+    }));
+    // 垫图可能还在落盘：等它们，否则这一批会**静默少图**（见 `addRefs`）。
+    if (pendingRefSaves.size) await Promise.allSettled([...pendingRefSaves]);
+    await invoke('publish_queue', { tasks: payload });
+    // 后端已经接单 ⇒ **立刻解锁按钮**。后面的看板刷新是旁路，
+    // 万一它慢（探针 / 上千条载荷），也不该让「发送」看起来还没发出去。
+    busy = false;
     queue.length = 0;
     // ⚠️ 编辑框的垫图**不清**：发送后仍留在那儿，等你决定删不删（需求 2）。
     renderRefs();
     closeMentions();
-    await refreshBoard();
+    renderQueue();
     // 提交后不再等跑完：调度器常驻，后面还可以继续提交、进同一会话排队。
     notice(`已提交 ${count} 条，正在排队`);
+    await refreshBoard();
   } catch (error) {
     $('boardNoticeText').textContent = `发布失败：${error}`;
     show($('boardNotice'), true);
@@ -1990,9 +2097,10 @@ async function importFile(index) {
       //    ① 待发缩略图取 `firstRef.url` 得 undefined ⇒ 一片破图；
       //    ② 发布时 `.map((ref) => ref.url)` 全变 undefined ⇒ queue.jsonl 里
       //       **refs 整段消失**，整批静默退化成文生图（垫图白垫，产品全靠猜）。
-      const refs = (task.refs || []).map((url) => {
+      // `data:` 由 `toRefItems` 统一落盘换路径（与编辑区同一个实现）。
+      const refs = (await toRefItems(task.refs || [])).map((ref) => {
         refSeq += 1;
-        return { id: `ref-${refSeq}`, url, label: refLabelOf(url, refSeq) };
+        return { id: `ref-${refSeq}`, url: ref.url, label: ref.label };
       });
       // 份数：同一条 push N 次，且**每份都是独立对象**（`refs` 也要各拷一份）——
       // 共用引用会让「改一条」联动全部。

@@ -487,6 +487,8 @@ impl Ctx {
         &mut self,
         ids: &std::collections::BTreeSet<String>,
     ) -> SchedulerSummary {
+        // 封口前的这一句要真的落盘，否则下面那句「进度可能续不上」说的不是事实。
+        let _ = self.state.flush_now();
         let records: Vec<TaskRecord> = self
             .state
             .all()
@@ -540,7 +542,8 @@ fn fix_orphan_submitting(ctx: &mut Ctx) -> usize {
         );
     }
     if !ids.is_empty() {
-        let _ = ctx.state.flush();
+        // 修复必须**真的落盘**，否则重启后还是「提交中」。
+        let _ = ctx.state.flush_now();
     }
     ids.len()
 }
@@ -587,6 +590,11 @@ struct Shared {
     on_session_end: Option<SessionEndFn>,
     /// 自动确认策略（全局开关 + 本批计数 + 本批许可）。
     auto_confirm: Arc<AutoConfirm>,
+    /// 「垫图来源 → CDN 地址」的进程内缓存。
+    ///
+    /// 记录里只存本机路径；上传推迟到发送那一刻。200 条共用一张垫图时，
+    /// 只有第一条会真上传，其余命中这里（这就是「同一批只传一次」）。
+    uploads: Mutex<BTreeMap<String, String>>,
 }
 
 impl Shared {
@@ -801,6 +809,71 @@ impl Shared {
         if let Err(error) = ctx.state.update(id, patch) {
             self.log(&format!("状态更新失败（内部 bug，请报告）：{error}"));
         }
+    }
+
+    /// 立刻把攒着的状态落盘（**锁内只做一次 `write_all`**，不是逐条开文件）。
+    ///
+    /// ⚠️ 调用方必须在**没持有** `Ctx` 锁时调它 —— 它自己会去拿锁。
+    /// 漏调的后果见 [`StateStore::flush_now`]：花钱边界上会重复提交。
+    fn flush_now(&self) -> PersistOutcome {
+        let mut ctx = self.lock();
+        ctx.state.flush_now()
+    }
+
+    /// 把「垫图来源」换成上游能吃的 CDN 地址。
+    ///
+    /// 来源有两种：本机文件路径（现读现传）与公网 URL（原样透传）。
+    /// **同一来源在进程内只上传一次** —— 200 条共用一张垫图时只有第一条真传。
+    /// 失败即 `Err`：**绝不退化成文生图**（那等于把用户垫的图悄悄扔掉）。
+    fn ref_attachments(
+        &self,
+        deps: &ClientDeps,
+        sources: &Option<Vec<String>>,
+    ) -> Result<Option<Vec<String>>, LovartError> {
+        let Some(sources) = sources else {
+            return Ok(None);
+        };
+        if sources.is_empty() {
+            return Ok(None);
+        }
+        // 持锁上传：同一张图被多个 worker 同时要时，只有一个在传，其余等着拿结果。
+        let mut cache = self.uploads.lock().unwrap_or_else(|error| error.into_inner());
+        let mut out: Vec<String> = Vec::with_capacity(sources.len());
+        for source in sources {
+            if let Some(url) = cache.get(source) {
+                out.push(url.clone());
+                continue;
+            }
+            let url = if source.starts_with("http://") || source.starts_with("https://") {
+                source.clone()
+            } else {
+                // 本机路径 → data: → 上传。`read_ref_inputs` 是这条链的唯一实现。
+                let entries = crate::engine::refs::read_ref_inputs(
+                    std::slice::from_ref(source),
+                    Path::new("."),
+                )
+                .map_err(|message| LovartError::internal(message, ErrType::UploadFailed))?;
+                let Some(entry) = entries.into_iter().next() else {
+                    return Err(LovartError::internal(
+                        format!("参考图解析为空（内部 bug）：{source}"),
+                        ErrType::UploadFailed,
+                    ));
+                };
+                let uploaded =
+                    crate::lovart::attachments::resolve_attachments(deps, std::slice::from_ref(&entry.url))?;
+                uploaded
+                    .and_then(|urls| urls.into_iter().next())
+                    .ok_or_else(|| {
+                        LovartError::internal(
+                            format!("参考图上传失败（未返回 CDN 地址）：{source}"),
+                            ErrType::UploadFailed,
+                        )
+                    })?
+            };
+            cache.insert(source.clone(), url.clone());
+            out.push(url);
+        }
+        Ok(Some(out))
     }
 
     /// 把任务置为**终态**的唯一出口。
@@ -1080,12 +1153,25 @@ fn download_all(
 fn run_submit(worker_id: usize, id: &str, shared: &Shared) {
     let (deps, ports, task, record, task_timeout) = {
         let ctx = shared.lock();
-        let Some(task) = ctx.task_by_id.get(id).cloned() else {
-            shared.log(&format!("[w{worker_id}] {id} 缺少任务定义，跳过"));
-            return;
-        };
-        let Some(record) = ctx.state.get(id).cloned() else {
-            shared.log(&format!("[w{worker_id}] {id} 缺少任务定义，跳过"));
+        // ⚠️ 两者缺一都是**内部 bug**（`enqueue` 保证 `task_by_id` 与记录同时建）。
+        //    原先「跳过」会让这条任务既不跑也不报，看板上永远停在待提交 ——
+        //    失败被伪装成「还没轮到」，比直接判失败更难查。
+        let (Some(task), Some(record)) = (
+            ctx.task_by_id.get(id).cloned(),
+            ctx.state.get(id).cloned(),
+        ) else {
+            drop(ctx);
+            shared.log(&format!(
+                "[w{worker_id}] {id} 任务定义或记录缺失（内部 bug，请报告）"
+            ));
+            shared.finish(
+                id,
+                TaskStatus::Failed,
+                RecordPatch {
+                    error: Some(Some("内部 bug：任务定义丢失，请报告".to_string())),
+                    ..Default::default()
+                },
+            );
             return;
         };
         (
@@ -1097,9 +1183,9 @@ fn run_submit(worker_id: usize, id: &str, shared: &Shared) {
         )
     };
 
-    let has_refs = task.refs.as_ref().is_some_and(|refs| !refs.is_empty());
-    let mode = match &task.refs {
-        Some(refs) if !refs.is_empty() => format!("图生图({}图)", refs.len()),
+    let has_refs = task.ref_files.as_ref().is_some_and(|files| !files.is_empty());
+    let mode = match &task.ref_files {
+        Some(files) if !files.is_empty() => format!("图生图({}图)", files.len()),
         _ => "文生图".to_string(),
     };
     shared.log(&format!(
@@ -1117,7 +1203,14 @@ fn run_submit(worker_id: usize, id: &str, shared: &Shared) {
     let tool_config = build_lovart_tool_config(&task.model);
     // 只传档位标签 + 比例，**不传像素**：像素会被上游当硬约束，长边算大后
     // 超出免费额度会触发 pending_confirmation（需人工批准才扣积分）。
-    let attachments = task.refs.clone();
+    // 垫图：记录里只有本机路径，**发送前才上传**（同一张图本次进程内只传一次）。
+    let attachments = match shared.ref_attachments(&deps, &task.ref_files) {
+        Ok(list) => list,
+        Err(error) => {
+            handle_submit_error(worker_id, id, &error, &record, shared);
+            return;
+        }
+    };
     let prompt = build_lovart_prompt(
         &task.model,
         &task.prompt,
@@ -1162,6 +1255,13 @@ fn run_submit(worker_id: usize, id: &str, shared: &Shared) {
             ..Default::default()
         },
     );
+    // 花钱边界：threadId 必须**立刻**落盘 —— 进程被杀后靠它续查，不重复提交。
+    // 落盘失败仍继续轮询（图上已经生成了），只把风险明说出来。
+    if let PersistOutcome::Failed { message, .. } = shared.flush_now() {
+        shared.log(&format!(
+            "[w{worker_id}] ⚠️ {id} threadId 落盘失败（{message}）：进程被杀后可能重复提交"
+        ));
+    }
     shared.log(&format!(
         "[w{worker_id}] 已提交 {id} thread={thread_id}，进入轮询"
     ));
@@ -1210,8 +1310,17 @@ fn handle_submit_error(
         ErrorClass::Concurrency | ErrorClass::ThreadBusy => {
             let (busy, max_busy, base) = {
                 let ctx = shared.lock();
+                // 记录不存在 = 内部 bug。原先按 0 算 ⇒ 它永远「第一次撞并发满」，
+                // 无限重投、永远不判死（错误被伪装成排队中）。
+                let Some(record) = ctx.state.get(id) else {
+                    drop(ctx);
+                    shared.log(&format!(
+                        "[w{worker_id}] {id} 记录不存在（内部 bug，请报告），停止重投"
+                    ));
+                    return;
+                };
                 (
-                    ctx.state.get(id).and_then(|r| Some(r.busy_retries)).unwrap_or(0) + 1,
+                    record.busy_retries + 1,
                     ctx.max_busy_retries,
                     ctx.busy_backoff_base,
                 )
@@ -1433,11 +1542,16 @@ fn poll_and_finish(
 ) {
     let (prompt_text, deps, ports) = {
         let ctx = shared.lock();
-        (
-            ctx.state.get(id).map(|r| r.prompt.clone()).unwrap_or_else(|| id.to_string()),
-            ctx.deps.clone(),
-            Arc::clone(&ctx.ports),
-        )
+        // ⚠️ 记录不存在 = 内部 bug。原先拿 id 当提示词兜底 ⇒ 产物文件名变成一串哈希，
+        //    而且没人知道这条为什么叫这个名（错误被盖住，而不是被报出来）。
+        let Some(prompt_text) = ctx.state.get(id).map(|record| record.prompt.clone()) else {
+            drop(ctx);
+            shared.log(&format!(
+                "[w{worker_id}] {id} 记录不存在（内部 bug，请报告），已跳过取件"
+            ));
+            return;
+        };
+        (prompt_text, ctx.deps.clone(), Arc::clone(&ctx.ports))
     };
 
     // 自动确认：`allow` 在"即将确认"那一刻求值（开关热更新）；计数器与轮询收场无关。
@@ -1624,7 +1738,15 @@ fn handle_poll_error(
             }
             let count = {
                 let ctx = shared.lock();
-                ctx.state.get(id).and_then(|r| Some(r.timeout_count)).unwrap_or(0) + 1
+                // 同上：记录不存在按 0 算会让超时计数永远归零 ⇒ 槽位永不释放。
+                let Some(record) = ctx.state.get(id) else {
+                    drop(ctx);
+                    shared.log(&format!(
+                        "[w{worker_id}] {id} 记录不存在（内部 bug，请报告），跳过超时计数"
+                    ));
+                    return;
+                };
+                record.timeout_count + 1
             };
             if count < max_timeouts {
                 shared.requeue(
@@ -1710,7 +1832,7 @@ fn handle_poll_error(
 /// 派工：把**这些已存在的记录**送进队列。
 ///
 /// ⚠️ **一个字段都不写回记录**。派工没有"声明"可对齐 —— 记录里的
-///    `prompt` / `model` / `ratio` / `size` / **垫图** / 指纹就是真相，
+///    `prompt` / `model` / `ratio` / `size` / **垫图** 就是真相，
 ///    所以这条路上**没有任何同步**。这正是与声明路径的分界。
 ///
 /// 返回的 [`PromptTask`] 由记录**无损投影**（[`TaskRecord::to_prompt_task`]），
@@ -1836,6 +1958,7 @@ impl Scheduler {
             last_summary: Mutex::new(None),
             on_session_end,
             auto_confirm,
+            uploads: Mutex::new(BTreeMap::new()),
         });
 
         let mut handles = Vec::new();
@@ -1879,7 +2002,7 @@ impl Scheduler {
             let tasks = match batch {
                 Batch::Declared(tasks) => tasks,
                 // 派工：**一个字段都不写回记录** —— 只把 id 送进队列；
-                // 任务由记录**无损投影**得到（含已上传的垫图 URL 与指纹）。
+                // 任务由记录**无损投影**得到（含已上传的垫图 URL）。
                 Batch::Records(ids) => {
                     let (records, rejects) = intake::enqueue_records(
                         &mut ctx.state,
@@ -1916,7 +2039,7 @@ impl Scheduler {
             if let PersistOutcome::Failed {
                 message,
                 failed_writes,
-            } = ctx.state.flush()
+            } = ctx.state.flush_now()
             {
                 return Err(LovartError::transport(format!(
                     "状态文件写不进去（{message}，失败 {failed_writes} 次）：断点续跑会失效，已中止启动"
@@ -2000,6 +2123,14 @@ impl Scheduler {
         self.shared.auto_confirm.count()
     }
 
+    /// 立刻把攒着的状态落盘 —— **关窗用，不停 worker**。
+    ///
+    /// 与 [`shutdown`](Self::shutdown) 的分工：那个要 join 在飞 HTTP（可能等 60 秒），
+    /// 关窗不能等那么久；这里只做一次 `write_all`（毫秒级）。
+    pub fn flush_now(&self) -> PersistOutcome {
+        self.shared.flush_now()
+    }
+
     /// 当前被持有的 id（待处理 ∪ 在飞）。界面进度条的**唯一**判据。
     pub fn held_ids(&self) -> std::collections::BTreeSet<String> {
         let ctx = self.lock();
@@ -2025,7 +2156,7 @@ impl Scheduler {
         self.shared.close_session_if_idle();
     }
 
-    /// 重跑某一条：锁内重置为待提交（**垫图与指纹原样保留**）。
+    /// 重跑某一条：锁内重置为待提交（**垫图原样保留**）。
     ///
     /// 走调度器而不是外部 `StateStore::open` —— 后者是第二个写者（不变量 I1）。
     pub fn reset_for_retry(&self, id: &str) -> Result<(), LovartError> {
@@ -2035,7 +2166,16 @@ impl Scheduler {
         }
         crate::engine::state::reset_for_retry(&mut ctx.state, id)
             .map_err(|error| LovartError::transport(format!("重置失败：{error}")))?;
-        let _ = ctx.state.flush();
+        // 重置不落盘 ⇒ 重启后回到旧终态，用户点了等于没点。**不许吞**。
+        if let PersistOutcome::Failed {
+            message,
+            failed_writes,
+        } = ctx.state.flush_now()
+        {
+            return Err(LovartError::transport(format!(
+                "重置后状态没落盘（{message}，失败 {failed_writes} 次）：重启后会回到旧状态，请重试"
+            )));
+        }
         Ok(())
     }
 
@@ -2048,7 +2188,16 @@ impl Scheduler {
         ctx.state
             .update(id, patch)
             .map_err(|error| LovartError::transport(format!("更新失败：{error}")))?;
-        let _ = ctx.state.flush();
+        // 「确认」会花积分：这条写不进去就必须让调用方知道，不能静默返回成功。
+        if let PersistOutcome::Failed {
+            message,
+            failed_writes,
+        } = ctx.state.flush_now()
+        {
+            return Err(LovartError::transport(format!(
+                "状态没落盘（{message}，失败 {failed_writes} 次）：重启后这条会回退，请重试"
+            )));
+        }
         Ok(())
     }
 

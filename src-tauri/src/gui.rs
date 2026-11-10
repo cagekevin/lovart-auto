@@ -843,6 +843,31 @@ fn import_inbox(state: tauri::State<'_, GuiState>, file: String) -> Result<Value
     import_inbox_core(&state.cwd, Path::new(&file))
 }
 
+/// 把前端读出来的 `data:` 垫图落成本机文件，返回绝对路径。
+///
+/// ── 为什么必须有它（2026-11-09 实测）────────────────────────────────
+/// 粘贴 / 文件选择得到的垫图只有 base64。原样塞进发布参数时，同一张图会在
+/// 200 条任务里**重复序列化 200 遍**（单张 10MB → base64 约 13MB ⇒ 2.6GB 字符串）
+/// ⇒ V8 抛 `RangeError: Invalid string length`，**整批发不出去**。
+/// 落成文件后参数里只有短路径；`refs.rs` 读盘并按内容哈希去重，同一张图仍只上传一次。
+///
+/// 文件名 = 内容 sha1：同一张图重复调用直接复用，不重复写盘。
+fn save_ref_image_core(dir: &Path, data: &str) -> Result<String, String> {
+    // **唯一实现**在 `engine::refs`：命令行与 GUI 的 `data:` 输入都走它。
+    crate::engine::refs::materialize_data_url(dir, data)
+}
+
+/// 见 [`save_ref_image_core`]。
+///
+/// **async**：解码 10MB base64 是几百毫秒级的活，不能压在主线程上。
+#[tauri::command]
+async fn save_ref_image(state: tauri::State<'_, GuiState>, data: String) -> Result<String, String> {
+    let dir = state.cwd.join("var").join("refs");
+    tauri::async_runtime::spawn_blocking(move || save_ref_image_core(&dir, &data))
+        .await
+        .map_err(|error| format!("保存垫图线程异常退出：{error}"))?
+}
+
 /// 导入的**核心** —— 不依赖 Tauri，集成测试直接打这里。
 ///
 /// （`import_inbox` 只是把 `cwd` 从 `State` 里取出来。分开的理由与 `run::build_status_json`
@@ -906,7 +931,7 @@ enum RunSource {
 
 /// 发布队列 —— 落文件后走**与 CLI 同一条开跑路径**。
 #[tauri::command]
-fn publish_queue(
+async fn publish_queue(
     app: tauri::AppHandle,
     state: tauri::State<'_, GuiState>,
     tasks: Vec<crate::engine::intake::TaskInput>,
@@ -948,7 +973,7 @@ fn reset_for_retry(state: &tauri::State<'_, GuiState>, id: &str) -> Result<(), S
 
 /// 重跑某一条（异常行菜单里的「重跑这一条」）。
 #[tauri::command]
-fn retry_one(
+async fn retry_one(
     app: tauri::AppHandle,
     state: tauri::State<'_, GuiState>,
     id: String,
@@ -979,7 +1004,7 @@ fn retry_one(
 /// 闸也不同：这里读**状态表**的 `actions` 列（有没有 `Resume`），
 /// 不在这里写第二份"哪些状态能接着查"。
 #[tauri::command]
-fn resume_one(
+async fn resume_one(
     app: tauri::AppHandle,
     state: tauri::State<'_, GuiState>,
     id: String,
@@ -1065,7 +1090,7 @@ fn confirmable(
 /// ⚠️ 它**不是队列任务**（表里 `needs_confirm` 的 `job` 是 `None`）：
 /// 确认只能由人按，进了队列就是"下次跑批自动确认"，即静默花钱。
 #[tauri::command]
-fn confirm_task(
+async fn confirm_task(
     app: tauri::AppHandle,
     state: tauri::State<'_, GuiState>,
     id: String,
@@ -1166,13 +1191,22 @@ fn probe_unfinished_core(cwd: &Path) -> Result<Value, String> {
         };
         match crate::lovart::client::get_status(&deps, &thread) {
             Ok(value) => {
+                // ⚠️ 缺 `status` 不许当成空串：前端会把空串显示成「未提交过」——
+                //    那是把「读不懂响应」说成「上游没这条」，比报错更误导。
                 let upstream = value
                     .as_object()
                     .and_then(|object| object.get("status"))
                     .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                probes.push(json!({ "id": record.id, "upstream": upstream }));
+                    .filter(|status| !status.is_empty());
+                match upstream {
+                    Some(status) => {
+                        probes.push(json!({ "id": record.id, "upstream": status }));
+                    }
+                    None => probes.push(json!({
+                        "id": record.id,
+                        "error": "上游响应缺少 status 字段，无法判定",
+                    })),
+                }
             }
             // 探测失败**如实带回**：绝不在这里悄悄吞掉，也绝不猜成 "running"。
             Err(error) => {
@@ -1249,7 +1283,7 @@ fn resume_unfinished(app: tauri::AppHandle, state: tauri::State<'_, GuiState>) -
 /// 保留的代价（**由界面负责说清**）：未完成的任务，上游可能**还在生成**；
 /// 删掉本地记录后没人去取那张图，它会变成上游的孤儿。所以前端删除前弹确认。
 #[tauri::command]
-fn remove_tasks(state: tauri::State<'_, GuiState>, ids: Vec<String>) -> Result<usize, String> {
+async fn remove_tasks(state: tauri::State<'_, GuiState>, ids: Vec<String>) -> Result<usize, String> {
     if ids.is_empty() {
         return Ok(0);
     }
@@ -1318,7 +1352,7 @@ pub fn remove_finished_tasks_core(state_file: &Path) -> Result<usize, String> {
 /// 清空未结束任务期间拒绝（`ensure_not_clearing`）、跑批中拒绝（追加写会打架）。
 /// 只删记录，图片文件与报告都不动。
 #[tauri::command]
-fn clear_finished_tasks(state: tauri::State<'_, GuiState>) -> Result<usize, String> {
+async fn clear_finished_tasks(state: tauri::State<'_, GuiState>) -> Result<usize, String> {
     match state.scheduler_snapshot() {
         // 调度器在 ⇒ 删除必须走它（唯一写者），否则重写文件会冲掉在飞任务刚写的行。
         Some(scheduler) => scheduler
@@ -1338,7 +1372,7 @@ fn clear_finished_tasks(state: tauri::State<'_, GuiState>) -> Result<usize, Stri
 /// 为什么跑批中**立刻返回**而不是同步等 60 秒：取消是协作式的，
 /// 等下去会把 UI 线程挂住（用户看到的是"点了没反应"）。
 #[tauri::command]
-fn cancel_all_tasks(state: tauri::State<'_, GuiState>) -> Result<Value, String> {
+async fn cancel_all_tasks(state: tauri::State<'_, GuiState>) -> Result<Value, String> {
     let cleared = match state.scheduler_snapshot() {
         // 调度器在 ⇒ 锁内删：与 worker 的写入天然串行，不再需要「先停批、等退出」。
         Some(scheduler) => scheduler
@@ -1487,7 +1521,7 @@ fn set_auto_confirm(state: tauri::State<'_, GuiState>, enabled: bool) -> Result<
 
 /// 停止当前批次（协作式取消：调度器会在下一个检查点退出）。
 #[tauri::command]
-fn stop_run(state: tauri::State<'_, GuiState>) -> Result<(), String> {
+async fn stop_run(state: tauri::State<'_, GuiState>) -> Result<(), String> {
     let scheduler = {
         let slot = state
             .scheduler
@@ -1631,6 +1665,17 @@ pub fn run() {
             }
             Ok(())
         })
+        // 关窗前把攒批的状态落盘：合并写之后不 drain，最多丢最近 2 秒的进度。
+        // ⚠️ 只落盘、**不停 worker**（`shutdown` 要 join 在飞 HTTP，最坏 60 秒）。
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                if let Some(state) = window.try_state::<GuiState>() {
+                    if let Some(scheduler) = state.scheduler_snapshot() {
+                        let _ = scheduler.flush_now();
+                    }
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             get_state,
             take_alerts,
@@ -1639,6 +1684,7 @@ pub fn run() {
             pick_prompt_file,
             inspect_prompt_file,
             import_inbox,
+            save_ref_image,
             validate_draft,
             export_draft,
             publish_queue,

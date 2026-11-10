@@ -46,8 +46,7 @@ fn make_task(id: &str) -> PromptTask {
         image_size: "2K".to_string(),
         line: 1,
         ref_inputs: None,
-        refs: None,
-        ref_signature: None,
+        ref_files: None,
     }
 }
 
@@ -184,20 +183,15 @@ fn 状态清单十个且线格式名互不相同() {
 }
 
 #[test]
-fn 记录到任务的无损投影_垫图与指纹不能丢() {
-    // ⚠️ 这条钉的是 **2026-10-01 那个"点确认后垫图消失"** 的根因：
-    //    适配层曾经自己造投影（`record_to_task`），**只挑 4 个字段** —— 垫图一丢，
-    //    调度器那条"以声明为准"的同步逻辑就按「没有就清空」把记录里的垫图抹掉。
-    //    投影搬进 `TaskRecord::to_prompt_task` 之后，**漏字段会编译不过**；
-    //    这条测试再从行为上钉死一次（防止有人"顺手"把它精简回去）。
+fn 记录到任务的无损投影_垫图不能丢() {
+    // ⚠️ 这条钉的是「点确认后垫图消失」的根因：适配层曾经自己造投影
+    //    （`record_to_task`），只挑 4 个字段 ⇒ 垫图一丢，重跑/接着查就变成文生图。
     let mut record = new_record(&make_task("img2img"));
-    record.ref_signature = Some("sig-abc".to_string());
-    record.ref_urls = Some(vec!["https://cdn.example/a.png".to_string()]);
+    record.ref_files = Some(vec!["C:/refs/a.png".to_string()]);
 
     let task = record.to_prompt_task();
 
-    assert_eq!(task.refs, record.ref_urls, "垫图地址丢了 ⇒ 重跑/接着查会变成文生图");
-    assert_eq!(task.ref_signature, record.ref_signature, "垫图指纹丢了");
+    assert_eq!(task.ref_files, record.ref_files, "垫图路径丢了 ⇒ 重跑/接着查会变成文生图");
     assert_eq!(
         (task.prompt.as_str(), task.model.as_str()),
         (record.prompt.as_str(), record.model.as_str())
@@ -712,27 +706,19 @@ fn 归一化与_TS_同口径_剥时间_留状态集合() {
 
 /// 「我当初垫的是哪张图」只有一个地方能回答 —— 记录本身。
 ///
-/// 守的不变量：**新建记录时必须把 task 上的垫图信息带过来**。
-/// 原先 `new_record` 把 `ref_signature` 写死成 `None`（`ref_urls` 根本不存在），
-/// 结果是**第一次跑的任务永远没有垫图信息** —— 界面上看不到、地址也查不到；
-/// 后面只有「参数变了」的补丁分支才会写上，而新任务根本走不到那里。
+/// 守的不变量：**新建记录时必须把 task 上的垫图带过来**，否则第一次跑的
+/// 图生图任务在界面上看不到垫图、地址也查不到。
 #[test]
 fn 新建记录必须带上垫图_否则第一次跑就丢了() {
     let mut task = make_task("ref-task");
-    task.refs = Some(vec!["https://cdn.invalid/ref-a.png".to_string()]);
-    task.ref_signature = Some("sig-a".to_string());
+    task.ref_files = Some(vec!["C:/refs/ref-a.png".to_string()]);
 
     let record = new_record(&task);
 
     assert_eq!(
-        record.ref_signature.as_deref(),
-        Some("sig-a"),
-        "指纹丢了 ⇒ 「换了垫图要重跑」的判定失效"
-    );
-    assert_eq!(
-        record.ref_urls,
-        Some(vec!["https://cdn.invalid/ref-a.png".to_string()]),
-        "地址丢了 ⇒ 用户再也看不到自己垫的是哪张图"
+        record.ref_files,
+        Some(vec!["C:/refs/ref-a.png".to_string()]),
+        "路径丢了 ⇒ 用户再也看不到自己垫的是哪张图"
     );
 }
 
@@ -742,28 +728,27 @@ fn 新建记录必须带上垫图_否则第一次跑就丢了() {
 fn 文生图不写垫图字段而不是写_null() {
     let record = new_record(&make_task("plain"));
     let value = serde_json::to_value(&record).expect("序列化");
-    assert!(value.get("refUrls").is_none(), "没有垫图就不该出现 refUrls");
-    assert!(value.get("refSignature").is_none());
+    assert!(value.get("refFiles").is_none(), "没有垫图就不该出现 refFiles");
 }
 
-/// 补丁语义：**换了垫图必须能显式清掉旧地址**，不能只改指纹。
-/// 只改指纹会让界面拿**上一张垫图**冒充这一张（用户正是靠这个地址核对垫图的）。
+/// 补丁语义：**换了垫图必须能显式清掉旧地址**。
+/// 清不掉会让界面拿**上一张垫图**冒充这一张（用户正是靠这个地址核对垫图的）。
 #[test]
 fn 垫图地址可以显式清空() {
     let (mut store, _path) = open_state();
     let mut task = make_task("swap");
-    task.refs = Some(vec!["https://cdn.invalid/first.png".to_string()]);
+    task.ref_files = Some(vec!["C:/refs/first.png".to_string()]);
     store.create(new_record(&task));
 
     store
         .update(
             "swap",
             RecordPatch {
-                ref_urls: clear(),
+                ref_files: clear(),
                 ..Default::default()
             },
         )
         .expect("清空垫图");
 
-    assert_eq!(store.get("swap").expect("记录还在").ref_urls, None);
+    assert_eq!(store.get("swap").expect("记录还在").ref_files, None);
 }
