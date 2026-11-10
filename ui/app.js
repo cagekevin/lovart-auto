@@ -793,12 +793,14 @@ function taskCard(task) {
       item.type = 'button';
       item.title = `垫图：${url}\n（点击看大图）`;
       const img = document.createElement('img');
-      img.src = url;
+      // ⚠️ 必须走 [`refSrc`]：`refFiles` 存的是**本机绝对路径**，
+      //    裸路径塞进 `src` 会被当成相对地址（`file://` 又被 webview 禁掉）⇒ 一片破图。
+      img.src = refSrc(url);
       img.alt = '垫图';
       img.loading = 'lazy';
       img.decoding = 'async';
       item.appendChild(img);
-      item.addEventListener('click', () => openViewerRemote(url, task.prompt));
+      item.addEventListener('click', () => openRefViewer(url, task.prompt));
       refs.appendChild(item);
     }
     top.appendChild(refs);
@@ -1114,6 +1116,17 @@ function openViewerRemote(url, prompt) {
   openViewerSrc(url, '', prompt);
 }
 
+/**
+ * 看一张垫图的大图。垫图有三种形态：本机路径（`refFiles`）· `data:`（文件选择器）· `http(s):`。
+ *
+ * ⚠️ 本机路径**必须走 [`openViewer`]**：内部 `convertFileSrc` 才加载得出来，
+ *    而且能带上路径让「打开所在位置」可用；塞给 `openViewerRemote` 是白板 + 按钮恒灰。
+ */
+function openRefViewer(ref, prompt) {
+  if (isRemoteSrc(ref)) openViewerRemote(ref, prompt);
+  else openViewer(ref, prompt);
+}
+
 function openViewerSrc(src, file, prompt) {
   viewerFile = file;
   viewerPrompt = prompt || '';
@@ -1175,8 +1188,12 @@ function toFileUrl(path) {
  *    webview 默认禁用 `file://`，拼出来的地址图片一律白板、且不报错。
  */
 function refSrc(ref) {
-  if (/^(data:|https?:)/.test(ref)) return ref;
-  return toFileUrl(ref);
+  return isRemoteSrc(ref) ? ref : toFileUrl(ref);
+}
+
+/** 这段地址能不能直接喂给 `<img src>`／浏览器（`data:` / `http(s):`）；其余一律当本机路径。 */
+function isRemoteSrc(ref) {
+  return /^(data:|https?:)/.test(ref);
 }
 
 // ── 待发队列 ─────────────────────────────────────────────────────────
