@@ -1,11 +1,13 @@
-# 三个入口：跑测试（唯一可信的验收）· 打包成 macOS 应用 · 打包成 Windows exe。
+# 三个入口：全量回归 · 打包成 macOS 应用 · 打包成 Windows exe。
 #
-#   make check      编译 + 全部测试
+#   make check      编译 + 全部测试（**不是每轮的闸**，见 README「验证规则」）
 #   make check-rs   同上（别名）
 #   make app        打包 macOS 应用包 lovart.app（双击即用）
 #   make win        打包 Windows exe lovart-client.exe（双击即用，见 scripts/make-exe.ps1）
 #   make clean-rs   清掉 Rust 构建产物
 #
+# ⚠️ **编译不是测试**：`check` / `win` / `app` 只证明「能编过」，不证明行为正确。
+#    前端改动的闸是 `node --check ui/app.js`；后端的闸是针对性用例或出包后手测。
 # ⚠️ 全绿只证明「和上次一样」，**不证明「规则真的成立」** —— 期望值本身可能是错的。
 #    要证明规则成立，用 `scripts/probe.mjs`（先红后绿）：
 #      node scripts/probe.mjs --label '…' --file <相对仓库根的路径> \
