@@ -210,7 +210,7 @@ function boardSignature(data) {
       // ⚠️ `following` **必须进签名**：批次开始/结束时，任务状态一个字都没变，
       //    变的是「谁在被跟」。签名漏了它就等于进度条停不下来（结构没变 ⇒ 不重建 DOM）。
       // 垫图条数同理：换垫图重跑时状态可能原地不动，但卡片内容必须变。
-      return `${task.id}:${task.status}:${present}:${task.following ? 'f' : '-'}:${(task.refFiles || task.refUrls || []).length}`;
+      return `${task.id}:${task.status}:${present}:${task.following ? 'f' : '-'}:${taskRefUrls(task).length}`;
     })
     .join('|');
   return [
@@ -336,6 +336,25 @@ let alertShownAt = 0;
 /** 两次弹窗之间的最小间隔。 */
 const ALERT_MIN_INTERVAL_MS = 60000;
 
+/**
+ * 看板顶部那条「读不到 / 失败」提示 —— **唯一写入口**。
+ *
+ * ⚠️ `hideMain` 只在**看板数据本身不可信**时给（读不到 `get_state` / 发布失败）：
+ *    那时不藏起列表，就等于把上一轮的旧列表当成现状。告警通道 / 停止失败则**不藏** ——
+ *    任务状态仍然有效，藏起来反而像是数据没了。
+ */
+function showBoardError(text, hideMain = false) {
+  $('boardNoticeText').textContent = text;
+  show($('boardNotice'), true);
+  if (hideMain) show($('boardMain'), false);
+}
+
+/** 关掉那条提示、把列表放回来（每轮全量刷新成功后调用）。 */
+function clearBoardError() {
+  show($('boardNotice'), false);
+  show($('boardMain'), true);
+}
+
 async function flushAlerts() {
   // ⚠️ 节流判断必须在**取走之前**：`take_alerts` 是取走即清，
   //    取了却不弹 = 丢告警，那比弹窗频繁更糟（用户错过失败原因）。
@@ -346,8 +365,7 @@ async function flushAlerts() {
   } catch (error) {
     // 取告警这条**通道本身**坏了：不能静默（否则告警机制一坏就回到「什么都看不见」）。
     // 但也**不能**再借告警通道报告 —— 那正是它坏掉的地方。
-    $('boardNoticeText').textContent = `读不到告警通道：${error}`;
-    show($('boardNotice'), true);
+    showBoardError(`读不到告警通道：${error}`);
     return;
   }
   if (!alerts.length) return;
@@ -475,13 +493,10 @@ async function refreshBoardOnce() {
     data = await invoke('get_state');
   } catch (error) {
     // 查7：读不到 ≠ 没有。保留错误 + 给重试，绝不渲染成空态。
-    $('boardNoticeText').textContent = `读不到任务状态：${error}`;
-    show($('boardNotice'), true);
-    show($('boardMain'), false);
+    showBoardError(`读不到任务状态：${error}`, true);
     return;
   }
-  show($('boardNotice'), false);
-  show($('boardMain'), true);
+  clearBoardError();
 
   // 批次级告警：**必须显示**，所以放在「结构没变就早退」之前 ——
   // 告警的出现与任务列表的结构无关（跑批失败时列表往往一点没变）。
@@ -531,9 +546,6 @@ async function refreshBoardOnce() {
   scroller.scrollTop = keepScroll;
 }
 
-/** 最近一次拿到的任务列表（面板头的「清理已结束」要用）。 */
-let lastTasks = [];
-
 /**
  * 最近一份**全量**载荷（`get_state` 的非 `unchanged` 返回）。
  *
@@ -571,7 +583,6 @@ let boardLive = false;
 
 function renderBoard(data) {
   const tasks = data.tasks || [];
-  lastTasks = tasks;
   boardLive = Boolean(data.running);
   // 分组判据来自 Rust（见文件头的说明），前端不自己算。
   const running = tasks.filter((task) => task.group === 'active');
@@ -702,6 +713,29 @@ async function confirmFlow(task) {
 }
 
 /**
+ * 一条任务的垫图地址：`refFiles`（本机路径，永远有效）优先，老记录没有它才退回 CDN 的 `refUrls`。
+ *
+ * ⚠️ **唯一出处**：看板签名、卡片缩略图、「复制垫图地址」、「载入编辑区」四处都读它。
+ *    各自写一遍 `refFiles || refUrls` 时，迟早有一处忘了「CDN 是上传产物、会过期」这条前提，
+ *    于是那条路又在界面上摆破图。
+ */
+function taskRefUrls(task) {
+  return (task.refFiles && task.refFiles.length) ? task.refFiles : (task.refUrls || []);
+}
+
+/**
+ * Rust 任务 → 前端的参数三件套（`aspectRatio` / `imageSize` → `ratio` / `size`）。
+ *
+ * ⚠️ **键名分叉的唯一换算点**：`get_state` / `import_inbox` 发 `aspectRatio`，
+ *    而 `validate_draft` / `publish_queue` / JSONL 用 `ratio` —— 同一个 `PromptTask`
+ *    在 `gui.rs` 里被投影了两遍。根治要把 Rust 那两份合成一份；在那之前，
+ *    前端只准在这一处改名，别再散到各个调用点。
+ */
+function paramsOf(task) {
+  return { model: task.model, ratio: task.aspectRatio, size: task.imageSize };
+}
+
+/**
  * 任务卡（处理中 / 排队中 / 已完成**共用同一套**）。
  *
  * ⚠️ 这是**图片工具**，每条任务的主角是**那张图**。
@@ -782,9 +816,8 @@ function taskCard(task) {
   //    原先记录里只有指纹，指纹是单向哈希、**反推不出图** ⇒ 界面上连看一眼都做不到。
   //    地址仍拿得到：悬停缩略图看 tooltip，或 ⋯ 菜单里的「复制垫图地址」。
   // 没有 `refUrls` 就不渲染这一列（文生图不该多出一块空白）。
-  // 垫图**优先显示本地文件**（`refFiles`）：CDN 地址是上传产物，会过期变破图；
-  // 本地文件永远在。老记录没有 `refFiles` 才退回 CDN。
-  const refUrls = (task.refFiles && task.refFiles.length) ? task.refFiles : (task.refUrls || []);
+  // 地址的取舍规则在 [`taskRefUrls`]：CDN 会过期、本地文件永远在。
+  const refUrls = taskRefUrls(task);
   const top = el('div', 'task-top');
   if (refUrls.length) {
     const refs = el('div', 'task-refs');
@@ -973,8 +1006,15 @@ function moreButton(task, file) {
       }));
     }
     const actions = [];
+    // 「载入编辑区」：想改一版再发时的出口 —— 把整条内容**替换**进编辑区
+    // （垫图 / 提示词 / 模型 / 比例 / 尺寸，见 `loadTaskIntoEditor`）。
+    // 不花钱、不改这条任务 ⇒ 放在「重跑」前面：它才是"再发一次"的常规入口。
+    actions.push(menuItem('载入编辑区', () => {
+      closeMenu();
+      void loadTaskIntoEditor(task);
+    }));
     // 垫图地址：**"我需要能查"** 的出口 —— 复制走。优先本地路径（永远有效）。
-    const refForCopy = (task.refFiles && task.refFiles.length) ? task.refFiles : (task.refUrls || []);
+    const refForCopy = taskRefUrls(task);
     if (refForCopy.length) {
       actions.push(menuItem('复制垫图地址', () => {
         closeMenu();
@@ -1238,7 +1278,7 @@ function renderQueue() {
     if (firstRef) {
       thumb.classList.add('is-ref');
       const img = document.createElement('img');
-      img.src = refSrc(firstRef.url);
+      img.src = refSrc(firstRef);
       img.alt = '垫图';
       img.loading = 'lazy';
       img.decoding = 'async';
@@ -1269,13 +1309,37 @@ function renderQueue() {
   });
 }
 
-function addToQueue() {
-  const input = $('promptInput');
+/**
+ * 编辑区草稿 → 一条待发任务（= 线上契约 `intake::TaskInput` 的形状）。
+ *
+ * ⚠️ **顺序是语义**：`refs` 的数组顺序 = 上游参考图列表顺序 = 文本里 `[img=图片N]` 的 N，
+ *    唯一来源是 `draft.refs`（人拖出来的顺序）。这里**不许排序**：
+ *    原先按「芯片引用的在前」重排过一次，条里看到的顺序和发出去的不是一回事。
+ */
+function draftToTask() {
   const chips = window.PromptChips;
   // 输入框是**富文本**（含 `@` 芯片）⇒ 先序列化成 `@{id:label}` 串，再解析成纯文本。
   // 芯片在文本里的位置换成 `[img=图片N]`（N = 该图在**垫图条里的位次**）。
-  const resolved = chips.resolvePromptChips(chips.serializeDOM(input), draft.refs);
-  if (!resolved.text) return;
+  const prompt = chips.resolvePromptChips(chips.serializeDOM($('promptInput')), draft.refs).text;
+  return { prompt, model: draft.model, ratio: draft.ratio, size: draft.size, refs: draft.refs.map((ref) => ref.url) };
+}
+
+/**
+ * 入队（**唯一入口**）：编辑区、inbox 导入、JSONL 回填三条路都走它。
+ *
+ * ⚠️ 份数在这里展开：N 份 = N 条独立任务，且**每份一个独立 `refs` 数组** ——
+ *    共用同一个数组会让「改一条」联动全部。
+ */
+function enqueue(task, copies) {
+  for (let copy = 0; copy < copies; copy += 1) {
+    queue.push({ ...task, refs: [...task.refs] });
+  }
+}
+
+function addToQueue() {
+  const input = $('promptInput');
+  const task = draftToTask();
+  if (!task.prompt) return;
   // 数量**先校验再入队**，与「从 inbox 导入」的份数同一口径（`parseCopies`）：
   // 不夹到边界、也不静默按 1 发 —— 否则用户会以为「我设的生效了」。
   const copies = parseCopies($('copiesInput').value);
@@ -1283,21 +1347,7 @@ function addToQueue() {
     notice(`数量要填 1–${MAX_COPIES} 的整数，这条没有加入待发`);
     return;
   }
-  // ⚠️ **顺序是语义**：`refs` 的数组顺序 = 上游参考图列表顺序 = 文本里 `[img=图片N]` 的 N，
-  //    唯一来源是编辑区那条 `draft.refs`（人拖出来的顺序）。这里**不许再排序**：
-  //    原先按「芯片引用的在前」重排过一次，条里看到的顺序和发出去的不是一回事。
-  const refs = draft.refs.map((ref) => ({ url: ref.url, label: ref.label }));
-  // 数量 N = 同一条 push N 次，且**每份都是独立对象**（`refs` 各拷一份）——
-  // 共用引用会让「改一条」联动全部（与 `importFile` 的份数同一口径）。
-  for (let copy = 0; copy < copies; copy += 1) {
-    queue.push({
-      prompt: resolved.text,
-      model: draft.model,
-      ratio: draft.ratio,
-      size: draft.size,
-      refs: refs.map((ref) => ({ ...ref })),
-    });
-  }
+  enqueue(task, copies);
   // ⚠️ **不清空编辑框**：文字与垫图留着，只有人点删除才消失（需求 2）。
   //    代价：同一条再点发送会命中同一个 id，后端会明确拒绝并说明原因，不会静默重复。
   closeMentions();
@@ -1305,6 +1355,70 @@ function addToQueue() {
   renderQueue();
   syncComposerState(); // 输入框仍有内容 ⇒ 占位符隐藏、「发送」保持可用
   if (copies > 1) notice(`已加入待发 ${copies} 条`);
+}
+
+/**
+ * 一条看板任务 → 编辑区草稿的数据投影（**纯函数，不碰 DOM**）。
+ *
+ * 与 [`addToQueue`] 是反向的一对（编辑区 → 待发 / 看板 → 编辑区），
+ * 字段口径与卡片头部完全一致（都是 Rust 下发的那份）。
+ */
+function taskToDraft(task) {
+  return { urls: taskRefUrls(task), prompt: task.prompt || '', ...paramsOf(task) };
+}
+
+/**
+ * 整体替换编辑区草稿（垫图 / 提示词 / 模型 / 比例 / 尺寸）—— **"换一批内容"的唯一入口**。
+ *
+ * 谁在用：只有 `loadTaskIntoEditor`。人手动输入不走这里 —— 打字是浏览器自己管 DOM，
+ * 加一张 / 删一张 / 换顺序各走 `addRefs` / 删除键 / `commitRefOrder`，四种语义各一个入口。
+ *
+ * ⚠️ **不写回设置**（不调 `persistDraftDefaults`）：借一条任务的参数发一次，
+ *    不等于把下次启动的默认值也改掉。写回设置的唯一入口是三个 `change` 监听。
+ * ⚠️ 参数必须**重画下拉**（`renderParamSelect`）：这条的比例/尺寸可能不在候选里，
+ *    直接 `.value = x` 会静默跳回第一项（看着像"参数没带上"）。
+ */
+function applyDraft(next) {
+  const chips = window.PromptChips;
+  const input = $('promptInput');
+
+  // ① 垫图：清空后仍旧走唯一入口 [`addRefs`]（名字 / 去重 / 重绘都在里面）。
+  // ⚠️ 之后必须再重画一次：文生图任务没有垫图 ⇒ `addRefs` 一条都不会 push，
+  //    条带还挂着上一条任务的缩略图（图在、`draft.refs` 却是空的，发出去是文生图）。
+  draft.refs = [];
+  addRefs(next.urls || []);
+  renderRefs();
+  renderMentions();
+
+  // ② 参数走唯一写入口；模型失效时 `setParams` 会保持当前值，这里只补一句说明
+  //    （"模型没带上"和"它已改名/下架"是两件事，不说清就会被当成前者）。
+  if (next.model && !hasModel(next.model)) {
+    notice(`模型 ${next.model} 不在当前模型表里，沿用「${draft.model}」`);
+  }
+  setParams({ model: next.model, ratio: next.ratio, size: next.size });
+
+  // ③ 提示词：`[img=图片N]` 还原成芯片。逆操作在 `promptChips.js`，本文件不另写一份正则
+  //    （格式契约只有那一个出处）。缩略图走 `refSrc`：垫图是本机路径，裸路径当图片地址是破图。
+  const tokens = chips.inflatePromptChips(next.prompt, draft.refs);
+  const meta = new Map(draft.refs.map((ref) => [ref.id, { label: ref.label, url: refSrc(ref.url) }]));
+  input.replaceChildren(...chips.renderPromptToNodes(tokens, meta));
+  chips.normalizeChipSlots(input);
+
+  closeMentions();
+  syncComposerState(); // 占位符 +「发送」的可用性同一个判据
+  input.focus();
+}
+
+/**
+ * 「载入编辑区」：把一条任务当成**新输入**填回来，改一版再发。
+ *
+ * ⚠️ 只动前端草稿：不碰这条任务、不进待发队列、不花额度。
+ * ⚠️ 编辑区非空时先问一句 —— 被替换掉的是人刚写的东西，没有后悔药。
+ */
+async function loadTaskIntoEditor(task) {
+  const clean = draft.refs.length === 0 && window.PromptChips.serializeDOM($('promptInput')) === '';
+  if (!clean && !(await askConfirm('载入编辑区', '编辑区当前内容会被这一条替换。'))) return;
+  applyDraft(taskToDraft(task));
 }
 
 // ── 垫图 ─────────────────────────────────────────────────────────────
@@ -1332,7 +1446,7 @@ const pendingRefSaves = new Set();
 /**
  * `data:` 垫图落盘换成本机路径（同一张只落一次）。
  *
- * **所有入口共用这一个实现**：编辑区（`addRefs`）与导入队列（`toRefItems`）。
+ * **所有入口共用这一个实现**：编辑区（`addRefs`）与导入（`toRefUrls`）。
  * 各写一份的话，两处迟早有一处忘了换，发布时又炸。
  */
 async function saveRefImage(dataUrl) {
@@ -1344,21 +1458,29 @@ async function saveRefImage(dataUrl) {
 }
 
 /**
- * 一批垫图 url → 待发条目（`data:` 先落盘）。
+ * 一张垫图 url → 可提交的 url：`data:` 落成本机文件（同一张只落一次）。
  *
- * 只有「导入」这条入口用得到：编辑区走 `addRefs`（逐张异步 push，界面即时反馈）；
- * 导入是整批替换，等完再 push 更简单。
+ * **唯一换算点**：编辑区（`addRefs`）与导入（`toRefUrls`）都走这里。
+ * 各写一份的话，迟早有一处把裸 base64 直接塞进队列 —— 发布时整批超字符串上限，
+ * 或者换个分支就静默退化成文生图。
  */
-async function toRefItems(urls) {
-  const items = [];
-  for (const url of urls) {
-    // ⚠️ 空项**报错**，不静默跳过：给了空串说明上游没校验
-    //    （「没有垫图」的合法写法是省略 refs 字段，不是塞个空串）。
+async function toRefUrl(url) {
+  return url.startsWith('data:') ? saveRefImage(url) : url;
+}
+
+/**
+ * 一批垫图 url → 可提交的 url 数组（`data:` 先落盘）。
+ *
+ * ⚠️ 空项**报错**，不静默跳过：给了空串说明上游没校验
+ *    （「没有垫图」的合法写法是省略 refs 字段，不是塞个空串）。
+ */
+async function toRefUrls(urls) {
+  const out = [];
+  for (const url of urls || []) {
     if (!url) throw new Error('导入的 refs 里有空项');
-    const resolved = url.startsWith('data:') ? await saveRefImage(url) : url;
-    items.push({ url: resolved, label: refLabelOf(resolved, items.length + 1) });
+    out.push(await toRefUrl(url));
   }
-  return items;
+  return out;
 }
 
 /**
@@ -1381,7 +1503,7 @@ function addRefs(list) {
     // 命中缓存时 `saveRefImage` 内部直接返回 —— 这里不再先查一遍（同一件事两处判）。
     // 名字在落盘前算好：落盘后的文件名是内容哈希，界面上不该显示哈希。
     const label = refLabelOf(url, draft.refs.length + 1);
-    const saving = saveRefImage(url)
+    const saving = toRefUrl(url)
       .then((path) => {
         if (!pushRef(path, label)) notice('这张已经在垫图里了');
       })
@@ -1607,16 +1729,15 @@ let dismissedAtIndex = -1;
 let savedRange = null;
 let composing = false;
 
-/** 候选素材（本工具的素材池 = 已加的垫图）。 */
-function mentionAssets() {
-  return draft.refs.map((ref) => ({ id: ref.id, label: ref.label, url: ref.url }));
-}
-
-/** 按 `@` 后面已输入的字过滤（大小写不敏感；空 query = 全部）。 */
+/**
+ * `@` 候选 = 已加的垫图（本工具的素材池只有垫图），按 `@` 后面已输入的字过滤。
+ *
+ * 直接读 `draft.refs`：`{id,label,url}` 已经齐了，再包一层同名字段只是多一份拷贝。
+ */
 function mentionCandidates() {
-  const all = mentionAssets();
   const query = mentionQuery.trim().toLowerCase();
-  return query ? all.filter((item) => item.label.toLowerCase().includes(query)) : all;
+  if (!query) return draft.refs;
+  return draft.refs.filter((item) => item.label.toLowerCase().includes(query));
 }
 
 /**
@@ -1668,7 +1789,7 @@ function detectMention() {
 
   const before = (node.textContent || '').slice(0, range.startOffset);
   const found = window.PromptMention.detectMentionQuery(before);
-  if (!found.active || mentionAssets().length === 0) return closeMentions();
+  if (!found.active || draft.refs.length === 0) return closeMentions();
   if (found.atIndex === dismissedAtIndex) return; // Esc 关过的那个 `@` 不再重弹
 
   dismissedAtIndex = -1;
@@ -1874,6 +1995,16 @@ async function wireDropZone() {
 // ── 参数下拉（比例 / 尺寸）────────────────────────────────────────────
 
 /**
+ * 下拉候选里没有这个值就补进去。
+ *
+ * 来源可能是手改的 `.env`（如 `9:16`），也可能是历史任务带着的旧值 ——
+ * 不补的话 `<select>` 会静默跳回第一个，用户看到的是"设置丢了"。
+ */
+function ensureOption(values, value) {
+  if (value && !values.includes(value)) values.push(value);
+}
+
+/**
  * 把候选值画进一个 `<select>`，返回**实际生效**的值。
  *
  * 与「模型」下拉同一套规格（原生 `<select>`）：一条工具条上只该有一种参数控件。
@@ -1892,6 +2023,39 @@ function renderParamSelect(id, values, current) {
   return box.value;
 }
 
+/** 模型表里有没有这个别名（改过名 / 下架的历史任务要据此提示，而不是静默塞进去）。 */
+function hasModel(alias) {
+  return Boolean(alias) && models.some((item) => item.alias === alias);
+}
+
+/**
+ * 参数三件套（模型 / 比例 / 尺寸）→ `draft` + 三个下拉 —— **唯一写入口**。
+ *
+ * ⚠️ 三个下拉是**视图**，`draft` 才是值：`.value = x` 只在这里跟着 `draft` 改，
+ *    不许反过来"读下拉当真相"（原先 5 处各写一份 draft，其中两处还靠
+ *    `renderParamSelect` 的返回值回写 —— 值到底谁定的说不清）。
+ * ⚠️ `persist` 只给**人改下拉**用（下次启动沿用）。启动初始化、载入历史任务都是
+ *    "借用"一套参数发一次，不写回默认值 —— 否则看一眼旧任务，下次启动参数就被改了。
+ * ⚠️ 候选里没有的比例/尺寸先补进候选再画：直接 `.value = x` 会静默跳回第一项。
+ * ⚠️ 模型塞不进候选时**不动**（保持当前值）：`<select>` 会静默变成空，
+ *    界面上看着像"模型没带上"，而 `draft` 里却是个发不出去的别名。要不要提示由调用方决定。
+ */
+function setParams(params, { persist = false } = {}) {
+  if (params.model && hasModel(params.model)) {
+    draft.model = params.model;
+    $('modelSelect').value = params.model;
+  }
+  if (params.ratio) {
+    ensureOption(RATIOS, params.ratio);
+    draft.ratio = renderParamSelect('ratioSelect', RATIOS, params.ratio);
+  }
+  if (params.size) {
+    ensureOption(SIZES, params.size);
+    draft.size = renderParamSelect('sizeSelect', SIZES, params.size);
+  }
+  if (persist) persistDraftDefaults();
+}
+
 // ── 弹窗 ─────────────────────────────────────────────────────────────
 
 function openMask(id) { show($(id), true); }
@@ -1899,19 +2063,14 @@ function closeMask(id) { show($(id), false); }
 
 // ── 动作 ─────────────────────────────────────────────────────────────
 
-/** 待发 → JSONL 文本（每行一条，与 prompts.jsonl 同构）。 */
+/**
+ * 待发 → JSONL 文本（每行一条，与 prompts.jsonl 同构）。
+ *
+ * ⚠️ 不做字段挑选也**不许** `filter(Boolean)`：队列条目已经是契约形状（`intake::TaskInput`），
+ *    空 url 说明有条坏数据 —— 过滤掉等于把「少一张垫图」静默写进导出文件。
+ */
 function queueToJsonl() {
-  return queue.map((item) => {
-    const line = { prompt: item.prompt };
-    if (item.model) line.model = item.model;
-    if (item.ratio) line.ratio = item.ratio;
-    if (item.size) line.size = item.size;
-    // ⚠️ 不再 `filter(Boolean)`：空 url 说明队列里有一条坏数据，过滤掉
-    //    等于把它静默写进导出的 JSONL（少一张垫图，没人看得出来）。
-    const refs = (item.refs || []).map((ref) => ref.url);
-    if (refs.length) line.refs = refs;
-    return JSON.stringify(line);
-  }).join('\n');
+  return queue.map((item) => JSON.stringify(item)).join('\n');
 }
 
 /**
@@ -1965,14 +2124,14 @@ function openJsonlEditor() {
       }
       queue.length = 0;
       for (const task of result.tasks) {
-        queue.push({
+        // `validate_draft` 回来的就是 JSONL 形状（`ratio`/`size`）⇒ 只补一次落盘。
+        enqueue({
           prompt: task.prompt,
           model: task.model,
           ratio: task.ratio,
           size: task.size,
-          refs: await toRefItems(task.refs || []),
-          copies: 1,
-        });
+          refs: await toRefUrls(task.refs || []),
+        }, 1);
       }
       renderQueue();
       overlay.remove();
@@ -2014,15 +2173,9 @@ async function publish() {
   busy = true;
   renderQueue();
   try {
-    const payload = queue.map((item) => ({
-      prompt: item.prompt,
-      model: item.model,
-      ratio: item.ratio,
-      size: item.size,
-      // 后端收 `refs: string[]`（`intake::TaskInput`）；前端内部的 `{url,label}`
-      // 只活在界面上，不往契约里塞。
-      refs: (item.refs || []).map((ref) => ref.url),
-    }));
+    // 队列条目**就是**契约形状（`intake::TaskInput`）⇒ 只做一份快照，不做字段映射。
+    // 快照是必须的：`invoke` 之前要 `await` 落盘，这期间队列可能被追加。
+    const payload = queue.map((item) => ({ ...item, refs: [...item.refs] }));
     // 垫图可能还在落盘：等它们，否则这一批会**静默少图**（见 `addRefs`）。
     if (pendingRefSaves.size) await Promise.allSettled([...pendingRefSaves]);
     await invoke('publish_queue', { tasks: payload });
@@ -2038,9 +2191,7 @@ async function publish() {
     notice(`已提交 ${count} 条，正在排队`);
     await refreshBoard();
   } catch (error) {
-    $('boardNoticeText').textContent = `发布失败：${error}`;
-    show($('boardNotice'), true);
-    show($('boardMain'), false);
+    showBoardError(`发布失败：${error}`, true);
   } finally {
     busy = false;
     renderQueue();
@@ -2056,8 +2207,7 @@ async function stopRun() {
   try {
     await invoke('stop_run');
   } catch (error) {
-    $('boardNoticeText').textContent = `停止失败：${error}`;
-    show($('boardNotice'), true);
+    showBoardError(`停止失败：${error}`);
   }
   await refreshBoard();
 }
@@ -2105,11 +2255,11 @@ async function cancelAllTasks() {
  * 与「取消所有未完成任务」是两件事：这条**不停批次**（已结束的记录本来没人在跟），
  * 但它同样要重写整个 `state.jsonl` ⇒ 跑批中后端会拒（界面上菜单项已置灰）。
  *
- * 条数从 `lastTasks` 里数 —— 分组判据仍来自 Rust 下发的 `group`，前端不自己判状态。
+ * 条数从 `lastBoardData` 里数 —— 分组判据仍来自 Rust 下发的 `group`，前端不自己判状态。
  */
 async function clearFinishedTasks() {
   if (cancelAllBusy) return;
-  const count = lastTasks.filter((task) => task.group === 'finished').length;
+  const count = (lastBoardData?.tasks || []).filter((task) => task.group === 'finished').length;
   if (count === 0) {
     // 后端也会返回 0，但那时候弹确认框只是让人白点一次「确定」。
     notice('没有已完成的任务可清空');
@@ -2259,29 +2409,10 @@ async function importFile(index) {
     // 归位失败会抛错，不会静默留下一份还能被再导入一次的文件（TD-05-12）。
     const tasks = await invoke('import_inbox', { file: file.path });
     for (const task of tasks) {
-      // ⚠️ 后端给的是 **url 字符串数组**，而队列里的 `refs` 必须是 `{id,url,label}`
-      //    （见文件头的约定）。原先直接塞字符串 ⇒ 两个后果一起出现：
-      //    ① 待发缩略图取 `firstRef.url` 得 undefined ⇒ 一片破图；
-      //    ② 发布时 `.map((ref) => ref.url)` 全变 undefined ⇒ queue.jsonl 里
-      //       **refs 整段消失**，整批静默退化成文生图（垫图白垫，产品全靠猜）。
-      // `data:` 由 `toRefItems` 统一落盘换路径（与编辑区同一个实现）。
-      const refs = (await toRefItems(task.refs || [])).map((ref) => {
-        refSeq += 1;
-        return { id: `ref-${refSeq}`, url: ref.url, label: ref.label };
-      });
-      // 份数：同一条 push N 次，且**每份都是独立对象**（`refs` 也要各拷一份）——
-      // 共用引用会让「改一条」联动全部。
       // 重复行的 id 由后端 `parse_prompts` 按出现次序生成 `hash` / `hash-2` / `hash-3`…，
       // 所以 N 份 = N 个独立任务（N 张不同的图），不是「同一任务提交 N 次」。
-      for (let copy = 0; copy < copies; copy += 1) {
-        queue.push({
-          prompt: task.prompt,
-          model: task.model,
-          ratio: task.aspectRatio,
-          size: task.imageSize,
-          refs: refs.map((ref) => ({ ...ref })),
-        });
-      }
+      // `data:` 由 [`toRefUrls`] 统一落盘换路径（与编辑区同一个实现）。
+      enqueue({ prompt: task.prompt, ...paramsOf(task), refs: await toRefUrls(task.refs || []) }, copies);
     }
     renderQueue();
     const total = tasks.length * copies;
@@ -2320,22 +2451,13 @@ async function loadSettings() {
  * 手写一条提示词发出去还是 2K，他会认为设置没生效。
  */
 function applyDefaultSettings(settings) {
-  if (settings) {
-    // 比例可能是手改 `.env` 写进去的非常用值（如 9:16）：补进下拉候选，
-    // 否则下拉会跳回第一个，用户会以为设置丢了。
-    if (settings.defaultRatio && !RATIOS.includes(settings.defaultRatio)) {
-      RATIOS.push(settings.defaultRatio);
-    }
-    if (settings.defaultRatio) draft.ratio = settings.defaultRatio;
-    if (SIZES.includes(settings.defaultSize)) draft.size = settings.defaultSize;
-    if (settings.defaultModel && models.some((model) => model.alias === settings.defaultModel)) {
-      draft.model = settings.defaultModel;
-      $('modelSelect').value = draft.model;
-    }
-  }
-  // 无论有没有读到设置都要画一次：下拉不能是空白。
-  draft.ratio = renderParamSelect('ratioSelect', RATIOS, draft.ratio);
-  draft.size = renderParamSelect('sizeSelect', SIZES, draft.size);
+  // 无论有没有读到设置都要走一趟：三个下拉不能是空白。
+  // 尺寸/模型只认清单里的（后端能兜非法值，界面不该显示一个发不出去的值）。
+  setParams({
+    model: hasModel(settings?.defaultModel) ? settings.defaultModel : '',
+    ratio: settings?.defaultRatio || draft.ratio,
+    size: SIZES.includes(settings?.defaultSize) ? settings.defaultSize : draft.size,
+  });
 }
 
 /**
@@ -2382,10 +2504,8 @@ function renderDefaultSelects(value) {
   // 否则下拉会"跳回第一个"，看起来像设置丢了。
   const ratioBox = $('setDefaultRatio');
   clear(ratioBox);
-  const currentRatio = value.defaultRatio || draft.ratio;
-  const ratioChoices = RATIO_CHOICES.includes(currentRatio)
-    ? RATIO_CHOICES
-    : [...RATIO_CHOICES, currentRatio];
+  const ratioChoices = [...RATIO_CHOICES];
+  ensureOption(ratioChoices, value.defaultRatio || draft.ratio);
   for (const ratio of ratioChoices) {
     const option = el('option', '', ratio);
     option.value = ratio;
@@ -2503,7 +2623,7 @@ async function saveSettings() {
 
 // ── 启动 ─────────────────────────────────────────────────────────────
 
-async function loadModels(settings) {
+async function loadModels() {
   try {
     models = await invoke('list_models');
   } catch (error) {
@@ -2522,25 +2642,20 @@ async function loadModels(settings) {
     option.value = model.alias;
     select.appendChild(option);
   }
-  // 默认选**兜底模型**（设置里的 `defaultModel`），不是列表第一个 ——
-  // 列表第一个是 gpt-image-2-low，选中它会让「没动过下拉」的任务悄悄用上另一个模型。
-  // 兜底值由后端解析（缺键/非法值已在内置默认上兜过），前端不再写死模型名。
-  const preferred = settings?.defaultModel || models[0]?.alias || '';
-  draft.model = models.some((model) => model.alias === preferred)
-    ? preferred
-    : (models[0]?.alias ?? preferred);
-  select.value = draft.model;
-  select.addEventListener('change', () => {
-    draft.model = select.value;
-    persistDraftDefaults();
-  });
+  // 这里只保证下拉**不是空的**：先落到第一个可用模型，真正的默认值由
+  // `applyDefaultSettings` 从后端设置里应用（同一个值不该在两个函数里各定一次）。
+  setParams({ model: models[0]?.alias ?? '' });
 }
 
 window.addEventListener('DOMContentLoaded', async () => {
-  // 设置先读：模型下拉的初值与比例/尺寸的初值都由它决定（兜底参数的唯一来源在后端）。
+  // 设置先读：三个参数的初值都来自它（兜底参数的唯一来源在后端）。
   const settings = await loadSettings();
-  await loadModels(settings);
+  await loadModels();
   applyDefaultSettings(settings);
+  // 人改下拉 = 借用一次不算，要让下次启动沿用 ⇒ 三个监听是**唯一**的写回点。
+  $('modelSelect').addEventListener('change', () => setParams({ model: $('modelSelect').value }, { persist: true }));
+  $('ratioSelect').addEventListener('change', () => setParams({ ratio: $('ratioSelect').value }, { persist: true }));
+  $('sizeSelect').addEventListener('change', () => setParams({ size: $('sizeSelect').value }, { persist: true }));
 
   // 提示词是**富文本**（contentEditable）⇒ 事件自己接（整套对齐 maomao 的 PromptInput）。
   //
@@ -2681,17 +2796,6 @@ window.addEventListener('DOMContentLoaded', async () => {
     if (promptInput.contains(event.target) || menu.contains(event.target)) return;
     closeMentions();
   });
-  // 比例 / 尺寸：与模型下拉同款 —— 改了就写进 `draft`。**不重画控件**
-  // （`<select>` 自己维护选中态，重画会把焦点抢走）。
-  $('ratioSelect').addEventListener('change', () => {
-    draft.ratio = $('ratioSelect').value;
-    persistDraftDefaults();
-  });
-  $('sizeSelect').addEventListener('change', () => {
-    draft.size = $('sizeSelect').value;
-    persistDraftDefaults();
-  });
-
   // 数量：上限取自 `MAX_COPIES`（HTML 里不写第二份 20）；说明文案同理，
   // 免得改了常量、界面还在说旧数字。
   const copiesInput = $('copiesInput');

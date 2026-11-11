@@ -200,6 +200,24 @@
     return { text: text.trim() };
   }
 
+  /**
+   * 反序列化（[`resolvePromptChips`] 的**逆操作**）：纯文本里的 `[img=图片N]` → 芯片 token。
+   *
+   * 用途只有一个：把一条历史任务「载入编辑区」时，让文本里的垫图引用重新变回可点的芯片。
+   *
+   * ⚠️ 与正向是**同一份 `refImages` 顺序**：N 是「第几张垫图」，不是「第几次出现」。
+   * ⚠️ N 越界（记录里垫图比文本引用的少）⇒ **原样保留** `[img=图片N]`：
+   *    静默改成空等于偷偷删掉人写的一段，他看不出来少了什么。
+   */
+  function inflatePromptChips(text, refImages) {
+    const refs = refImages || [];
+    return String(text || '').replace(/\[img=图片(\d+)\]/g, (match, digits) => {
+      const ref = refs[Number(digits) - 1];
+      if (!ref || !ref.id) return match;
+      return buildChipText(ref.id, ref.label || '');
+    });
+  }
+
   window.PromptChips = {
     promptChipRe,
     buildChipText,
@@ -212,5 +230,6 @@
     buildChipEl,
     renderPromptToNodes,
     resolvePromptChips,
+    inflatePromptChips,
   };
 })();
