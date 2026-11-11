@@ -48,7 +48,7 @@ use serde::{Deserialize, Serialize};
 use crate::lovart::prompt::PromptTask;
 
 impl TaskRecord {
-    /// 记录 → 任务（**无损**：含已上传的垫图 URL）。
+    /// 记录 → 任务（**无损**：垫图路径一并带过去）。
     ///
     /// ── 为什么这件事必须在这里做 ──────────────────────────────────────
     /// 它是**派工的输入** —— 调度器按 id 处理已有记录时用它。
@@ -64,8 +64,9 @@ impl TaskRecord {
             aspect_ratio: self.aspect_ratio.clone(),
             image_size: self.image_size.clone(),
             line: self.line.unwrap_or(0),
-            // 垫图**已经是 CDN URL**（提交时上传过）⇒ 不需要 `ref_inputs`：
-            // 参考图解析那一步会因输入端为空而跳过，这些地址原样留着。
+            // `ref_inputs` 是**声明阶段**的原始输入（本机路径 / URL / `data:`），记录里不存它；
+            // 垫图的真相是下面的 `ref_files`（本机路径），CDN 地址在发送那一刻才现取。
+            // 留 `None` ⇒ 参考图解析那一步跳过，直接用 `ref_files`。
             ref_inputs: None,
             ref_files: self.ref_files.clone(),
         }
@@ -434,7 +435,7 @@ pub fn slots_in_use(state: &StateStore) -> usize {
         .count()
 }
 
-/// 把一条记录重置为待提交（重跑）。**保留 `ref_urls`** —— 重跑仍要带垫图。
+/// 把一条记录重置为待提交（重跑）。**保留 `ref_files`** —— 重跑仍要带垫图。
 ///
 /// 唯一实现：GUI 的「重跑这一条」与 CLI 的 `--retry-failed` 共用。
 pub fn reset_for_retry(store: &mut StateStore, id: &str) -> Result<TaskRecord, StateError> {
@@ -452,7 +453,7 @@ pub fn reset_for_retry(store: &mut StateStore, id: &str) -> Result<TaskRecord, S
             artifacts: clear(),
             files: clear(),
             error: clear(),
-            // 刻意不动 ref_urls —— 重跑仍要带垫图。
+            // 刻意不动 ref_files —— 重跑仍要带垫图。
             ..Default::default()
         },
     )

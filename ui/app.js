@@ -210,7 +210,7 @@ function boardSignature(data) {
       // ⚠️ `following` **必须进签名**：批次开始/结束时，任务状态一个字都没变，
       //    变的是「谁在被跟」。签名漏了它就等于进度条停不下来（结构没变 ⇒ 不重建 DOM）。
       // 垫图条数同理：换垫图重跑时状态可能原地不动，但卡片内容必须变。
-      return `${task.id}:${task.status}:${present}:${task.following ? 'f' : '-'}:${taskRefUrls(task).length}`;
+      return `${task.id}:${task.status}:${present}:${task.following ? 'f' : '-'}:${taskRefFiles(task).length}`;
     })
     .join('|');
   return [
@@ -713,26 +713,26 @@ async function confirmFlow(task) {
 }
 
 /**
- * 一条任务的垫图地址：`refFiles`（本机路径，永远有效）优先，老记录没有它才退回 CDN 的 `refUrls`。
+ * 一条任务的垫图：记录里的 `refFiles`（本机路径，**唯一真相**）。
  *
+ * ⚠️ 记录里**没有第二种来源**：CDN 地址是发送那一刻现取的产物，不落盘
+ *    （见 `engine/state.rs` 的 `TaskRecord::ref_files`）⇒ 这里不做任何回退。
  * ⚠️ **唯一出处**：看板签名、卡片缩略图、「复制垫图地址」、「载入编辑区」四处都读它。
- *    各自写一遍 `refFiles || refUrls` 时，迟早有一处忘了「CDN 是上传产物、会过期」这条前提，
- *    于是那条路又在界面上摆破图。
  */
-function taskRefUrls(task) {
-  return (task.refFiles && task.refFiles.length) ? task.refFiles : (task.refUrls || []);
+function taskRefFiles(task) {
+  return task.refFiles || [];
 }
 
 /**
- * Rust 任务 → 前端的参数三件套（`aspectRatio` / `imageSize` → `ratio` / `size`）。
+ * 看板记录 → 前端参数三件套（`aspectRatio` / `imageSize` → `ratio` / `size`）。
  *
- * ⚠️ **键名分叉的唯一换算点**：`get_state` / `import_inbox` 发 `aspectRatio`，
- *    而 `validate_draft` / `publish_queue` / JSONL 用 `ratio` —— 同一个 `PromptTask`
- *    在 `gui.rs` 里被投影了两遍。根治要把 Rust 那两份合成一份；在那之前，
- *    前端只准在这一处改名，别再散到各个调用点。
+ * ⚠️ **只用于「记录 → 草稿」这一个方向**。记录（`state.jsonl` 的 `TaskRecord`）与
+ *    任务契约（`intake::TaskInput`、`prompts.jsonl`）是**两个 schema**：
+ *    契约侧统一叫 `ratio`/`size`（`gui.rs::task_input_json` 一处投影），
+ *    记录侧仍是 `aspectRatio`/`imageSize`。除了这里，别处不许再改名。
  */
-function paramsOf(task) {
-  return { model: task.model, ratio: task.aspectRatio, size: task.imageSize };
+function paramsOf(record) {
+  return { model: record.model, ratio: record.aspectRatio, size: record.imageSize };
 }
 
 /**
@@ -812,16 +812,15 @@ function taskCard(task) {
   //    垫图选错，整张图就全错。所以它给到**卡片左上角、给大**，不加"垫图"两个字：
   //    结果图在下面整行宽、垫图在左上角是个方块，谁是谁一眼就分得出来。
   //
-  // 地址来自记录里的 `refUrls`（`TaskRecord::ref_urls`），不是每次现算：
+  // 路径来自记录里的 `refFiles`（`TaskRecord::ref_files`），不是每次现算：
   //    原先记录里只有指纹，指纹是单向哈希、**反推不出图** ⇒ 界面上连看一眼都做不到。
-  //    地址仍拿得到：悬停缩略图看 tooltip，或 ⋯ 菜单里的「复制垫图地址」。
-  // 没有 `refUrls` 就不渲染这一列（文生图不该多出一块空白）。
-  // 地址的取舍规则在 [`taskRefUrls`]：CDN 会过期、本地文件永远在。
-  const refUrls = taskRefUrls(task);
+  //    路径仍拿得到：悬停缩略图看 tooltip，或 ⋯ 菜单里的「复制垫图地址」。
+  // 没有垫图就不渲染这一列（文生图不该多出一块空白）。
+  const refFiles = taskRefFiles(task);
   const top = el('div', 'task-top');
-  if (refUrls.length) {
+  if (refFiles.length) {
     const refs = el('div', 'task-refs');
-    for (const url of refUrls) {
+    for (const url of refFiles) {
       const item = el('button', 'task-ref');
       item.type = 'button';
       item.title = `垫图：${url}\n（点击看大图，拖进垫图区可复用）`;
@@ -1014,7 +1013,7 @@ function moreButton(task, file) {
       void loadTaskIntoEditor(task);
     }));
     // 垫图地址：**"我需要能查"** 的出口 —— 复制走。优先本地路径（永远有效）。
-    const refForCopy = taskRefUrls(task);
+    const refForCopy = taskRefFiles(task);
     if (refForCopy.length) {
       actions.push(menuItem('复制垫图地址', () => {
         closeMenu();
@@ -1364,7 +1363,7 @@ function addToQueue() {
  * 字段口径与卡片头部完全一致（都是 Rust 下发的那份）。
  */
 function taskToDraft(task) {
-  return { urls: taskRefUrls(task), prompt: task.prompt || '', ...paramsOf(task) };
+  return { urls: taskRefFiles(task), prompt: task.prompt || '', ...paramsOf(task) };
 }
 
 /**
@@ -2411,8 +2410,9 @@ async function importFile(index) {
     for (const task of tasks) {
       // 重复行的 id 由后端 `parse_prompts` 按出现次序生成 `hash` / `hash-2` / `hash-3`…，
       // 所以 N 份 = N 个独立任务（N 张不同的图），不是「同一任务提交 N 次」。
-      // `data:` 由 [`toRefUrls`] 统一落盘换路径（与编辑区同一个实现）。
-      enqueue({ prompt: task.prompt, ...paramsOf(task), refs: await toRefUrls(task.refs || []) }, copies);
+      // ⚠️ 后端给的**就是契约形状**（`intake::TaskInput`）⇒ 只补一次 `data:` 落盘，
+      //    不做字段改名 —— 改名只出现在「记录 → 草稿」这一个方向（见 `paramsOf`）。
+      enqueue({ ...task, refs: await toRefUrls(task.refs || []) }, copies);
     }
     renderQueue();
     const total = tasks.length * copies;

@@ -34,7 +34,7 @@ use crate::lovart::connection::{
     load_dot_env, read_auto_confirm, reload_dot_env, resolve_connection, to_client_deps,
     update_env_keys, AUTO_CONFIRM_KEY,
 };
-use crate::lovart::prompt::{parse_prompts, ParseOptions, PromptDefaults};
+use crate::lovart::prompt::{parse_prompts, ParseOptions, PromptDefaults, PromptTask};
 use crate::run::build_status_json;
 
 /// `get_state` 的「没变就别重算」缓存。
@@ -749,20 +749,23 @@ fn prompts_json(path: &Path) -> Result<Value, String> {
     if !parsed.errors.is_empty() {
         return Err(parsed.errors.join("\n"));
     }
-    let tasks: Vec<Value> = parsed
-        .tasks
-        .iter()
-        .map(|task| {
-            json!({
-                "prompt": task.prompt,
-                "model": task.model,
-                "aspectRatio": task.aspect_ratio,
-                "imageSize": task.image_size,
-                "refs": task.ref_inputs.clone().unwrap_or_default(),
-            })
-        })
-        .collect();
-    Ok(Value::Array(tasks))
+    Ok(Value::Array(parsed.tasks.iter().map(task_input_json).collect()))
+}
+
+/// 一条解析出的任务 → 前端契约（键名与 `intake::TaskInput`、`prompts.jsonl` 一致）。
+///
+/// ⚠️ **唯一投影**：`import_inbox`（`prompts_json`）与 `validate_draft` 都从这里出。
+///    写成 `aspectRatio`/`imageSize` 就等于让前端为这两条命令各留一处改名 ——
+///    而记录（`TaskRecord`）用的是 `aspect_ratio`/`image_size`，那是**另一个**
+///    持久化 schema，不要跟着改。
+fn task_input_json(task: &PromptTask) -> Value {
+    json!({
+        "prompt": task.prompt,
+        "model": task.model,
+        "ratio": task.aspect_ratio,
+        "size": task.image_size,
+        "refs": task.ref_inputs.clone().unwrap_or_default(),
+    })
 }
 
 /// 导入一个提示词文件：**读 + 校验**（`inbox/` 里的还要归位），返回任务给前端。
@@ -789,20 +792,7 @@ fn prompts_json(path: &Path) -> Result<Value, String> {
 fn validate_draft(text: String) -> Result<Value, String> {
     let (defaults, _) = PromptDefaults::from_env();
     let parsed = parse_prompts(&text, &defaults, &ParseOptions::default());
-    let tasks: Vec<Value> = parsed
-        .tasks
-        .iter()
-        .map(|task| {
-            json!({
-                "prompt": task.prompt,
-                "model": task.model,
-                "ratio": task.aspect_ratio,
-                "size": task.image_size,
-                // 前端队列的 `refs` 是 url 字符串数组（见 app.js 文件头的约定）。
-                "refs": task.ref_inputs.clone().unwrap_or_default(),
-            })
-        })
-        .collect();
+    let tasks: Vec<Value> = parsed.tasks.iter().map(task_input_json).collect();
     Ok(json!({ "tasks": tasks, "errors": parsed.errors }))
 }
 
@@ -1724,6 +1714,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("建临时目录");
         dir
+    }
+
+    /// 任务契约的键名：`import_inbox` 与 `validate_draft` 必须发 `ratio`/`size`。
+    ///
+    /// 曾经一处发 `aspectRatio`/`imageSize`、另一处发 `ratio`/`size` —— 同一个
+    /// `PromptTask` 两个投影，前端只好为每条命令各留一处改名。
+    #[test]
+    fn task_input_json_uses_input_keys() {
+        let task = PromptTask {
+            id: "t".to_string(),
+            prompt: "p".to_string(),
+            model: "nano-bn-2".to_string(),
+            aspect_ratio: "3:4".to_string(),
+            image_size: "2K".to_string(),
+            line: 1,
+            ref_inputs: Some(vec!["C:/refs/a.png".to_string()]),
+            ref_files: None,
+        };
+        let value = task_input_json(&task);
+        assert_eq!(value["ratio"], json!("3:4"));
+        assert_eq!(value["size"], json!("2K"));
+        assert_eq!(value["refs"], json!(["C:/refs/a.png"]));
+        assert!(
+            value.get("aspectRatio").is_none(),
+            "记录 schema 的键名不该出现在任务契约里"
+        );
     }
 
     /// 一条只有必填字段的记录（= `state.jsonl` 的一行）。
