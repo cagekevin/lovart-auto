@@ -1357,17 +1357,19 @@ function addToQueue() {
 }
 
 /**
- * 一条看板任务 → 编辑区草稿的数据投影（**纯函数，不碰 DOM**）。
+ * 看板记录 → 任务契约（`intake::TaskInput`，与 `draftToTask` 同一个形状）。
  *
- * 与 [`addToQueue`] 是反向的一对（编辑区 → 待发 / 看板 → 编辑区），
- * 字段口径与卡片头部完全一致（都是 Rust 下发的那份）。
+ * ⚠️ 只做两件投影：垫图取 `refFiles`（本机路径）、参数键名换成 `ratio`/`size`
+ *    （`paramsOf`）。方向是**记录 → 契约**，不是"记录 → 编辑区" —— 编辑区怎么落，
+ *    由 [`applyDraft`] 决定。
  */
-function taskToDraft(task) {
-  return { urls: taskRefFiles(task), prompt: task.prompt || '', ...paramsOf(task) };
+function recordToTaskInput(task) {
+  return { prompt: task.prompt || '', ...paramsOf(task), refs: taskRefFiles(task) };
 }
 
 /**
- * 整体替换编辑区草稿（垫图 / 提示词 / 模型 / 比例 / 尺寸）—— **"换一批内容"的唯一入口**。
+ * 把一份任务契约（`TaskInput`）落成编辑区：垫图 / 提示词 / 模型 / 比例 / 尺寸 ——
+ * **"换一批内容"的唯一入口**，入参形状与 [`draftToTask`] 的输出完全一致。
  *
  * 谁在用：只有 `loadTaskIntoEditor`。人手动输入不走这里 —— 打字是浏览器自己管 DOM，
  * 加一张 / 删一张 / 换顺序各走 `addRefs` / 删除键 / `commitRefOrder`，四种语义各一个入口。
@@ -1385,7 +1387,7 @@ function applyDraft(next) {
   // ⚠️ 之后必须再重画一次：文生图任务没有垫图 ⇒ `addRefs` 一条都不会 push，
   //    条带还挂着上一条任务的缩略图（图在、`draft.refs` 却是空的，发出去是文生图）。
   draft.refs = [];
-  addRefs(next.urls || []);
+  addRefs(next.refs || []);
   renderRefs();
   renderMentions();
 
@@ -1417,7 +1419,7 @@ function applyDraft(next) {
 async function loadTaskIntoEditor(task) {
   const clean = draft.refs.length === 0 && window.PromptChips.serializeDOM($('promptInput')) === '';
   if (!clean && !(await askConfirm('载入编辑区', '编辑区当前内容会被这一条替换。'))) return;
-  applyDraft(taskToDraft(task));
+  applyDraft(recordToTaskInput(task));
 }
 
 // ── 垫图 ─────────────────────────────────────────────────────────────
@@ -2411,7 +2413,8 @@ async function importFile(index) {
       // 重复行的 id 由后端 `parse_prompts` 按出现次序生成 `hash` / `hash-2` / `hash-3`…，
       // 所以 N 份 = N 个独立任务（N 张不同的图），不是「同一任务提交 N 次」。
       // ⚠️ 后端给的**就是契约形状**（`intake::TaskInput`）⇒ 只补一次 `data:` 落盘，
-      //    不做字段改名 —— 改名只出现在「记录 → 草稿」这一个方向（见 `paramsOf`）。
+      //    不做字段改名 —— 改名只出现在「记录 → 契约」这一个方向（见 `paramsOf`）。
+      // 整对象入队的前提：`task_input_json` 只产出那 5 个键（Rust 侧有测试锁）。
       enqueue({ ...task, refs: await toRefUrls(task.refs || []) }, copies);
     }
     renderQueue();

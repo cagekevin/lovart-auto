@@ -758,6 +758,9 @@ fn prompts_json(path: &Path) -> Result<Value, String> {
 ///    写成 `aspectRatio`/`imageSize` 就等于让前端为这两条命令各留一处改名 ——
 ///    而记录（`TaskRecord`）用的是 `aspect_ratio`/`image_size`，那是**另一个**
 ///    持久化 schema，不要跟着改。
+/// ⚠️ **键集必须恰好是 `TaskInput` 那 5 个**：前端把返回的整个对象入队，多出一个键
+///    就会随「待发 → 导出 JSONL」写进文件，而 `parse_prompts` 对未知字段是 fail-loud。
+///    加字段前先想清楚它是契约的一部分还是只给界面看。
 fn task_input_json(task: &PromptTask) -> Value {
     json!({
         "prompt": task.prompt,
@@ -1739,6 +1742,18 @@ mod tests {
         assert!(
             value.get("aspectRatio").is_none(),
             "记录 schema 的键名不该出现在任务契约里"
+        );
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .expect("任务契约必须是对象")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["model", "prompt", "ratio", "refs", "size"],
+            "键集必须恰好是 TaskInput 的 5 个：前端会整对象入队，多一个键会让导出的 JSONL 被判「未知字段」"
         );
     }
 
