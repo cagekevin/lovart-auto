@@ -145,6 +145,15 @@ button { cursor: pointer; color: inherit; }
 
 /* ── 编辑态：整块换掉 ───────────────────────────────────────────── */
 .preset-editor { padding: var(--sp-1) var(--sp-4) 0; }
+/* 名字：单行标签，可留空（留空时列表用正文首行兜底） */
+.preset-name {
+  display: block; width: 100%; height: var(--h-ctl);
+  margin-bottom: var(--sp-2); padding: 0 10px;
+  border: 1px solid var(--line); border-radius: var(--r-md);
+  background: var(--bg-sub); color: var(--ink);
+  font-size: var(--fs-md); outline: none;
+}
+.preset-name:focus { border-color: var(--ink); background: var(--bg); }
 .preset-text {
   display: block; width: 100%; height: 148px;
   padding: var(--sp-2) 10px;
@@ -206,6 +215,7 @@ button { cursor: pointer; color: inherit; }
     <!-- 编辑态（新建 / 修改共用） -->
     <div id="viewEdit" hidden>
       <div class="preset-editor">
+        <input class="preset-name" id="presetName" type="text" placeholder="名字（留空就用首行）" />
         <textarea class="preset-text" id="presetText" placeholder="写一条提示词…"></textarea>
       </div>
       <div class="dialog-foot is-edit">
@@ -219,9 +229,9 @@ button { cursor: pointer; color: inherit; }
 
 <script>
 const presets = [
-  { id: 'p1', text: '人像胶片风：85mm 定焦，柔和侧逆光，肤质保留颗粒感，背景压暗，低饱和暖调，浅景深。' },
-  { id: 'p2', text: '猫在窗台上，午后光斑，逆光轮廓，浅色木地板，静物摄影，50mm，f/2.0。' },
-  { id: 'p3', text: '极简产品图：白色亚克力台面，单侧硬光 + 大面积反光板，45° 俯拍，纯色背景，无文字。' },
+  { id: 'p1', name: '人像胶片风', text: '人像胶片风：85mm 定焦，柔和侧逆光，肤质保留颗粒感，背景压暗，低饱和暖调，浅景深。' },
+  { id: 'p2', name: '窗台逆光', text: '猫在窗台上，午后光斑，逆光轮廓，浅色木地板，静物摄影，50mm，f/2.0。' },
+  { id: 'p3', name: '极简产品图', text: '白色亚克力台面，单侧硬光 + 大面积反光板，45° 俯拍，纯色背景，无文字。' },
 ];
 
 let editingId = null; // null = 新建
@@ -230,6 +240,11 @@ const $ = (id) => document.getElementById(id);
 function nameFrom(text) {
   const first = (text.split('\n').find((l) => l.trim()) || '').trim().replace(/\s+/g, ' ');
   return first.length > 16 ? first.slice(0, 16) + '…' : first;
+}
+
+/** 有名字用名字，没名字才从正文派生 */
+function displayName(preset) {
+  return preset.name || nameFrom(preset.text);
 }
 
 function icon(kind) {
@@ -268,12 +283,12 @@ function renderList() {
     pick.title = '取用这条预设';
     const name = document.createElement('span');
     name.className = 'preset-pick-name';
-    name.textContent = nameFrom(preset.text);
+    name.textContent = displayName(preset);
     const text = document.createElement('span');
     text.className = 'preset-pick-text';
     text.textContent = preset.text;
     pick.append(name, text);
-    pick.addEventListener('click', () => toast('已写入编辑区：「' + nameFrom(preset.text) + '」'));
+    pick.addEventListener('click', () => toast('已写入编辑区：「' + displayName(preset) + '」'));
 
     const edit = document.createElement('button');
     edit.className = 'preset-act';
@@ -306,6 +321,7 @@ function showList() {
   $('viewList').hidden = false;
   $('viewEdit').hidden = true;
   $('presetTitle').textContent = '提示词预设';
+  $('presetName').value = '';
   $('presetText').value = '';
   renderList();
 }
@@ -315,26 +331,32 @@ function openEditor(preset) {
   $('viewList').hidden = true;
   $('viewEdit').hidden = false;
   $('presetTitle').textContent = preset ? '修改预设' : '新建预设';
+  $('presetName').value = preset ? preset.name || '' : '';
   $('presetText').value = preset ? preset.text : '';
-  $('presetText').focus();
-  $('presetText').setSelectionRange($('presetText').value.length, $('presetText').value.length);
+  if (preset) {
+    $('presetText').focus();
+    $('presetText').setSelectionRange($('presetText').value.length, $('presetText').value.length);
+  } else {
+    $('presetName').focus(); // 新建先起名字
+  }
 }
 
 $('btnNew').addEventListener('click', () => openEditor(null));
 $('btnCancel').addEventListener('click', showList);
 
 $('btnSave').addEventListener('click', () => {
+  const name = $('presetName').value.replace(/\s+/g, ' ').trim();
   const text = $('presetText').value.trim();
   if (!text) { toast('内容不能为空', true); return; }
 
   if (editingId) {
     const preset = presets.find((item) => item.id === editingId);
-    if (preset) preset.text = text;
+    if (preset) { preset.name = name; preset.text = text; }
     showList();
     toast('已更新');
     return;
   }
-  presets.unshift({ id: 'p' + Date.now().toString(36), text });
+  presets.unshift({ id: 'p' + Date.now().toString(36), name, text });
   showList();
   toast('已保存');
 });
