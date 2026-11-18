@@ -943,12 +943,18 @@ function iconButton(symbolId, title, onClick) {
  * 而列表**每秒重建**，一分钟能挂上千个监听器，全都不回收。
  */
 let openMenu = null;
+/** 当前菜单的锚点。自绘下拉靠它回写 `aria-expanded`（关菜单时不回写就是"一直展开"）。 */
+let openAnchor = null;
 
 function closeMenu() {
-  if (openMenu) {
-    openMenu.remove();
-    openMenu = null;
+  if (!openMenu) return;
+  openMenu.remove();
+  openMenu = null;
+  // 只回写**本来就有**这个属性的按钮：⋯ 菜单不是展开式控件，硬塞一个 false 是假信息
+  if (openAnchor && openAnchor.hasAttribute('aria-expanded')) {
+    openAnchor.setAttribute('aria-expanded', 'false');
   }
+  openAnchor = null;
 }
 
 // 滚动或改窗口大小时关掉：`fixed` 菜单不会跟着锚点走，留着就是错位。
@@ -956,8 +962,13 @@ function closeMenu() {
 window.addEventListener('scroll', () => closeMenu(), true);
 window.addEventListener('resize', () => closeMenu());
 
-/** 把菜单摆在按钮下方；下方空间不够就翻到上方。水平右对齐按钮。 */
-function placeMenu(menu, button) {
+/**
+ * 把菜单摆在按钮下方；下方空间不够就翻到上方。
+ *
+ * `align`：`'right'` = 菜单右边缘贴按钮右边缘（⋯ 菜单，靠右的按钮）；
+ * `'left'` = 左边缘贴按钮左边缘（**下拉**，与原生 select 的候选列表同一个落点）。
+ */
+function placeMenu(menu, button, align = 'right') {
   const rect = button.getBoundingClientRect();
   const gap = 4;
   const height = menu.offsetHeight;
@@ -967,7 +978,15 @@ function placeMenu(menu, button) {
       ? rect.bottom + gap
       : Math.max(gap, rect.top - height - gap);
   menu.style.top = `${top}px`;
-  menu.style.right = `${Math.max(gap, window.innerWidth - rect.right)}px`;
+  if (align === 'left') {
+    // 右边放不下就往左挪（模型下拉在工具条最左，菜单比按钮宽）
+    const maxLeft = Math.max(gap, window.innerWidth - menu.offsetWidth - gap);
+    menu.style.left = `${Math.min(Math.max(gap, rect.left), maxLeft)}px`;
+    menu.style.right = 'auto';
+  } else {
+    menu.style.right = `${Math.max(gap, window.innerWidth - rect.right)}px`;
+    menu.style.left = 'auto';
+  }
 }
 
 function moreButton(task, file) {
@@ -1420,6 +1439,169 @@ async function loadTaskIntoEditor(task) {
   const clean = draft.refs.length === 0 && window.PromptChips.serializeDOM($('promptInput')) === '';
   if (!clean && !(await askConfirm('载入编辑区', '编辑区当前内容会被这一条替换。'))) return;
   applyDraft(recordToTaskInput(task));
+}
+
+// ── 提示词预设 ───────────────────────────────────────────────────────
+/**
+ * 提示词预设：**只存文本**（不含垫图 / 模型比例尺寸），存在 WebView 的 localStorage。
+ *
+ * ── 为什么存 localStorage 而不是 `var/presets.json` ─────────────────
+ * 预设是"手边常用的几条提示词"，属于纯前端草稿：CLI 用不上，也不需要跨进程同步。
+ * 为它加一对 Tauri 命令等于给「设置只有一份真相」开第二个存储口。
+ * 落盘位置是 WebView 的数据目录（Windows 上是
+ * `%LOCALAPPDATA%\<应用标识>\EBWebView\Default\Local Storage`）⇒
+ * **关窗口 / 重启 / 升级 / 换 exe 所在目录都不丢**；会丢的只有两种：
+ * 手动清站点数据（或删掉那个 AppData 目录）、改应用标识（数据目录跟着变）。
+ *
+ * ── 为什么存的是"降级后的纯文本" ────────────────────────────────────
+ * `@` 芯片序列化后是 `@{id:label}` 这种 token，它的意义**只取决于当前垫图还在不在**。
+ * 预设不带垫图 ⇒ 存 token 等于存一条取回来就指空的引用，而 `resolvePromptChips`
+ * 遇到找不到的 id 会**静默替换成空**（人看不出少了什么）。所以在保存这一刻就把芯片
+ * 换成它的名字文本 —— 预设里每条都是能原样发出去的纯文本。
+ */
+const PRESET_KEY = 'lovart.promptPresets.v1';
+/** 条数上限：这是"常用几条"，不是知识库；无上限只会让菜单长到翻不动。 */
+const MAX_PRESETS = 30;
+/** 名字长度上限（菜单一行放得下；超了截断加省略号，全文在 title 里）。 */
+const PRESET_NAME_MAX = 16;
+
+/** 读预设：**只收形状对的项** —— 手改过 / 旧版本残留不该让整个功能崩掉。 */
+function loadPresets() {
+  let raw = '';
+  try {
+    raw = window.localStorage.getItem(PRESET_KEY) || '';
+  } catch (error) {
+    // 存储被禁用（隐私模式 / 策略）时读就抛 ⇒ 必须说出来，不能当成"还没有预设"
+    notice(`读不到提示词预设（本地存储不可用）：${error}`);
+    return [];
+  }
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((item) => item && typeof item.name === 'string' && typeof item.text === 'string')
+      .slice(0, MAX_PRESETS);
+  } catch (error) {
+    notice(`提示词预设解析失败（存储内容被改坏了？）：${error}`);
+    return [];
+  }
+}
+
+/** 写预设：返回**是否真的写进去了** —— 存储不可用时不能假装成功。 */
+function savePresets(list) {
+  try {
+    window.localStorage.setItem(PRESET_KEY, JSON.stringify(list));
+    return true;
+  } catch (error) {
+    notice(`预设没保存成功：${error}`);
+    return false;
+  }
+}
+
+/**
+ * 编辑区的提示词**纯文本**（芯片降级成名字）—— 预设存的就是它。
+ * token 的替换用 `promptChips.js` 的正则工厂，本文件不另写一份格式知识。
+ */
+function composerPlainText() {
+  const chips = window.PromptChips;
+  return chips
+    .serializeDOM($('promptInput'))
+    .replace(chips.promptChipRe(), (_match, _id, label) => label)
+    .trim();
+}
+
+/** 预设名 = 提示词首行前 N 个字（不弹输入框：名字只是给人认的，不是标识）。 */
+function presetNameOf(text) {
+  const firstLine = (text.split('\n').find((line) => line.trim()) || '').trim().replace(/\s+/g, ' ');
+  return firstLine.length > PRESET_NAME_MAX ? `${firstLine.slice(0, PRESET_NAME_MAX)}…` : firstLine;
+}
+
+/**
+ * 存当前编辑区。
+ * 同名**覆盖**：名字取自文本本身 ⇒ 同一段提示词点两次必然同名，追加会让菜单里堆一堆一样的。
+ */
+function savePresetFromComposer() {
+  const text = composerPlainText();
+  if (!text) {
+    notice('编辑区是空的，没有可存的提示词');
+    return;
+  }
+  const name = presetNameOf(text);
+  const list = loadPresets();
+  const existing = list.findIndex((item) => item.name === name);
+  if (existing >= 0) {
+    list[existing] = { name, text };
+  } else {
+    if (list.length >= MAX_PRESETS) {
+      notice(`预设最多 ${MAX_PRESETS} 条，先删一条再存`);
+      return;
+    }
+    list.unshift({ name, text });
+  }
+  if (savePresets(list)) notice(existing >= 0 ? `已更新预设「${name}」` : `已存为预设「${name}」`);
+}
+
+/** 取用：只替换**输入框文本** —— 垫图与参数不动（预设里本来就没存它们）。 */
+async function applyPreset(preset) {
+  const chips = window.PromptChips;
+  const input = $('promptInput');
+  // 与「载入编辑区」同一个判据：非空就先问一句，被替换掉的是人刚写的东西
+  const clean = draft.refs.length === 0 && chips.serializeDOM(input) === '';
+  if (!clean && !(await askConfirm('取用预设', `编辑区当前内容会被「${preset.name}」替换。`))) return;
+  input.replaceChildren(...chips.renderPromptToNodes(preset.text, new Map()));
+  chips.normalizeChipSlots(input);
+  closeMentions();
+  syncComposerState(); // 占位符 +「发送」的可用性同一个判据
+  input.focus();
+}
+
+/** 画菜单。存完立刻重画 —— 不进菜单就看不到刚存的那条。 */
+function renderPresetMenu(menu, anchor) {
+  clear(menu);
+  menu.appendChild(
+    menuItem('存为预设（当前编辑区）', (event) => {
+      // 拦住冒泡：`document` 上那个全局 `closeMenu` 会把刚重画的菜单立刻关掉
+      event.stopPropagation();
+      savePresetFromComposer();
+      renderPresetMenu(menu, anchor);
+      // 条数变了高度也变 ⇒ 重新摆一次，否则翻到上方的菜单会走位
+      placeMenu(menu, anchor, 'left');
+    }),
+  );
+  menu.appendChild(el('div', 'menu-sep'));
+
+  const list = loadPresets();
+  if (list.length === 0) {
+    // 空列表也**显示一项**（灰着）：菜单一片空白会被当成"没打开"
+    menu.appendChild(menuItem('还没有预设', () => {}, false, true));
+    return;
+  }
+  for (const preset of list) {
+    const row = el('div', 'preset-row');
+    const pick = el('button', 'preset-pick', preset.name);
+    pick.type = 'button';
+    pick.title = preset.text; // 名字被截断时，悬停能看全文
+    pick.addEventListener('click', () => {
+      closeMenu();
+      void applyPreset(preset);
+    });
+
+    const remove = el('button', 'preset-del', '×');
+    remove.type = 'button';
+    remove.title = '删除这条预设';
+    remove.addEventListener('click', async () => {
+      const ok = await askConfirm('删除预设', `「${preset.name}」删除后不能恢复。`);
+      if (!ok) return;
+      // 以**存储里当前那份**为准重读再删：中间可能又存过新的
+      const next = loadPresets().filter((item) => item.name !== preset.name);
+      if (savePresets(next)) notice(`已删除预设「${preset.name}」`);
+    });
+
+    row.appendChild(pick);
+    row.appendChild(remove);
+    menu.appendChild(row);
+  }
 }
 
 // ── 垫图 ─────────────────────────────────────────────────────────────
@@ -1993,6 +2175,126 @@ async function wireDropZone() {
   }
 }
 
+// ── 工具条下拉（自绘）───────────────────────────────────────────────
+/**
+ * 工具条上四个控件（模型 / 比例 / 尺寸 / 预设）**全是自绘下拉**。
+ *
+ * ── 为什么不用原生 `<select>` ────────────────────────────────────────
+ * 候选列表由**系统绘制**（WebView2 走 OS 菜单）：字体、行高、圆角、高亮色一处也改
+ * 不了。四个控件里三个是原生的、一个是自绘的，摆在一行就是"两个物种"—— 用户会以为
+ * 自绘那个坏了。所以原生 `<select>` 退化成**纯数据模型**。
+ *
+ * ⚠️ 为什么留 `<select>`：值本来就靠 `select.value` 传（`setParams` 写、三个
+ *    `change` 监听读）。把数据模型一起换掉，等于"值和视图同时换"，所有读下拉的地方
+ *    都要重新审一遍 —— 那是另一件事。这里只换**看得见的那一层**。
+ */
+const SELECT_BUTTONS = {
+  modelSelect: 'btnModel',
+  ratioSelect: 'btnRatio',
+  sizeSelect: 'btnSize',
+};
+
+/** 按钮文字 = 当前选项 —— **投影**，真相仍是 `select.value`（根上还是 `draft`）。 */
+function syncSelectButton(selectId) {
+  const option = $(selectId).selectedOptions[0];
+  const button = $(SELECT_BUTTONS[selectId]);
+  button.textContent = option ? option.textContent : '';
+  // 宽度按内容收窄后长模型名会显示省略号 ⇒ 全文挂 title（与展开列表里看到的一致）
+  button.title = option ? option.textContent : '';
+}
+
+/** 三个一起同步：`setParams` 之后一次调用，避免每个调用点各写一遍。 */
+function syncSelectButtons() {
+  for (const selectId of Object.keys(SELECT_BUTTONS)) syncSelectButton(selectId);
+}
+
+/** 按 `<select>` 的选项画菜单。点一项 = 改值 + 派发 `change`（写回仍走那三个监听）。 */
+function buildSelectMenu(selectId, anchor) {
+  const select = $(selectId);
+  const menu = el('div', 'menu');
+  menu.setAttribute('role', 'listbox');
+  for (const option of Array.from(select.options)) {
+    const item = el('button', 'menu-item', option.textContent);
+    item.type = 'button';
+    item.setAttribute('role', 'option');
+    item.setAttribute('aria-selected', String(option.value === select.value));
+    item.addEventListener('click', () => {
+      closeMenu();
+      // 值没变就不派发：否则"点一下当前值"也会触发一次写设置
+      if (option.value !== select.value) {
+        select.value = option.value;
+        select.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      syncSelectButton(selectId);
+      // 焦点还给按钮：菜单已被移除，不还的话焦点掉到 body，键盘用户直接"失联"
+      anchor.focus();
+    });
+    menu.appendChild(item);
+  }
+  return menu;
+}
+
+/** 菜单内键盘：↑↓ 换焦点、Esc 收起。回车/空格是 `<button>` 自带的点击，不用管。 */
+function onSelectMenuKeydown(event, anchor) {
+  if (!openMenu) return;
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    closeMenu();
+    anchor.focus();
+    return;
+  }
+  if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+  const items = Array.from(openMenu.querySelectorAll('[role="option"]'));
+  if (!items.length) return;
+  event.preventDefault();
+  const index = items.indexOf(document.activeElement);
+  const step = event.key === 'ArrowDown' ? 1 : -1;
+  // `index === -1`（焦点不在项上）时从两端进：向下从第一项，向上从最后一项
+  const next = index < 0
+    ? (step > 0 ? 0 : items.length - 1)
+    : (index + step + items.length) % items.length;
+  items[next].focus();
+}
+
+function openSelectMenu(selectId, anchor) {
+  const wasOpen = openAnchor === anchor;
+  closeMenu();
+  if (wasOpen) return; // 再点一次 = 收起
+  const select = $(selectId);
+  if (!select.options.length) {
+    notice('这个下拉还没有可选值');
+    return;
+  }
+  const menu = buildSelectMenu(selectId, anchor);
+  menu.addEventListener('keydown', (event) => onSelectMenuKeydown(event, anchor));
+  document.body.appendChild(menu);
+  openMenu = menu;
+  openAnchor = anchor;
+  anchor.setAttribute('aria-expanded', 'true');
+  placeMenu(menu, anchor, 'left');
+  // 焦点落到**当前值**上：打开后直接上下键就能换，不用先 Tab 进去
+  const current = menu.querySelector('[aria-selected="true"]') || menu.firstElementChild;
+  if (current) current.focus();
+}
+
+/** 挂事件。⚠️ 点击必须拦冒泡：`document` 上的 `closeMenu` 会让它「开了立刻关」。 */
+function bindSelectButtons() {
+  for (const [selectId, buttonId] of Object.entries(SELECT_BUTTONS)) {
+    const anchor = $(buttonId);
+    anchor.addEventListener('click', (event) => {
+      event.stopPropagation();
+      openSelectMenu(selectId, anchor);
+    });
+    anchor.addEventListener('keydown', (event) => {
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        openSelectMenu(selectId, anchor);
+      }
+    });
+    syncSelectButton(selectId);
+  }
+}
+
 // ── 参数下拉（比例 / 尺寸）────────────────────────────────────────────
 
 /**
@@ -2054,6 +2356,9 @@ function setParams(params, { persist = false } = {}) {
     ensureOption(SIZES, params.size);
     draft.size = renderParamSelect('sizeSelect', SIZES, params.size);
   }
+  // 自绘按钮上的文字是 `select.value` 的**投影**：值改完统一刷一次，
+  // 免得每个调用点各记一遍（`loadModels` / `applyDefaultSettings` / `applyDraft` 都经过这里）。
+  syncSelectButtons();
   if (persist) persistDraftDefaults();
 }
 
@@ -2805,6 +3110,34 @@ window.addEventListener('DOMContentLoaded', async () => {
   copiesInput.max = String(MAX_COPIES);
   copiesInput.title = `数量：这条提示词入队几次（每份一个独立任务、一张不同的图，占同样多个并发槽位，上限 ${MAX_COPIES}）`;
   $('btnSend').addEventListener('click', addToQueue);
+
+  // 工具条三个下拉：原生 `<select>` 已退化成数据模型，看得见的是自绘按钮。
+  bindSelectButtons();
+
+  // 提示词预设：**一个按钮 + 弹出菜单**（菜单里含「存为预设」），复用的是任务卡片
+  // 那套 `.menu` / `placeMenu` / `openMenu` —— 只留一个菜单实例，同一时刻只开一个。
+  $('btnPresets').addEventListener('click', (event) => {
+    // 拦住冒泡：否则 `document` 上的 `closeMenu` 会让它「开了立刻关」
+    event.stopPropagation();
+    const anchor = event.currentTarget;
+    const wasOpen = openAnchor === anchor;
+    closeMenu();
+    if (wasOpen) return; // 再点一次 = 收起
+    const menu = el('div', 'menu preset-menu');
+    renderPresetMenu(menu, anchor);
+    // Esc 收起并还焦点（与三个自绘下拉同一套键盘约定）
+    menu.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      closeMenu();
+      anchor.focus();
+    });
+    document.body.appendChild(menu);
+    openMenu = menu;
+    openAnchor = anchor;
+    anchor.setAttribute('aria-expanded', 'true');
+    placeMenu(menu, anchor, 'left');
+  });
   syncComposerState();
 
   $('refPicker').addEventListener('change', (event) => {

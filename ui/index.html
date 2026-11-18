@@ -163,20 +163,33 @@
         </div>
 
         <div class="composer-bar">
+          <!-- ⚠️ 这四个控件（模型 / 比例 / 尺寸 / 预设）**全是自绘下拉**：
+               原生 `<select>` 的候选列表由系统绘制（WebView2 走 OS 菜单），字体 / 行高 /
+               圆角 / 高亮色一处也改不了 —— 摆在一行里就是"两个物种"。
+               所以 `<select>` 退化成**纯数据模型**（`.value` / `<option>` / `change` 照旧，
+               见 app.js 的 `SELECT_BUTTONS`），看得见的是 `.select-btn` + `.menu` 弹层。 -->
           <div class="bar-field">
-            <label class="bar-label" for="modelSelect">模型</label>
-            <select id="modelSelect"></select>
+            <label class="bar-label" for="btnModel">模型</label>
+            <select id="modelSelect" tabindex="-1" aria-hidden="true"></select>
+            <button class="select-btn" id="btnModel" aria-haspopup="listbox" aria-expanded="false"></button>
           </div>
           <!-- 比例 / 尺寸 = 与「模型」**同款下拉**（原先是一条工具条上并存
                分段按钮 + 下拉两种控件，选中反馈也不一样）。 -->
           <div class="bar-field">
-            <label class="bar-label" for="ratioSelect">比例</label>
-            <select class="select-short" id="ratioSelect"></select>
+            <label class="bar-label" for="btnRatio">比例</label>
+            <select id="ratioSelect" tabindex="-1" aria-hidden="true"></select>
+            <button class="select-btn" id="btnRatio" aria-haspopup="listbox" aria-expanded="false"></button>
           </div>
           <div class="bar-field">
-            <label class="bar-label" for="sizeSelect">尺寸</label>
-            <select class="select-short" id="sizeSelect"></select>
+            <label class="bar-label" for="btnSize">尺寸</label>
+            <select id="sizeSelect" tabindex="-1" aria-hidden="true"></select>
+            <button class="select-btn" id="btnSize" aria-haspopup="listbox" aria-expanded="false"></button>
           </div>
+          <!-- 提示词预设：**只存文本**（不含垫图 / 参数），存在 WebView 的 localStorage。
+               形态是**一个按钮 + 弹出菜单**（菜单里含「存为预设」），不是「下拉 + 保存」
+               两个控件：工具条只有一行，再多一个控件就会被顶到换行。 -->
+          <button class="select-btn" id="btnPresets" aria-haspopup="true" aria-expanded="false"
+            title="提示词预设：存下当前提示词 / 取回以前存的">预设</button>
           <!-- 右端：数量 + 发送。
                ⚠️ 两者都只是「加入待发」，真正花钱的是下面的「发布任务」——
                   所以这里不写「提交 / 发布」，否则用户会以为点一下就扣积分。

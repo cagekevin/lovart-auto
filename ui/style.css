@@ -53,6 +53,10 @@
   /* 面板头 / 工作台栏宽 */
   --head-h: 46px;
   --board-w: 396px;
+
+  /* 下拉箭头：`select` 与「预设」按钮**共用同一张图**
+   * （两处各写一份 data URI，迟早会在其中一处画歪）。 */
+  --chev: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='11' height='11' viewBox='0 0 12 12'><path d='M3 4.8L6 7.8 9 4.8' fill='none' stroke='%23a6a6ae' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/></svg>");
 }
 
 :root[data-theme="light"] {
@@ -932,7 +936,55 @@ button { cursor: pointer; color: inherit; }
   background: transparent;
 }
 
+/* 自绘下拉里"当前值"：一打开就看得出来现在选的是哪条（原生 `<select>` 自带高亮，
+   自绘必须自己给）。 */
+.menu-item[aria-selected="true"] {
+  background: var(--line-soft);
+  font-weight: 600;
+}
+
 .menu-sep { height: 1px; margin: var(--sp-1) 0; background: var(--line); }
+
+/* 提示词预设：一行 = **取用**（左边整块）+ **删除**（右边 ×）。
+   不能复用 `.menu-item`：那是 `<button>`，按钮里再套一个 × 按钮是非法 DOM
+   （点击会串到外层）。所以这一行是 div，两个按钮并列。 */
+.preset-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+.preset-pick {
+  flex: 1;
+  min-width: 0;
+  padding: var(--sp-1) var(--sp-2);
+  border: none;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--ink);
+  font-size: var(--fs-sm);
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.preset-pick:hover { background: var(--bg-hover); }
+
+.preset-del {
+  flex: none;
+  width: var(--h-btn-sm);
+  height: var(--h-btn-sm);
+  padding: 0;
+  border: none;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--ink-3);
+  font-size: var(--fs-lg);
+  line-height: 1;
+}
+
+.preset-del:hover { background: var(--bg-hover); color: var(--bad); }
 
 /* ══ 看大图 ════════════════════════════════════════════════════════ */
 
@@ -1104,10 +1156,13 @@ body.is-ref-pulling * { cursor: grabbing; user-select: none; }
 button.task-thumb { cursor: grab; }
 
 /* 查2：工具条上边线 —— 分隔「写什么」与「怎么生成」 */
+/* ⚠️ gap 是 `--sp-2`（8）而不是 16：这一行要放下「模型/比例/尺寸/预设 + 数量/发送」，
+   16 的间距 + 统一 148px 起跳的下拉会把最后一个控件顶到换行。
+   `flex-wrap: wrap` 保留作兜底 —— 真挤不下时换行也比**裁掉**控件好。 */
 .composer-bar {
   display: flex;
   align-items: center;
-  gap: var(--sp-4);
+  gap: var(--sp-2);
   flex-wrap: wrap;
   padding: var(--sp-3) var(--sp-4);
   border-top: 1px solid var(--line);
@@ -1274,7 +1329,7 @@ button.task-thumb { cursor: grab; }
 .bar-tail {
   display: flex;
   align-items: center;
-  gap: var(--sp-3);
+  gap: var(--sp-2);
   margin-left: auto;
 }
 
@@ -1376,7 +1431,8 @@ button.task-thumb { cursor: grab; }
 
 .ref-add:hover { border-color: var(--ink); color: var(--ink); }
 
-/* 下拉 */
+/* 下拉（原生 `<select>`：**只剩设置页在用**）。
+   工具条上的模型 / 比例 / 尺寸已换成自绘按钮，理由见下面 `.select-btn`。 */
 select {
   height: var(--h-ctl);
   min-width: 148px;
@@ -1394,17 +1450,68 @@ select {
   outline: none;
   appearance: none;
   cursor: pointer;
-  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='11' height='11' viewBox='0 0 12 12'><path d='M3 4.8L6 7.8 9 4.8' fill='none' stroke='%23a6a6ae' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+  background-image: var(--chev);
   background-repeat: no-repeat;
   background-position: right 9px center;
 }
 
 select:focus { border-color: var(--ink); }
 
-/* 比例 / 尺寸的下拉：**同一个 `select` 规格**，只是宽度按内容收窄。
-   全局 `select` 的 `min-width: 148px` 是给模型名留的（最长那条要放得下），
-   而比例/尺寸的值最多 4 个字，照搬会把工具条顶到换行。 */
-select.select-short { min-width: 84px; }
+/* 工具条上的原生下拉 = **纯数据模型**（值 / 选项 / `change` 事件照旧，见 app.js 的
+   `SELECT_BUTTONS`）。不参与布局：看得见的是紧挨着的 `.select-btn`。 */
+.bar-field select { display: none; }
+
+/* 自绘下拉（模型 / 比例 / 尺寸 / 预设）——**工具条上唯一的控件规格**。
+ *
+ * ── 为什么不用原生 `<select>` ────────────────────────────────────────
+ * 候选列表由**系统绘制**（WebView2 走 OS 菜单）：字体、行高、圆角、高亮色一处也
+ * 改不了 ⇒ 和自绘的「预设」菜单摆在一起就是两种东西。同一行控件长得不一样，
+ * 用户第一反应是"这个坏了"。
+ * ⚠️ 所以四个控件全部走"按钮 + `.menu` 弹层"，规格只有这一份。 */
+.select-btn {
+  height: var(--h-ctl);
+  padding: 0 var(--sp-5) 0 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background-color: var(--bg);
+  color: var(--ink);
+  font-size: var(--fs-sm);
+  line-height: 1;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  outline: none;
+  cursor: pointer;
+  background-image: var(--chev);
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+}
+
+.select-btn:hover { border-color: var(--ink); }
+
+.select-btn:focus-visible { border-color: var(--ink); }
+
+/* 宽度**各按内容定**，不按统一 148px 起跳（这一行还要塞数量 / 发送 / 预设）。
+   模型名最长的是 "GPT Image 2.6 Sunburst Medium"，放不下就省略号 ——
+   全文在展开的列表里看得到（`.menu` 按内容伸到 260px）。
+   比例最多 4 个字（16:9）、尺寸 2 个（2K），收到刚好放得下。 */
+#btnModel { width: 148px; }
+#btnRatio { width: 64px; }
+#btnSize { width: 54px; }
+
+/* 窗口窄到放不下四个标签时，标签让位（值本身就在控件里；`<label for>` 仍给无障碍名）。
+   ⚠️ 用「视觉隐藏」而不是 `display:none`：后者会把控件的可访问名一起删掉。 */
+@media (max-width: 1040px) {
+  .bar-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+}
 
 /* ══ 工作台：待发 ══════════════════════════════════════════════════ */
 
