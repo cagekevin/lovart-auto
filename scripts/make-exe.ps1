@@ -21,7 +21,12 @@
     跳过 `.ico` 重新生成（已有 `src-tauri/icons/icon.ico` 时可用）。
 
 .EXAMPLE
-    powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/make-exe.ps1
+    pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/make-exe.ps1
+
+.NOTES
+    必须用 `pwsh`（PowerShell 7），不能用 `powershell`（5.1）：
+    本文件是 UTF-8 **无 BOM**，5.1 按 GBK 解码 ⇒ 中文乱码、括号错位，
+    报 `Unexpected token '}'`（2026-11-18 实测）。7 默认按 UTF-8 读。
 #>
 [CmdletBinding()]
 param(

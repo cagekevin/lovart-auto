@@ -29,8 +29,11 @@ app:
 
 # ⚠️ 同上：改过 `ui/` 也必须走它（前端资源是编译期嵌进 exe 的）。
 #    需在 Windows 上、且 `make` 可用；否则直接跑 scripts/make-exe.ps1。
+# ⚠️ 必须用 `pwsh`（PowerShell 7），不能用 `powershell`（5.1）：
+#    脚本是 UTF-8 **无 BOM**，5.1 按 GBK 解码 ⇒ 中文全成乱码、括号错位，
+#    报 `Unexpected token '}'`（2026-11-18 实测）。7 默认按 UTF-8 读。
 win:
-	powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/make-exe.ps1
+	pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/make-exe.ps1
 
 clean-rs:
 	cd src-tauri && cargo clean

@@ -47,9 +47,12 @@ make app                    # → 仓库根目录下的 lovart.app
 失败时窗口停住，错误不会一闪而过。
 
 ```powershell
-.\scripts\build-win.bat                                                      # 双击等价
-powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/make-exe.ps1   # 或：make win
+.\scripts\build-win.bat                                                    # 双击等价
+pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/make-exe.ps1       # 或：make win
 ```
+
+> ⚠️ 必须是 `pwsh`（PowerShell 7），不能用 `powershell`（5.1）：脚本是 UTF-8 **无 BOM**，
+> 5.1 按 GBK 解码 ⇒ 中文乱码、括号错位，报 `Unexpected token '}'`（2026-11-18 实测）。
 
 它做三件事：从 `assets/icon.png` 生成 `src-tauri/icons/icon.ico` → 载入 MSVC 环境编译
 （前端资源同样是**编译期**嵌入，改过 `ui/` 必须重跑）→ 把 exe 拷到仓库根。

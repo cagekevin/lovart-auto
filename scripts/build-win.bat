@@ -39,7 +39,9 @@ rem （图标 → MSVC 环境 → cargo build --release → 拷到仓库根）�
 rem 它与本脚本**同目录**，所以用 `%~dp0` 直接拼文件名。
 :build
 echo [1/2] 编译并组装（首次约 2 分钟，之后更快）...
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0make-exe.ps1" %*
+rem 必须用 pwsh（PowerShell 7）：make-exe.ps1 是 UTF-8 无 BOM，
+rem 5.1 按 GBK 解码会报 `Unexpected token '}'`（2026-11-18 实测）。
+pwsh -NoProfile -ExecutionPolicy Bypass -File "%~dp0make-exe.ps1" %*
 if errorlevel 1 goto fail
 
 echo.
