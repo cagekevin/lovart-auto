@@ -37,6 +37,16 @@
   <symbol id="i-more" viewBox="0 0 24 24">
     <path d="M12 5h.01M12 12h.01M12 19h.01" stroke-width="3.4" />
   </symbol>
+  <!-- 预设列表的行内动作：铅笔 / 垃圾桶。
+       用图标不用"改 / 删"两个字：图标更安静，也不会像 × 那样被当成"关闭"。 -->
+  <symbol id="i-edit" viewBox="0 0 24 24">
+    <path d="M4 20h4L20 8l-4-4L4 16v4z" />
+    <path d="M14 6l4 4" />
+  </symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24">
+    <path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13" />
+    <path d="M10 11v6M14 11v6" />
+  </symbol>
 </svg>
 
 <header class="topbar">
@@ -69,11 +79,9 @@
         <button class="btn btn-sm btn-quiet" id="btnResume" hidden>接着查 0</button>
         <button class="btn btn-sm btn-stop" id="btnStop" disabled>停止</button>
         <button class="btn btn-sm btn-quiet" id="btnOpenOutput">打开输出文件夹</button>
-        <div class="menu-anchor">
-          <button class="icon-btn" id="btnBoardMore" title="更多">
-            <svg class="icon-btn-svg"><use href="#i-more" /></svg>
-          </button>
-        </div>
+        <button class="icon-btn" id="btnBoardMore" title="更多">
+          <svg class="icon-btn-svg"><use href="#i-more" /></svg>
+        </button>
       </div>
     </div>
 
@@ -166,30 +174,33 @@
           <!-- ⚠️ 这四个控件（模型 / 比例 / 尺寸 / 预设）**全是自绘下拉**：
                原生 `<select>` 的候选列表由系统绘制（WebView2 走 OS 菜单），字体 / 行高 /
                圆角 / 高亮色一处也改不了 —— 摆在一行里就是"两个物种"。
-               所以 `<select>` 退化成**纯数据模型**（`.value` / `<option>` / `change` 照旧，
-               见 app.js 的 `SELECT_BUTTONS`），看得见的是 `.select-btn` + `.menu` 弹层。 -->
+               所以 `<select>` 退化成**纯数据模型**（`.value` / `<option>` / `change` 照旧），
+               看得见的是 `.select-btn` + `.menu` 弹层。
+               ⚠️ 配对靠按钮上的 `data-select`（指向 select 的 id），JS 侧没有第二张表。 -->
           <div class="bar-field">
             <label class="bar-label" for="btnModel">模型</label>
             <select id="modelSelect" tabindex="-1" aria-hidden="true"></select>
-            <button class="select-btn" id="btnModel" aria-haspopup="listbox" aria-expanded="false"></button>
+            <button class="select-btn" id="btnModel" data-select="modelSelect"
+              aria-haspopup="listbox" aria-expanded="false"></button>
           </div>
           <!-- 比例 / 尺寸 = 与「模型」**同款下拉**（原先是一条工具条上并存
                分段按钮 + 下拉两种控件，选中反馈也不一样）。 -->
           <div class="bar-field">
             <label class="bar-label" for="btnRatio">比例</label>
             <select id="ratioSelect" tabindex="-1" aria-hidden="true"></select>
-            <button class="select-btn" id="btnRatio" aria-haspopup="listbox" aria-expanded="false"></button>
+            <button class="select-btn" id="btnRatio" data-select="ratioSelect"
+              aria-haspopup="listbox" aria-expanded="false"></button>
           </div>
           <div class="bar-field">
             <label class="bar-label" for="btnSize">尺寸</label>
             <select id="sizeSelect" tabindex="-1" aria-hidden="true"></select>
-            <button class="select-btn" id="btnSize" aria-haspopup="listbox" aria-expanded="false"></button>
+            <button class="select-btn" id="btnSize" data-select="sizeSelect"
+              aria-haspopup="listbox" aria-expanded="false"></button>
           </div>
-          <!-- 提示词预设：**只存文本**（不含垫图 / 参数），存在 WebView 的 localStorage。
-               形态是**一个按钮 + 弹出菜单**（菜单里含「存为预设」），不是「下拉 + 保存」
-               两个控件：工具条只有一行，再多一个控件就会被顶到换行。 -->
-          <button class="select-btn" id="btnPresets" aria-haspopup="true" aria-expanded="false"
-            title="提示词预设：存下当前提示词 / 取回以前存的">预设</button>
+          <!-- 提示词预设：打开一个面板（列表态挑一条用；新建 / 修改在编辑器态）。
+               不是下拉，所以 `aria-haspopup` 是 `dialog`，也没有 `aria-expanded`。 -->
+          <button class="select-btn" id="btnPresets" aria-haspopup="dialog"
+            title="提示词预设">预设</button>
           <!-- 右端：数量 + 发送。
                ⚠️ 两者都只是「加入待发」，真正花钱的是下面的「发布任务」——
                   所以这里不写「提交 / 发布」，否则用户会以为点一下就扣积分。
@@ -288,6 +299,37 @@
   </div>
 </div>
 
+<!-- ══ 提示词预设 ══
+     两态互斥：默认是**列表**（点一行 = 取用），新建 / 修改换到编辑器。
+     ⚠️ 面板**不读**编辑区（`#promptInput`）：存/改的文本一律来自这里的 textarea。 -->
+<div class="mask" id="maskPresets" hidden>
+  <div class="dialog dialog-mid" role="dialog" aria-modal="true" aria-labelledby="presetsTitle">
+    <div class="dialog-head">
+      <h2 class="dialog-title" id="presetsTitle">提示词预设</h2>
+      <button class="dialog-close" id="btnPresetClose" title="关闭（Esc）" aria-label="关闭">×</button>
+    </div>
+
+    <!-- 态一：列表 -->
+    <div id="presetListView">
+      <div class="preset-list" id="presetList"></div>
+      <div class="dialog-foot">
+        <button class="btn btn-sm btn-quiet" id="btnPresetNew">＋ 新建预设</button>
+      </div>
+    </div>
+
+    <!-- 态二：编辑器（新建 / 修改共用） -->
+    <div id="presetFormView" hidden>
+      <div class="preset-editor">
+        <textarea class="preset-text" id="presetText" placeholder="写一条提示词…"></textarea>
+      </div>
+      <div class="dialog-foot">
+        <button class="btn btn-sm btn-quiet" id="btnPresetCancel">取消</button>
+        <button class="btn btn-sm btn-primary" id="btnPresetSave">保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- ══ 设置 ══ -->
 <div class="mask" id="maskSettings" hidden>
   <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
@@ -365,6 +407,7 @@
 <input class="visually-hidden" id="refPicker" type="file" accept="image/*" multiple />
 
 <script src="promptChips.js"></script>
+<script src="presets.js"></script>
 <script src="promptMention.js"></script>
 <script src="app.js"></script>
 </body>

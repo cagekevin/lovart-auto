@@ -127,7 +127,14 @@
     return span;
   }
 
-  /** 反序列化：`@{id:label}` 文本 → Node[]（文本 + `<br>` + 芯片）。 */
+  /**
+   * 反序列化：`@{id:label}` 文本 → Node[]（文本 + `<br>` + 芯片）。
+   *
+   * `metaMap` = **当前还有哪些垫图**（`id → {label, url}`）。
+   * ⚠️ 没有 meta 的 token **当文字原样保留**，不做成芯片：芯片是"指向某张垫图"的引用，
+   *    指空的芯片在发送时会被 `resolvePromptChips` 静默换成空 —— 用户看不到自己少了什么。
+   *    传 `null` 就等于"这段文本里没有有效引用"（预设就是这么用的）。
+   */
   function renderPromptToNodes(text, metaMap) {
     const nodes = [];
     const pushChip = (chip) => {
@@ -152,8 +159,14 @@
       pushTextWithBreaks(text.slice(lastIndex, match.index));
       const id = match[1];
       const meta = metaMap ? metaMap.get(id) : undefined;
+      // 没有 meta ⇒ 这段 token 没有对应的垫图，**当文字原样放回**（见函数头注释）
+      if (!meta) {
+        pushTextWithBreaks(match[0]);
+        lastIndex = re.lastIndex;
+        continue;
+      }
       // label 以 metaMap（当前最新）为准，字符串里那个可能是旧的
-      const label = (meta && meta.label) || match[2];
+      const label = meta.label || match[2];
       let thumb = '';
       if (match[3]) {
         try {
@@ -162,7 +175,7 @@
           thumb = match[3];
         }
       }
-      if (!thumb && meta && meta.url) thumb = meta.url;
+      if (!thumb && meta.url) thumb = meta.url;
       pushChip(buildChipEl(id, label, thumb));
       lastIndex = re.lastIndex;
     }
@@ -218,6 +231,19 @@
     });
   }
 
+  /**
+   * 把一段文本落成编辑区 DOM —— **写提示词的唯一入口**（反序列化 + 芯片光标落点）。
+   *
+   * 谁在用：`applyDraft`（载入历史任务 / 预设）与「取用预设」。两处各自拼
+   * `renderPromptToNodes` + `normalizeChipSlots` 等于两份"怎么写编辑区"，
+   * 漏掉 `normalizeChipSlots` 的表现是"行首芯片点不进去"，很难看出来。
+   */
+  function writePrompt(root, text, metaMap) {
+    root.replaceChildren(...renderPromptToNodes(text, metaMap));
+    normalizeChipSlots(root);
+    return root;
+  }
+
   window.PromptChips = {
     promptChipRe,
     buildChipText,
@@ -227,6 +253,7 @@
     ensureCaretSlotBeforeChip,
     normalizeChipSlots,
     serializeDOM,
+    writePrompt,
     buildChipEl,
     renderPromptToNodes,
     resolvePromptChips,

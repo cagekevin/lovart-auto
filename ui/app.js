@@ -12,6 +12,10 @@
  *   · 显示/隐藏 → `hidden` 属性；
  *   · 选中态 → `classList`；
  *   · 进度 → 纯 CSS 动画（本来就没有真实进度可显示，见 style.css 的说明）。
+ *
+ * ⚠️ 唯一例外是**浮层坐标**：`placeMenu`（菜单）与 `renderMentions`（`@` 弹层）必须把
+ *    运行期量到的像素写进去 —— 位置本来就取决于按钮在哪、窗口多大，CSS 里写不出来。
+ *    这是"要算的东西算一次"，不是"用内联样式做样式"。
  */
 
 const { invoke } = window.__TAURI__.core;
@@ -950,7 +954,7 @@ function closeMenu() {
   if (!openMenu) return;
   openMenu.remove();
   openMenu = null;
-  // 只回写**本来就有**这个属性的按钮：⋯ 菜单不是展开式控件，硬塞一个 false 是假信息
+  // 只回写**本来就有**这个属性的按钮：想给纯图标按钮加 `aria-expanded` 的地方自己声明
   if (openAnchor && openAnchor.hasAttribute('aria-expanded')) {
     openAnchor.setAttribute('aria-expanded', 'false');
   }
@@ -989,13 +993,36 @@ function placeMenu(menu, button, align = 'right') {
   }
 }
 
+/**
+ * 打开一个浮层菜单 —— **挂载 + 定位 + 登记的唯一入口**。
+ *
+ * 三件事必须一起做，分开写就一定会漏（`⋯` 菜单曾经少做了定位与登记）：
+ * ① 挂到 `body`：祖先 `.panel-body` 是 `overflow: auto`，留在原地会被裁掉；
+ * ② 定位：`fixed` 的坐标只能等挂上去、量到真实尺寸才敢算（`placeMenu`）；
+ * ③ 登记 `openMenu` / `openAnchor` + `aria-expanded`：全局只允许一个浮层，
+ *    关的时候才知道该把 `aria-expanded` 回写给谁。
+ *
+ * ⚠️ 先藏一帧再定位：否则会在 (0,0) 上闪一下（菜单比按钮宽时尤其明显）。
+ */
+function showMenu(menu, anchor, align = 'right') {
+  closeMenu(); // 同一时刻只允许一个浮层
+  menu.style.visibility = 'hidden';
+  document.body.appendChild(menu);
+  placeMenu(menu, anchor, align);
+  menu.style.visibility = '';
+  openMenu = menu;
+  openAnchor = anchor;
+  // 只回写**声明过** `aria-expanded` 的锚点（与 `closeMenu` 对称）：
+  // 纯图标按钮（卡片 / 板级 ⋯）不是展开式控件，硬塞一个 true/false 是假信息。
+  if (anchor.hasAttribute('aria-expanded')) anchor.setAttribute('aria-expanded', 'true');
+  return menu;
+}
+
 function moreButton(task, file) {
-  const anchor = el('div', 'menu-anchor');
   const button = el('button', 'icon-btn');
   button.type = 'button';
   button.title = '更多操作';
   button.appendChild(svgIcon('i-more', ''));
-  anchor.appendChild(button);
 
   button.addEventListener('click', (event) => {
     // 必须拦住冒泡，否则立刻被全局那个 closeMenu 关掉
@@ -1087,16 +1114,11 @@ function moreButton(task, file) {
       for (const item of actions) menu.appendChild(item);
     }
 
-    // 浮层挂到 body：祖先 `.panel-body` 的 `overflow: auto` 裁不到它。
-    // 先藏一帧再定位，避免出现在 (0,0) 上闪一下。
-    menu.style.visibility = 'hidden';
-    document.body.appendChild(menu);
-    placeMenu(menu, button);
-    menu.style.visibility = '';
-    openMenu = menu;
+    // 挂载 + 定位 + 登记只在 `showMenu` 里做一次（那边注释写了为什么要一起做）
+    showMenu(menu, button);
   });
 
-  return anchor;
+  return button;
 }
 
 /**
@@ -1142,7 +1164,6 @@ function bindBoardMenu() {
   const button = $('btnBoardMore');
   if (!button) return;
   button.type = 'button';
-  const anchor = button.parentElement;
 
   button.addEventListener('click', (event) => {
     // 拦住冒泡，否则立刻被全局那个 closeMenu 关掉（与卡片 ⋯ 同一处理）。
@@ -1162,8 +1183,8 @@ function bindBoardMenu() {
       closeMenu();
       clearFinishedTasks();
     }, true, boardLive));
-    anchor.appendChild(menu);
-    openMenu = menu;
+    // 与卡片 ⋯ 同一个挂载点（`showMenu`）：不自己 append，免得再漏一次定位/登记
+    showMenu(menu, button);
   });
 }
 
@@ -1421,8 +1442,9 @@ function applyDraft(next) {
   //    （格式契约只有那一个出处）。缩略图走 `refSrc`：垫图是本机路径，裸路径当图片地址是破图。
   const tokens = chips.inflatePromptChips(next.prompt, draft.refs);
   const meta = new Map(draft.refs.map((ref) => [ref.id, { label: ref.label, url: refSrc(ref.url) }]));
-  input.replaceChildren(...chips.renderPromptToNodes(tokens, meta));
-  chips.normalizeChipSlots(input);
+  // 写编辑区只有一个入口（`chips.writePrompt`）：反序列化 + 光标落点一起做，
+  // 上一次"两处各写一遍"的代价是漏了 `normalizeChipSlots`，行首芯片点不进去。
+  chips.writePrompt(input, tokens, meta);
 
   closeMentions();
   syncComposerState(); // 占位符 +「发送」的可用性同一个判据
@@ -1436,172 +1458,167 @@ function applyDraft(next) {
  * ⚠️ 编辑区非空时先问一句 —— 被替换掉的是人刚写的东西，没有后悔药。
  */
 async function loadTaskIntoEditor(task) {
-  const clean = draft.refs.length === 0 && window.PromptChips.serializeDOM($('promptInput')) === '';
-  if (!clean && !(await askConfirm('载入编辑区', '编辑区当前内容会被这一条替换。'))) return;
+  if (!isComposerClean() && !(await askConfirm('载入编辑区', '编辑区当前内容会被这一条替换。'))) return;
   applyDraft(recordToTaskInput(task));
 }
 
-// ── 提示词预设 ───────────────────────────────────────────────────────
+// ── 提示词预设（界面侧）──────────────────────────────────────────────
 /**
- * 提示词预设：**只存文本**（不含垫图 / 模型比例尺寸），存在 WebView 的 localStorage。
+ * 预设的**形状 / 仓储 / 名字派生**在 `ui/presets.js`（`window.Presets`，纯函数）。
+ * 这里只做壳该做的事：翻译 `reason`、画两态、接线。
  *
- * ── 为什么存 localStorage 而不是 `var/presets.json` ─────────────────
- * 预设是"手边常用的几条提示词"，属于纯前端草稿：CLI 用不上，也不需要跨进程同步。
- * 为它加一对 Tauri 命令等于给「设置只有一份真相」开第二个存储口。
- * 落盘位置是 WebView 的数据目录（Windows 上是
- * `%LOCALAPPDATA%\<应用标识>\EBWebView\Default\Local Storage`）⇒
- * **关窗口 / 重启 / 升级 / 换 exe 所在目录都不丢**；会丢的只有两种：
- * 手动清站点数据（或删掉那个 AppData 目录）、改应用标识（数据目录跟着变）。
+ * ── 两态 ─────────────────────────────────────────────────────────────
+ * 列表态（默认）= "挑一条来用"；编辑态 = 新建 / 修改共用同一个 textarea。
+ * 状态只有**一个**对象：`presetEditor`
+ *   null             ⇒ 列表态
+ *   { id }           ⇒ 编辑态（`id === null` 表示新建）
+ * ⚠️ 不能只用 `editingId`：列表态和新建态都为"没有 id"，会串态。
  *
- * ── 为什么存的是"降级后的纯文本" ────────────────────────────────────
- * `@` 芯片序列化后是 `@{id:label}` 这种 token，它的意义**只取决于当前垫图还在不在**。
- * 预设不带垫图 ⇒ 存 token 等于存一条取回来就指空的引用，而 `resolvePromptChips`
- * 遇到找不到的 id 会**静默替换成空**（人看不出少了什么）。所以在保存这一刻就把芯片
- * 换成它的名字文本 —— 预设里每条都是能原样发出去的纯文本。
+ * ── 与编辑区的关系 ───────────────────────────────────────────────────
+ * **只写不读**：唯一接触点是 `applyPreset` 里的 `chips.writePrompt(..., null)`。
+ * 存/改的文本只来自面板的 textarea —— 编辑区只负责"装提示词"。
  */
-const PRESET_KEY = 'lovart.promptPresets.v1';
-/** 条数上限：这是"常用几条"，不是知识库；无上限只会让菜单长到翻不动。 */
-const MAX_PRESETS = 30;
-/** 名字长度上限（菜单一行放得下；超了截断加省略号，全文在 title 里）。 */
-const PRESET_NAME_MAX = 16;
+let presetEditor = null;
 
-/** 读预设：**只收形状对的项** —— 手改过 / 旧版本残留不该让整个功能崩掉。 */
-function loadPresets() {
-  let raw = '';
-  try {
-    raw = window.localStorage.getItem(PRESET_KEY) || '';
-  } catch (error) {
-    // 存储被禁用（隐私模式 / 策略）时读就抛 ⇒ 必须说出来，不能当成"还没有预设"
-    notice(`读不到提示词预设（本地存储不可用）：${error}`);
-    return [];
-  }
-  if (!raw) return [];
-  try {
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed
-      .filter((item) => item && typeof item.name === 'string' && typeof item.text === 'string')
-      .slice(0, MAX_PRESETS);
-  } catch (error) {
-    notice(`提示词预设解析失败（存储内容被改坏了？）：${error}`);
-    return [];
+/** `Presets` 的失败原因 → 给人看的一句话（**唯一的措辞出处**）。 */
+function presetMessage(result) {
+  switch (result.reason) {
+    case 'empty':
+      return '内容不能为空';
+    case 'missing':
+      return '这条预设已经不在存储里了';
+    case 'storage':
+      return `预设读写失败（本地存储不可用）：${result.error}`;
+    default:
+      return '预设操作失败';
   }
 }
 
-/** 写预设：返回**是否真的写进去了** —— 存储不可用时不能假装成功。 */
-function savePresets(list) {
-  try {
-    window.localStorage.setItem(PRESET_KEY, JSON.stringify(list));
-    return true;
-  } catch (error) {
-    notice(`预设没保存成功：${error}`);
-    return false;
-  }
-}
+function renderPresetList() {
+  const box = $('presetList');
+  clear(box);
 
-/**
- * 编辑区的提示词**纯文本**（芯片降级成名字）—— 预设存的就是它。
- * token 的替换用 `promptChips.js` 的正则工厂，本文件不另写一份格式知识。
- */
-function composerPlainText() {
-  const chips = window.PromptChips;
-  return chips
-    .serializeDOM($('promptInput'))
-    .replace(chips.promptChipRe(), (_match, _id, label) => label)
-    .trim();
-}
-
-/** 预设名 = 提示词首行前 N 个字（不弹输入框：名字只是给人认的，不是标识）。 */
-function presetNameOf(text) {
-  const firstLine = (text.split('\n').find((line) => line.trim()) || '').trim().replace(/\s+/g, ' ');
-  return firstLine.length > PRESET_NAME_MAX ? `${firstLine.slice(0, PRESET_NAME_MAX)}…` : firstLine;
-}
-
-/**
- * 存当前编辑区。
- * 同名**覆盖**：名字取自文本本身 ⇒ 同一段提示词点两次必然同名，追加会让菜单里堆一堆一样的。
- */
-function savePresetFromComposer() {
-  const text = composerPlainText();
-  if (!text) {
-    notice('编辑区是空的，没有可存的提示词');
+  const stored = window.Presets.list();
+  // 读失败：**只报事实**，不画"还没有预设" —— 那等于把"读不到"说成"没有"。
+  // （失败形状里没有 `list`，所以这里必须提前返回，不能顺手读空表。）
+  if (!stored.ok) {
+    notice(presetMessage(stored));
     return;
   }
-  const name = presetNameOf(text);
-  const list = loadPresets();
-  const existing = list.findIndex((item) => item.name === name);
-  if (existing >= 0) {
-    list[existing] = { name, text };
-  } else {
-    if (list.length >= MAX_PRESETS) {
-      notice(`预设最多 ${MAX_PRESETS} 条，先删一条再存`);
-      return;
-    }
-    list.unshift({ name, text });
-  }
-  if (savePresets(list)) notice(existing >= 0 ? `已更新预设「${name}」` : `已存为预设「${name}」`);
-}
-
-/** 取用：只替换**输入框文本** —— 垫图与参数不动（预设里本来就没存它们）。 */
-async function applyPreset(preset) {
-  const chips = window.PromptChips;
-  const input = $('promptInput');
-  // 与「载入编辑区」同一个判据：非空就先问一句，被替换掉的是人刚写的东西
-  const clean = draft.refs.length === 0 && chips.serializeDOM(input) === '';
-  if (!clean && !(await askConfirm('取用预设', `编辑区当前内容会被「${preset.name}」替换。`))) return;
-  input.replaceChildren(...chips.renderPromptToNodes(preset.text, new Map()));
-  chips.normalizeChipSlots(input);
-  closeMentions();
-  syncComposerState(); // 占位符 +「发送」的可用性同一个判据
-  input.focus();
-}
-
-/** 画菜单。存完立刻重画 —— 不进菜单就看不到刚存的那条。 */
-function renderPresetMenu(menu, anchor) {
-  clear(menu);
-  menu.appendChild(
-    menuItem('存为预设（当前编辑区）', (event) => {
-      // 拦住冒泡：`document` 上那个全局 `closeMenu` 会把刚重画的菜单立刻关掉
-      event.stopPropagation();
-      savePresetFromComposer();
-      renderPresetMenu(menu, anchor);
-      // 条数变了高度也变 ⇒ 重新摆一次，否则翻到上方的菜单会走位
-      placeMenu(menu, anchor, 'left');
-    }),
-  );
-  menu.appendChild(el('div', 'menu-sep'));
-
-  const list = loadPresets();
-  if (list.length === 0) {
-    // 空列表也**显示一项**（灰着）：菜单一片空白会被当成"没打开"
-    menu.appendChild(menuItem('还没有预设', () => {}, false, true));
+  if (stored.list.length === 0) {
+    box.appendChild(el('div', 'preset-empty', '还没有预设'));
     return;
   }
-  for (const preset of list) {
-    const row = el('div', 'preset-row');
-    const pick = el('button', 'preset-pick', preset.name);
+
+  for (const preset of stored.list) {
+    const row = el('div', 'preset-item');
+
+    // 整行 = 取用（不是"选中"）：点它就是把它写进编辑区
+    const pick = el('button', 'preset-pick');
     pick.type = 'button';
-    pick.title = preset.text; // 名字被截断时，悬停能看全文
-    pick.addEventListener('click', () => {
-      closeMenu();
-      void applyPreset(preset);
-    });
+    pick.title = '取用这条预设';
+    pick.appendChild(el('span', 'preset-pick-name', window.Presets.nameFrom(preset.text)));
+    // 预览被省略号截断，全文挂 title（名字本身就是首行截断，全文只能在这里看）
+    const preview = el('span', 'preset-pick-text', preset.text);
+    preview.title = preset.text;
+    pick.appendChild(preview);
+    pick.addEventListener('click', () => applyPreset(preset));
 
-    const remove = el('button', 'preset-del', '×');
-    remove.type = 'button';
-    remove.title = '删除这条预设';
-    remove.addEventListener('click', async () => {
-      const ok = await askConfirm('删除预设', `「${preset.name}」删除后不能恢复。`);
-      if (!ok) return;
-      // 以**存储里当前那份**为准重读再删：中间可能又存过新的
-      const next = loadPresets().filter((item) => item.name !== preset.name);
-      if (savePresets(next)) notice(`已删除预设「${preset.name}」`);
-    });
+    const edit = el('button', 'preset-act');
+    edit.type = 'button';
+    edit.title = '修改';
+    edit.setAttribute('aria-label', '修改');
+    edit.appendChild(svgIcon('i-edit', ''));
+    edit.addEventListener('click', () => openPresetEditor(preset));
+
+    const del = el('button', 'preset-act is-danger');
+    del.type = 'button';
+    del.title = '删除';
+    del.setAttribute('aria-label', '删除');
+    del.appendChild(svgIcon('i-trash', ''));
+    del.addEventListener('click', () => removePreset(preset));
 
     row.appendChild(pick);
-    row.appendChild(remove);
-    menu.appendChild(row);
+    row.appendChild(edit);
+    row.appendChild(del);
+    box.appendChild(row);
   }
+}
+
+/**
+ * 取用：库 → 编辑区的**唯一通道**。
+ *
+ * ⚠️ 先 `get(id)` 重读：列表是快照，这条可能已被删/改。
+ *    读不到 ⇒ 提示且**不关面板**（用户还能选别的）；写成功才关。
+ * ⚠️ 不读编辑区、不确认：点一行就是要用它。
+ */
+function applyPreset(preset) {
+  const fresh = window.Presets.get(preset.id);
+  if (!fresh.ok) {
+    notice(presetMessage(fresh));
+    return;
+  }
+  // metaMap = null：预设里是纯文本，没有"有效引用"，token 一律按文字落地
+  window.PromptChips.writePrompt($('promptInput'), fresh.preset.text, null);
+  closeMentions();
+  syncComposerState(); // 占位符 +「发送」可用性同一个判据
+  $('promptInput').focus();
+  closeMask('maskPresets');
+}
+
+function openPresetEditor(preset) {
+  presetEditor = { id: preset ? preset.id : null };
+  $('presetsTitle').textContent = preset ? '修改预设' : '新建预设';
+  const input = $('presetText');
+  input.value = preset ? preset.text : '';
+  show($('presetListView'), false);
+  show($('presetFormView'), true);
+  input.focus();
+  // 光标在末尾：改错字是常态，别全选（一敲就把整条替换掉）
+  input.setSelectionRange(input.value.length, input.value.length);
+}
+
+/** 回列表态（也用于"取消"）：丢弃编辑中的内容，重新从存储画一遍。 */
+function closePresetEditor() {
+  presetEditor = null;
+  $('presetsTitle').textContent = '提示词预设';
+  $('presetText').value = '';
+  show($('presetFormView'), false);
+  show($('presetListView'), true);
+  renderPresetList();
+}
+
+function savePresetForm() {
+  const text = $('presetText').value;
+  const editingId = presetEditor ? presetEditor.id : null;
+  const result = editingId
+    ? window.Presets.update(editingId, text)
+    : window.Presets.create(text);
+  if (!result.ok) {
+    notice(presetMessage(result));
+    return;
+  }
+  notice(editingId ? '已更新' : '已保存');
+  closePresetEditor();
+}
+
+/** 删除：无确认（预设是一段文本，重写很快）；列表是快照，按 id 删。 */
+function removePreset(preset) {
+  const result = window.Presets.remove(preset.id);
+  if (!result.ok) {
+    notice(presetMessage(result));
+    return;
+  }
+  renderPresetList();
+}
+
+/** 打开面板：**一律回列表态**（上次残留的编辑态不能带进来）。 */
+function openPresets() {
+  closeMenu();
+  closeMentions();
+  closePresetEditor();
+  openMask('maskPresets');
+  $('btnPresetNew').focus();
 }
 
 // ── 垫图 ─────────────────────────────────────────────────────────────
@@ -1939,6 +1956,19 @@ function syncComposerState() {
   $('btnSend').disabled = empty;
 }
 
+/**
+ * 编辑区是否**干净**（没垫图、也没文字）。
+ *
+ * 只有一个用途：**替换前要不要问一句**（载入编辑区 / 取用预设）。
+ *
+ * ⚠️ 与上面 `syncComposerState` 的"是否为空"**不是同一个判据**：
+ *    「空」只看文本（决定占位符与发送键），「干净」还要求垫图为空。
+ *    两者都从序列化结果取，不看 `innerHTML`（只剩一个 `<br>` 时 HTML 非空、内容其实是空）。
+ */
+function isComposerClean() {
+  return draft.refs.length === 0 && window.PromptChips.serializeDOM($('promptInput')) === '';
+}
+
 /** 取「`@` 字符」的视口矩形（fixed 弹层的锚点）；找不到时退回光标矩形。 */
 function mentionAnchorRect() {
   const selection = window.getSelection();
@@ -2188,24 +2218,42 @@ async function wireDropZone() {
  *    `change` 监听读）。把数据模型一起换掉，等于"值和视图同时换"，所有读下拉的地方
  *    都要重新审一遍 —— 那是另一件事。这里只换**看得见的那一层**。
  */
-const SELECT_BUTTONS = {
-  modelSelect: 'btnModel',
-  ratioSelect: 'btnRatio',
-  sizeSelect: 'btnSize',
-};
+/**
+ * 配对方式：按钮上用 `data-select="<select 的 id>"` **自己声明**它属于哪个 `<select>`。
+ *
+ * ⚠️ 不在 JS 里再维护一张 `{ modelSelect: 'btnModel', … }` 的表：那是 HTML 的第二份真相，
+ *    加一个控件要改两处，漏一处就是"点了没反应、字也不显示"（而且很难查）。
+ */
+const SELECT_BTN_SELECTOR = '.select-btn[data-select]';
 
-/** 按钮文字 = 当前选项 —— **投影**，真相仍是 `select.value`（根上还是 `draft`）。 */
-function syncSelectButton(selectId) {
-  const option = $(selectId).selectedOptions[0];
-  const button = $(SELECT_BUTTONS[selectId]);
-  button.textContent = option ? option.textContent : '';
-  // 宽度按内容收窄后长模型名会显示省略号 ⇒ 全文挂 title（与展开列表里看到的一致）
-  button.title = option ? option.textContent : '';
+/** 模型别名 → 展示名（下拉里用的也是这个名字；找不到就原样显示，不吞值）。 */
+function modelNameOf(alias) {
+  return models.find((item) => item.alias === alias)?.name || alias;
 }
 
-/** 三个一起同步：`setParams` 之后一次调用，避免每个调用点各写一遍。 */
+/**
+ * 按钮文字 = **`draft` 的投影**。
+ *
+ * ⚠️ 不从 `select.selectedOptions[0]` 回读：那是"读视图画视图"。`<select>` 只承担两件事
+ *    —— 存选项表（给菜单画）和派发 `change`（`setParams` 的写回入口）；值的真相是 `draft`。
+ *    两个视图互相投影，一旦不同步，按钮上的名字和真正发出去的值就会各说各话。
+ */
+function syncSelectButton(anchor) {
+  const selectId = anchor.dataset.select;
+  const text =
+    selectId === 'modelSelect'
+      ? modelNameOf(draft.model)
+      : selectId === 'ratioSelect'
+        ? draft.ratio
+        : draft.size;
+  anchor.textContent = text;
+  // 宽度按内容收窄后长模型名会显示省略号 ⇒ 全文挂 title（与展开列表里看到的一致）
+  anchor.title = text;
+}
+
+/** 全部刷新：`setParams` 之后调一次，免得到处各记一遍。 */
 function syncSelectButtons() {
-  for (const selectId of Object.keys(SELECT_BUTTONS)) syncSelectButton(selectId);
+  for (const anchor of document.querySelectorAll(SELECT_BTN_SELECTOR)) syncSelectButton(anchor);
 }
 
 /** 按 `<select>` 的选项画菜单。点一项 = 改值 + 派发 `change`（写回仍走那三个监听）。 */
@@ -2225,7 +2273,7 @@ function buildSelectMenu(selectId, anchor) {
         select.value = option.value;
         select.dispatchEvent(new Event('change', { bubbles: true }));
       }
-      syncSelectButton(selectId);
+      syncSelectButton(anchor);
       // 焦点还给按钮：菜单已被移除，不还的话焦点掉到 body，键盘用户直接"失联"
       anchor.focus();
     });
@@ -2267,32 +2315,30 @@ function openSelectMenu(selectId, anchor) {
   }
   const menu = buildSelectMenu(selectId, anchor);
   menu.addEventListener('keydown', (event) => onSelectMenuKeydown(event, anchor));
-  document.body.appendChild(menu);
-  openMenu = menu;
-  openAnchor = anchor;
-  anchor.setAttribute('aria-expanded', 'true');
-  placeMenu(menu, anchor, 'left');
+  showMenu(menu, anchor, 'left');
   // 焦点落到**当前值**上：打开后直接上下键就能换，不用先 Tab 进去
   const current = menu.querySelector('[aria-selected="true"]') || menu.firstElementChild;
   if (current) current.focus();
 }
 
-/** 挂事件。⚠️ 点击必须拦冒泡：`document` 上的 `closeMenu` 会让它「开了立刻关」。 */
+/**
+ * 挂事件：扫 `data-select`，**不依赖任何 JS 侧的清单**（HTML 是配对关系的唯一出处）。
+ * ⚠️ 点击必须拦冒泡：`document` 上的 `closeMenu` 会让它「开了立刻关」。
+ */
 function bindSelectButtons() {
-  for (const [selectId, buttonId] of Object.entries(SELECT_BUTTONS)) {
-    const anchor = $(buttonId);
+  for (const anchor of document.querySelectorAll(SELECT_BTN_SELECTOR)) {
+    const selectId = anchor.dataset.select;
     anchor.addEventListener('click', (event) => {
       event.stopPropagation();
       openSelectMenu(selectId, anchor);
     });
     anchor.addEventListener('keydown', (event) => {
-      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
-        event.preventDefault();
-        openSelectMenu(selectId, anchor);
-      }
+      if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+      event.preventDefault();
+      openSelectMenu(selectId, anchor);
     });
-    syncSelectButton(selectId);
   }
+  syncSelectButtons();
 }
 
 // ── 参数下拉（比例 / 尺寸）────────────────────────────────────────────
@@ -3114,30 +3160,23 @@ window.addEventListener('DOMContentLoaded', async () => {
   // 工具条三个下拉：原生 `<select>` 已退化成数据模型，看得见的是自绘按钮。
   bindSelectButtons();
 
-  // 提示词预设：**一个按钮 + 弹出菜单**（菜单里含「存为预设」），复用的是任务卡片
-  // 那套 `.menu` / `placeMenu` / `openMenu` —— 只留一个菜单实例，同一时刻只开一个。
-  $('btnPresets').addEventListener('click', (event) => {
-    // 拦住冒泡：否则 `document` 上的 `closeMenu` 会让它「开了立刻关」
-    event.stopPropagation();
-    const anchor = event.currentTarget;
-    const wasOpen = openAnchor === anchor;
-    closeMenu();
-    if (wasOpen) return; // 再点一次 = 收起
-    const menu = el('div', 'menu preset-menu');
-    renderPresetMenu(menu, anchor);
-    // Esc 收起并还焦点（与三个自绘下拉同一套键盘约定）
-    menu.addEventListener('keydown', (event) => {
-      if (event.key !== 'Escape') return;
-      event.preventDefault();
-      closeMenu();
-      anchor.focus();
-    });
-    document.body.appendChild(menu);
-    openMenu = menu;
-    openAnchor = anchor;
-    anchor.setAttribute('aria-expanded', 'true');
-    placeMenu(menu, anchor, 'left');
+  // 提示词预设：一个按钮开面板（列表态 = 挑一条用；编辑器态 = 新建 / 修改）
+  $('btnPresets').addEventListener('click', openPresets);
+  $('btnPresetNew').addEventListener('click', () => openPresetEditor(null));
+  $('btnPresetClose').addEventListener('click', () => closeMask('maskPresets'));
+  $('btnPresetCancel').addEventListener('click', closePresetEditor);
+  $('btnPresetSave').addEventListener('click', savePresetForm);
+  // 点遮罩空白处 = 关面板
+  $('maskPresets').addEventListener('click', (event) => {
+    if (event.target === $('maskPresets')) closeMask('maskPresets');
   });
+  // Esc：编辑态先回列表（丢弃未保存内容），列表态才关面板
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape' || $('maskPresets').hidden) return;
+    if (presetEditor) closePresetEditor();
+    else closeMask('maskPresets');
+  });
+
   syncComposerState();
 
   $('refPicker').addEventListener('change', (event) => {

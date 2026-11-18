@@ -1,0 +1,366 @@
+<!doctype html>
+<!--
+  提示词预设 · 界面草稿（mockup v2）
+  ⚠️ 不是 ui/ 里的实现：浏览器直接打开看，不参与打包。
+  令牌与 .dialog 规格照抄 ui/style.css。
+
+  结构决定：
+  · 默认态 = **只有列表**（点名字=用），因为默认任务是"挑一条"；
+  · 新建 / 修改 = **整块换成编辑器**，不把空 textarea 摆在列表上面；
+  · 行内动作 = 铅笔 / 垃圾桶（不用"改/删"两个字，也不用 ×，× 会被当成关闭）。
+-->
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8" />
+<title>提示词预设 · 界面草稿</title>
+<style>
+:root {
+  --r-sm: 6px; --r-md: 8px; --r-lg: 12px;
+  --fs-xs: 11px; --fs-sm: 12px; --fs-md: 13px; --fs-lg: 14px;
+  --h-ctl: 32px; --h-btn: 30px; --h-btn-sm: 26px;
+  --sp-1: 6px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 22px;
+
+  --bg: #ffffff;
+  --bg-sunken: #fafafa;
+  --bg-sub: #f4f4f5;
+  --bg-hover: #ececee;
+  --line: #e7e7e9;
+  --line-soft: #f1f1f3;
+  --ink: #18181b;
+  --ink-2: #6f6f78;
+  --ink-3: #a6a6ae;
+  --bad: #b91c1c;
+  --ok: #15803d;
+  --shadow-dialog: 0 14px 44px rgb(0 0 0 / 24%);
+  --mask: rgb(12 12 14 / 40%);
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg-sunken);
+  color: var(--ink);
+  font: var(--fs-md) / 1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+button, input, textarea { font-family: inherit; }
+button { cursor: pointer; color: inherit; }
+
+.mock-note {
+  position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
+  z-index: 10; padding: 6px 12px;
+  border: 1px dashed var(--line); border-radius: var(--r-sm);
+  background: #fff; color: var(--ink-2); font-size: var(--fs-xs); white-space: nowrap;
+}
+
+/* ── 遮罩 / 弹窗（同 ui/style.css）────────────────────────────── */
+.mask {
+  position: fixed; inset: 0; z-index: 50;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--mask);
+}
+.dialog {
+  width: 460px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--bg);
+  box-shadow: var(--shadow-dialog);
+  overflow: hidden;
+}
+
+/* 标题栏：标题 + ×（× 只负责关，不承担"取消编辑"） */
+.dialog-head {
+  display: flex; align-items: center; gap: var(--sp-2);
+  padding: var(--sp-4) var(--sp-4) var(--sp-3);
+}
+.dialog-title { margin: 0; font-size: var(--fs-lg); font-weight: 600; }
+.dialog-close {
+  margin-left: auto;
+  width: var(--h-btn-sm); height: var(--h-btn-sm); padding: 0;
+  border: none; border-radius: var(--r-sm);
+  background: transparent; color: var(--ink-3);
+  font-size: var(--fs-lg); line-height: 1;
+}
+.dialog-close:hover { background: var(--bg-hover); color: var(--ink); }
+
+/* ── 浏览态：列表 ───────────────────────────────────────────────── */
+.preset-list {
+  max-height: 56vh; overflow: auto;
+  padding: 0 var(--sp-2);
+  border-top: 1px solid var(--line);
+}
+
+.preset-item {
+  display: flex; align-items: center; gap: var(--sp-1);
+  border-bottom: 1px solid var(--line-soft);
+}
+.preset-item:last-child { border-bottom: 0; }
+.preset-item:hover { background: var(--bg-sub); }
+.preset-item:hover .preset-act { color: var(--ink-2); }
+
+/* 整行是"取用"按钮：两行文本（名字 / 内容预览），点哪儿都算 */
+.preset-pick {
+  flex: 1; min-width: 0;
+  display: block;
+  padding: 10px var(--sp-2);
+  border: none; background: transparent; text-align: left;
+}
+.preset-pick-name {
+  display: block;
+  font-size: var(--fs-md); font-weight: 500; color: var(--ink);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.preset-pick-text {
+  display: block; margin-top: 2px;
+  font-size: var(--fs-sm); color: var(--ink-3);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* 行内动作：常显（查8），默认很淡，hover 行时才提亮；图标无歧义 */
+.preset-act {
+  flex: none;
+  width: var(--h-btn-sm); height: var(--h-btn-sm); padding: 0;
+  border: none; border-radius: var(--r-sm);
+  background: transparent; color: var(--ink-3);
+  display: flex; align-items: center; justify-content: center;
+}
+.preset-act svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.preset-act:hover { background: var(--bg); color: var(--ink); }
+.preset-act.is-danger:hover { color: var(--bad); }
+
+.preset-empty {
+  padding: var(--sp-5) var(--sp-3);
+  color: var(--ink-3); font-size: var(--fs-sm); text-align: center;
+}
+
+/* ── 脚：只有一个动作（新建）。关闭用右上 ×，不重复第二个入口 ── */
+.dialog-foot {
+  display: flex; align-items: center; gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-4);
+  border-top: 1px solid var(--line);
+  background: var(--bg);
+}
+.dialog-foot.is-edit { justify-content: flex-end; }
+
+/* ── 编辑态：整块换掉 ───────────────────────────────────────────── */
+.preset-editor { padding: var(--sp-1) var(--sp-4) 0; }
+.preset-text {
+  display: block; width: 100%; height: 148px;
+  padding: var(--sp-2) 10px;
+  border: 1px solid var(--line); border-radius: var(--r-md);
+  background: var(--bg-sub); color: var(--ink);
+  font-size: var(--fs-md); line-height: 1.6;
+  outline: none; resize: vertical;
+}
+.preset-text:focus { border-color: var(--ink); background: var(--bg); }
+
+/* ── 按钮（同 .btn / .btn-sm / .btn-primary）────────────────────── */
+.btn {
+  height: var(--h-btn); padding: 0 var(--sp-3);
+  border: 1px solid var(--line); border-radius: var(--r-md);
+  background: var(--bg); color: var(--ink);
+  font-size: var(--fs-sm); font-weight: 500; white-space: nowrap;
+  display: inline-flex; align-items: center; justify-content: center; line-height: 1;
+}
+.btn:hover { background: var(--bg-sub); }
+.btn-sm { height: var(--h-btn-sm); padding: 0 10px; font-size: var(--fs-xs); border-radius: var(--r-sm); }
+.btn-primary { background: var(--ink); border-color: var(--ink); color: var(--bg); padding: 0 var(--sp-5); }
+.btn-primary:hover { background: var(--ink); opacity: 0.86; }
+.btn-quiet { border-color: transparent; background: transparent; color: var(--ink-2); }
+.btn-quiet:hover { background: var(--bg-sub); color: var(--ink); }
+.btn-plus { margin-right: 2px; font-size: var(--fs-lg); line-height: 1; color: var(--ink-3); }
+[hidden] { display: none !important; }
+
+.toast {
+  position: fixed; top: 64px; left: 50%; transform: translateX(-50%);
+  z-index: 60; padding: 6px 12px;
+  border: 1px solid var(--line); border-radius: var(--r-md);
+  background: var(--bg); box-shadow: var(--shadow-dialog);
+  font-size: var(--fs-sm); color: var(--ok);
+}
+</style>
+</head>
+<body>
+
+<div class="mock-note">界面草稿</div>
+
+<div class="mask">
+  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="presetTitle">
+
+    <div class="dialog-head">
+      <h2 class="dialog-title" id="presetTitle">提示词预设</h2>
+      <button class="dialog-close" title="关闭（Esc）" aria-label="关闭">×</button>
+    </div>
+
+    <!-- 浏览态 -->
+    <div id="viewList">
+      <div class="preset-list" id="presetList"></div>
+      <div class="dialog-foot">
+        <button class="btn btn-sm btn-quiet" id="btnNew">
+          <span class="btn-plus">＋</span>新建预设
+        </button>
+      </div>
+    </div>
+
+    <!-- 编辑态（新建 / 修改共用） -->
+    <div id="viewEdit" hidden>
+      <div class="preset-editor">
+        <textarea class="preset-text" id="presetText" placeholder="写一条提示词…"></textarea>
+      </div>
+      <div class="dialog-foot is-edit">
+        <button class="btn btn-sm btn-quiet" id="btnCancel">取消</button>
+        <button class="btn btn-sm btn-primary" id="btnSave">保存</button>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+const presets = [
+  { id: 'p1', text: '人像胶片风：85mm 定焦，柔和侧逆光，肤质保留颗粒感，背景压暗，低饱和暖调，浅景深。' },
+  { id: 'p2', text: '猫在窗台上，午后光斑，逆光轮廓，浅色木地板，静物摄影，50mm，f/2.0。' },
+  { id: 'p3', text: '极简产品图：白色亚克力台面，单侧硬光 + 大面积反光板，45° 俯拍，纯色背景，无文字。' },
+];
+
+let editingId = null; // null = 新建
+const $ = (id) => document.getElementById(id);
+
+function nameFrom(text) {
+  const first = (text.split('\n').find((l) => l.trim()) || '').trim().replace(/\s+/g, ' ');
+  return first.length > 16 ? first.slice(0, 16) + '…' : first;
+}
+
+function icon(kind) {
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  const path = document.createElementNS(ns, 'path');
+  path.setAttribute('d', kind === 'edit'
+    // 铅笔
+    ? 'M4 20h4L20 8l-4-4L4 16v4zM14 6l4 4'
+    // 垃圾桶
+    : 'M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13M10 11v6M14 11v6');
+  svg.appendChild(path);
+  return svg;
+}
+
+function renderList() {
+  const list = $('presetList');
+  list.replaceChildren();
+
+  if (presets.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'preset-empty';
+    empty.textContent = '还没有预设';
+    list.appendChild(empty);
+    return;
+  }
+
+  for (const preset of presets) {
+    const row = document.createElement('div');
+    row.className = 'preset-item';
+
+    const pick = document.createElement('button');
+    pick.className = 'preset-pick';
+    pick.type = 'button';
+    pick.title = '取用这条预设';
+    const name = document.createElement('span');
+    name.className = 'preset-pick-name';
+    name.textContent = nameFrom(preset.text);
+    const text = document.createElement('span');
+    text.className = 'preset-pick-text';
+    text.textContent = preset.text;
+    pick.append(name, text);
+    pick.addEventListener('click', () => toast('已写入编辑区：「' + nameFrom(preset.text) + '」'));
+
+    const edit = document.createElement('button');
+    edit.className = 'preset-act';
+    edit.type = 'button';
+    edit.title = '修改';
+    edit.setAttribute('aria-label', '修改');
+    edit.appendChild(icon('edit'));
+    edit.addEventListener('click', () => openEditor(preset));
+
+    const del = document.createElement('button');
+    del.className = 'preset-act is-danger';
+    del.type = 'button';
+    del.title = '删除';
+    del.setAttribute('aria-label', '删除');
+    del.appendChild(icon('trash'));
+    del.addEventListener('click', () => {
+      const at = presets.findIndex((item) => item.id === preset.id);
+      if (at >= 0) presets.splice(at, 1);
+      renderList();
+      toast('已删除');
+    });
+
+    row.append(pick, edit, del);
+    list.appendChild(row);
+  }
+}
+
+function showList() {
+  editingId = null;
+  $('viewList').hidden = false;
+  $('viewEdit').hidden = true;
+  $('presetTitle').textContent = '提示词预设';
+  $('presetText').value = '';
+  renderList();
+}
+
+function openEditor(preset) {
+  editingId = preset ? preset.id : null;
+  $('viewList').hidden = true;
+  $('viewEdit').hidden = false;
+  $('presetTitle').textContent = preset ? '修改预设' : '新建预设';
+  $('presetText').value = preset ? preset.text : '';
+  $('presetText').focus();
+  $('presetText').setSelectionRange($('presetText').value.length, $('presetText').value.length);
+}
+
+$('btnNew').addEventListener('click', () => openEditor(null));
+$('btnCancel').addEventListener('click', showList);
+
+$('btnSave').addEventListener('click', () => {
+  const text = $('presetText').value.trim();
+  if (!text) { toast('内容不能为空', true); return; }
+
+  if (editingId) {
+    const preset = presets.find((item) => item.id === editingId);
+    if (preset) preset.text = text;
+    showList();
+    toast('已更新');
+    return;
+  }
+  presets.unshift({ id: 'p' + Date.now().toString(36), text });
+  showList();
+  toast('已保存');
+});
+
+// Esc：编辑态先退回列表，列表态才关面板
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'Escape') return;
+  if (!$('viewEdit').hidden) showList();
+  else document.querySelector('.mask').style.display = 'none';
+});
+
+let timer = null;
+function toast(message, bad) {
+  let box = document.querySelector('.toast');
+  if (!box) {
+    box = document.createElement('div');
+    box.className = 'toast';
+    document.body.appendChild(box);
+  }
+  box.textContent = message;
+  box.style.color = bad ? 'var(--bad)' : 'var(--ok)';
+  clearTimeout(timer);
+  timer = setTimeout(() => box.remove(), 2000);
+}
+
+showList();
+</script>
+</body>
+</html>

@@ -908,8 +908,6 @@ button { cursor: pointer; color: inherit; }
   box-shadow: var(--shadow-dialog);
 }
 
-.menu-anchor { position: relative; }
-
 .menu-item {
   display: flex;
   align-items: center;
@@ -944,47 +942,6 @@ button { cursor: pointer; color: inherit; }
 }
 
 .menu-sep { height: 1px; margin: var(--sp-1) 0; background: var(--line); }
-
-/* 提示词预设：一行 = **取用**（左边整块）+ **删除**（右边 ×）。
-   不能复用 `.menu-item`：那是 `<button>`，按钮里再套一个 × 按钮是非法 DOM
-   （点击会串到外层）。所以这一行是 div，两个按钮并列。 */
-.preset-row {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-1);
-}
-
-.preset-pick {
-  flex: 1;
-  min-width: 0;
-  padding: var(--sp-1) var(--sp-2);
-  border: none;
-  border-radius: var(--r-sm);
-  background: transparent;
-  color: var(--ink);
-  font-size: var(--fs-sm);
-  text-align: left;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.preset-pick:hover { background: var(--bg-hover); }
-
-.preset-del {
-  flex: none;
-  width: var(--h-btn-sm);
-  height: var(--h-btn-sm);
-  padding: 0;
-  border: none;
-  border-radius: var(--r-sm);
-  background: transparent;
-  color: var(--ink-3);
-  font-size: var(--fs-lg);
-  line-height: 1;
-}
-
-.preset-del:hover { background: var(--bg-hover); color: var(--bad); }
 
 /* ══ 看大图 ════════════════════════════════════════════════════════ */
 
@@ -1457,8 +1414,8 @@ select {
 
 select:focus { border-color: var(--ink); }
 
-/* 工具条上的原生下拉 = **纯数据模型**（值 / 选项 / `change` 事件照旧，见 app.js 的
-   `SELECT_BUTTONS`）。不参与布局：看得见的是紧挨着的 `.select-btn`。 */
+/* 工具条上的原生下拉 = **纯数据模型**（值 / 选项 / `change` 事件照旧）。
+   不参与布局：看得见的是紧挨着的 `.select-btn`（靠 `data-select` 与它配对）。 */
 .bar-field select { display: none; }
 
 /* 自绘下拉（模型 / 比例 / 尺寸 / 预设）——**工具条上唯一的控件规格**。
@@ -1591,6 +1548,34 @@ select:focus { border-color: var(--ink); }
 
 .dialog-wide { width: 520px; }
 
+/* 预设面板：比 `.dialog`（388）宽、比 `.dialog-wide`（520）窄 —— 列表两行文本刚好够 */
+.dialog-mid { width: 460px; }
+
+/* 带关闭键的标题栏（`.dialog-title` 原本自带 padding，在栏里要收掉） */
+.dialog-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-4) var(--sp-4) var(--sp-3);
+}
+
+.dialog-head .dialog-title { padding: 0; }
+
+.dialog-close {
+  margin-left: auto;
+  width: var(--h-btn-sm);
+  height: var(--h-btn-sm);
+  padding: 0;
+  border: none;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--ink-3);
+  font-size: var(--fs-lg);
+  line-height: 1;
+}
+
+.dialog-close:hover { background: var(--bg-hover); color: var(--ink); }
+
 .dialog-title {
   margin: 0;
   padding: var(--sp-5) var(--sp-5) 0;
@@ -1618,6 +1603,118 @@ select:focus { border-color: var(--ink); }
   padding: var(--sp-3) var(--sp-5) var(--sp-4);
   border-top: 1px solid var(--line);
 }
+
+/* ══ 提示词预设面板 ══════════════════════════════════════════════════ */
+
+/* 列表：一行 = 两行文本（名字 / 内容预览）+ 两个图标动作；**整行可点** = 取用 */
+.preset-list {
+  max-height: 56vh;
+  overflow: auto;
+  padding: 0 var(--sp-2);
+  border-top: 1px solid var(--line);
+}
+
+.preset-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.preset-item:last-child { border-bottom: 0; }
+
+.preset-item:hover { background: var(--bg-sub); }
+
+.preset-item:hover .preset-act { color: var(--ink-2); }
+
+.preset-pick {
+  flex: 1;
+  min-width: 0;
+  display: block;
+  padding: 10px var(--sp-2);
+  border: none;
+  background: transparent;
+  text-align: left;
+}
+
+.preset-pick-name {
+  display: block;
+  font-size: var(--fs-md);
+  font-weight: 500;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.preset-pick-text {
+  display: block;
+  margin-top: 2px;
+  font-size: var(--fs-sm);
+  color: var(--ink-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 行内动作：常显（查8），默认很淡，hover 整行时才提亮；图标不会有"关闭"的歧义 */
+.preset-act {
+  flex: none;
+  width: var(--h-btn-sm);
+  height: var(--h-btn-sm);
+  padding: 0;
+  border: none;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--ink-3);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.preset-act svg {
+  width: 13px;
+  height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.preset-act:hover { background: var(--bg); color: var(--ink); }
+
+.preset-act.is-danger:hover { color: var(--bad); }
+
+.preset-empty {
+  padding: var(--sp-5) var(--sp-3);
+  color: var(--ink-3);
+  font-size: var(--fs-sm);
+  text-align: center;
+}
+
+/* 编辑态：**整块换掉**列表（不是把空 textarea 摆在列表上面） */
+.preset-editor { padding: 0 var(--sp-4); }
+
+.preset-text {
+  display: block;
+  width: 100%;
+  height: 148px;
+  padding: var(--sp-2) 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg-sub);
+  color: var(--ink);
+  font-size: var(--fs-md);
+  line-height: 1.6;
+  outline: none;
+  resize: vertical;
+}
+
+.preset-text:focus { border-color: var(--ink); background: var(--bg); }
+
+/* 列表态的 footer 只有一个「新建」，靠左；编辑态的「取消 / 保存」用默认的靠右 */
+#presetListView .dialog-foot { justify-content: flex-start; }
 
 .form {
   display: grid;
