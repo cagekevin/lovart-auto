@@ -439,6 +439,52 @@ async function toggleAutoConfirm() {
   }
 }
 
+// ── 花积分模式（顶栏常驻）──────────────────────────────────────────────
+//
+// ⚠️ 与自动确认**不是**一回事：
+//   · 花积分 = **提交时**走 fast 通道（不排队、按张扣积分）；
+//   · 自动确认 = **轮询中**上游要求确认时，替不替人点。
+//   前者**不跳过**后者（`lovart/task.rs` 的 `pending_confirmation` 与模式无关）。
+//
+// 真源在后端（`get_state.spendMode`）；这里只做三件事：画、点击时调**唯一写命令**、
+// 用返回值立刻刷新（不等轮询 —— 轮询失败时 chip 会停在旧值，那是假象）。
+// 不落盘：后端不写 `.env`，重启恒关。
+
+let spendModeState = false;
+let spendModeBusy = false;
+
+function renderSpendMode(enabled) {
+  spendModeState = Boolean(enabled);
+  const chip = $('btnSpendMode');
+  if (!chip) return;
+  chip.setAttribute('aria-pressed', spendModeState ? 'true' : 'false');
+  $('spendModeLabel').textContent = spendModeState ? '花积分中' : '花积分关';
+}
+
+async function toggleSpendMode() {
+  // 整个流程（弹窗 + 命令）都上锁：连点会开两个弹窗 / 发两次写请求。
+  if (spendModeBusy) return;
+  spendModeBusy = true;
+  try {
+    // 关永不弹窗：安全方向不该有摩擦。
+    if (!spendModeState) {
+      const ok = await askConfirm(
+        '开启花积分模式？',
+        '开启后，每条任务提交时都会把服务端切成 fast 通道：不排队、很快出图，但按张扣积分。\n'
+          + '它不等于「自动确认」：上游要求确认时仍会停下来等你，除非也开着自动确认。\n'
+          + '不持久化：重启后回到关闭。',
+      );
+      if (!ok) return;
+    }
+    // 命令只改内存（服务端由每条提交前的 `ensure_mode` 投影），返回值就是新状态。
+    renderSpendMode(await invoke('set_spend_mode', { enabled: !spendModeState }));
+  } catch (error) {
+    notice(`切换花积分模式失败：${error.message || error}`);
+  } finally {
+    spendModeBusy = false;
+  }
+}
+
 /**
  * 轮询间隔。`REFRESH_MS` 是"上一轮**结束后**再等这么久"，不是 fixedRate。
  *
@@ -532,6 +578,7 @@ async function refreshBoardOnce() {
 
   // 顶栏开关状态（切换后另有命令返回值即时刷新）。
   renderAutoConfirm(data.autoConfirm, data.autoConfirmed);
+  renderSpendMode(data.spendMode);
 
   // **自动探测上游**（只读、同一批数据 60 秒最多探一次）：给「本地没跟的那几条」
   // 一个交代，而不是让用户（或维护者）自己拿密钥去上游问一遍。
@@ -3288,6 +3335,7 @@ window.addEventListener('DOMContentLoaded', async () => {
 
   bindBoardMenu();
   $('btnAutoConfirm').addEventListener('click', toggleAutoConfirm);
+  $('btnSpendMode').addEventListener('click', toggleSpendMode);
   // 设置的两个动作各自**内部**已经负责报错（`openSettings` / `saveSettings`），
   // 绑定处不再包第二层 —— 一个动作只留一个错误出口。
   $('btnSettings').addEventListener('click', openSettings);

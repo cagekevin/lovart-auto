@@ -41,7 +41,7 @@ use crate::engine::state::{
     StateStore, TaskRecord, TaskStatus,
 };
 
-use crate::lovart::client::{set_mode, ClientDeps};
+use crate::lovart::client::{set_mode, ClientDeps, Mode};
 use crate::lovart::contract::SendInput;
 use crate::lovart::errors::{classify_error, is_retryable_error, ErrorClass, ErrType, LovartError};
 use crate::lovart::project::{send_chat_with_project, ProjectCache};
@@ -74,7 +74,7 @@ const IDLE_POLL_MS: u64 = 1_000;
 ///
 /// 生产实现是 [`RealPorts`]，生产路径零变化。
 pub trait Ports: Send + Sync {
-    fn set_mode(&self, deps: &ClientDeps, unlimited: bool) -> Result<(), LovartError>;
+    fn set_mode(&self, deps: &ClientDeps, mode: Mode) -> Result<(), LovartError>;
     fn send(&self, deps: &ClientDeps, input: &SendInput) -> Result<(String, String), LovartError>;
     fn poll(
         &self,
@@ -115,8 +115,8 @@ impl RealPorts {
 }
 
 impl Ports for RealPorts {
-    fn set_mode(&self, deps: &ClientDeps, unlimited: bool) -> Result<(), LovartError> {
-        set_mode(deps, unlimited)
+    fn set_mode(&self, deps: &ClientDeps, mode: Mode) -> Result<(), LovartError> {
+        set_mode(deps, mode)
     }
 
     fn send(&self, deps: &ClientDeps, input: &SendInput) -> Result<(String, String), LovartError> {
@@ -467,9 +467,10 @@ struct Ctx {
     removed: std::collections::BTreeSet<String>,
     /// 全局提交闸门（间隔 + 429 熔断）。
     gate: SubmitGate,
-    /// 本批是否已经记过「排队模式已设置」—— **只影响日志**，不影响行为。
-    /// 每条提交前都会重设（见 [`Shared::ensure_mode`]），这里只是避免刷屏。
-    mode_logged: bool,
+    /// 本批**最后一次记录过的**生成模式（`None` = 还没记）—— **只影响日志**，不影响行为。
+    /// 每条提交前都会重设（见 [`Shared::ensure_mode`]），这里只是避免刷屏；
+    /// 存"哪种模式"而不是布尔：将来运行时切换，换一种模式要能再记一行。
+    mode_logged: Option<Mode>,
     /// 是否对「失败且无 threadId」的记录重置重跑（`--retry-failed` 的一次性快照）。
     retry_failed: bool,
     /// 会话封口时写报告；`None` = 不写。
@@ -590,6 +591,11 @@ struct Shared {
     on_session_end: Option<SessionEndFn>,
     /// 自动确认策略（全局开关 + 本批计数 + 本批许可）。
     auto_confirm: Arc<AutoConfirm>,
+    /// 花积分开关（与 `GuiState.spend_mode` 共享同一个原子量 ⇒ 切换立即生效）。
+    ///
+    /// ⚠️ 它**只**决定「提交前把服务端设成哪条通道」，不参与排队、不进 `Ctx`、
+    ///    不落盘。CLI 恒 `false`（命令行永远免费）。
+    spend_mode: Arc<AtomicBool>,
     /// 「垫图来源 → CDN 地址」的进程内缓存。
     ///
     /// 记录里只存本机路径；上传推迟到发送那一刻。200 条共用一张垫图时，
@@ -727,7 +733,8 @@ impl Shared {
         }
     }
 
-    /// 提交前把服务端模式设回排队（`unlimited`，免费）。**每条提交都调**。
+    /// 提交前设一次服务端模式 —— 参数按 `spend_mode` 开关**现算**（默认 [`Mode::Queue`]，免费）。
+    /// **每条提交都调**。
     ///
     /// ── 为什么不是「每批一次」────────────────────────────────────────
     /// 服务端模式是**账号级持久设置**，不是本进程的局部状态：手机、另一台电脑、
@@ -748,16 +755,23 @@ impl Shared {
     /// ── 失败 ────────────────────────────────────────────────────────
     /// 返回 `Err` ⇒ 调用方**不提交**（见 [`run_submit`]）。宁可不发，也不在未知模式下扣钱。
     fn ensure_mode(&self, deps: &ClientDeps, ports: &dyn Ports) -> Result<(), LovartError> {
+        // ⚠️ **生成模式唯一的读点**：提交前现读开关 ⇒ 切换对**下一条**立即生效。
+        //    `Mode::Fast` = 立刻出图、扣积分；`Mode::Queue` = 免费排队。
+        //    bool → Mode 只在 `Mode::from_spend` 一处（方向由单测锁住）。
+        let mode = Mode::from_spend(self.spend_mode.load(Ordering::Relaxed));
         // 网络 I/O 一律在锁外：这里只把结果搬进 `Ctx`。
-        ports.set_mode(deps, true)?;
+        ports.set_mode(deps, mode)?;
         let first = {
             let mut ctx = self.lock();
-            let first = !ctx.mode_logged;
-            ctx.mode_logged = true;
+            let first = ctx.mode_logged != Some(mode);
+            ctx.mode_logged = Some(mode);
             first
         };
         if first {
-            self.log("排队模式已设置（unlimited / 免费）—— 之后每条提交前都会重设");
+            self.log(match mode {
+                Mode::Queue => "排队模式已设置（unlimited / 免费）—— 之后每条提交前都会重设",
+                Mode::Fast => "⚡ 花积分模式已设置（fast / 扣积分）—— 之后每条提交前都会重设",
+            });
         }
         Ok(())
     }
@@ -1851,6 +1865,8 @@ pub struct SchedulerConfig {
     pub tuning: SchedulerTuning,
     pub retry_failed: bool,
     pub auto_confirm: Arc<AutoConfirm>,
+    /// 花积分开关（GUI 的顶栏 chip 写它）；CLI 恒 `false`（命令行永远免费）。
+    pub spend_mode: Arc<AtomicBool>,
     pub log: LogFn,
     pub ports: Option<Arc<dyn Ports>>,
     /// 会话封口回调（GUI 用）；CLI 传 `None`。
@@ -1894,6 +1910,7 @@ impl Scheduler {
             tuning,
             retry_failed,
             auto_confirm,
+            spend_mode,
             log,
             ports,
             on_session_end,
@@ -1932,7 +1949,7 @@ impl Scheduler {
             processing: std::collections::BTreeSet::new(),
             removed: std::collections::BTreeSet::new(),
             gate: SubmitGate::new(task_interval, rate_limit_backoff_base),
-            mode_logged: false,
+            mode_logged: None,
             retry_failed,
             report_file,
             session: SessionState::new(),
@@ -1958,6 +1975,7 @@ impl Scheduler {
             last_summary: Mutex::new(None),
             on_session_end,
             auto_confirm,
+            spend_mode,
             uploads: Mutex::new(BTreeMap::new()),
         });
 
@@ -2364,6 +2382,8 @@ pub fn run_scheduler(options: SchedulerOptions) -> Result<SchedulerSummary, Lova
         auto_confirm,
         log,
         ports,
+        // CLI 没有花积分开关：命令行永远免费（GUI / CLI 共用 `var/.lock`，不会并存）。
+        spend_mode: Arc::new(AtomicBool::new(false)),
         // CLI 自己打印摘要，不需要回调。
         on_session_end: None,
     })?;

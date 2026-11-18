@@ -53,7 +53,7 @@ use crate::engine::settings::{self, Settings};
 use crate::engine::state::{
     is_not_done, row as status_row, Action, StateStore, TaskRecord, TaskStatus, STATUS_TABLE,
 };
-use crate::lovart::client::{query_mode, set_mode, ClientDeps};
+use crate::lovart::client::{query_mode, set_mode, ClientDeps, Mode};
 use crate::lovart::connection::{load_dot_env, read_auto_confirm, resolve_connection, to_client_deps};
 use crate::lovart::models::MODEL_SPECS;
 use crate::lovart::prompt::{parse_prompts, ParseOptions, PromptDefaults, PromptTask};
@@ -1090,7 +1090,7 @@ pub fn main_with_args(argv: &[String]) -> Result<(), String> {
     //    这里只是**早失败**（凭据 / 网络不通就别开跑，省得跑一半才发现）；
     //    调度器在**每条提交前**还会再设一次（见 `scheduler::Shared::ensure_mode`），
     //    因为跑批可能持续十几个小时，中途随时会被别的设备改回 fast（扣积分）。
-    set_mode(&deps, true).map_err(|error| error.to_string())?;
+    set_mode(&deps, Mode::Queue).map_err(|error| error.to_string())?;
     let mode = query_mode(&deps).ok();
     log(&format!(
         "已切换为排队模式（unlimited）；当前模式回读：{}",

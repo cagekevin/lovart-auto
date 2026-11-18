@@ -58,8 +58,8 @@ struct ViewCache {
     elapsed: Vec<(String, Option<String>)>,
 }
 
-/// `get_state` 的指纹：**文件侧**（长度 + 修改时间）+ **内存侧**（看板 rev / 清空 / 自动确认）
-/// + **输出目录**。
+/// `get_state` 的指纹：**文件侧**（长度 + 修改时间）+ **内存侧**（看板 rev / 清空 / 自动确认 /
+/// 花积分）+ **输出目录**。
 ///
 /// 文件侧用 `len + mtime` 而不是内容哈希：追加和压实都会改这两个值，
 /// 而一次 `metadata()` 是微秒级（对照：2263 条全量重算是 200ms 级）。
@@ -74,6 +74,7 @@ fn view_key(
     clearing: bool,
     auto_confirm: bool,
     auto_confirmed: usize,
+    spend_mode: bool,
 ) -> String {
     let (len, modified) = match std::fs::metadata(state_file) {
         Ok(meta) => (
@@ -88,7 +89,7 @@ fn view_key(
         Err(_) => (u64::MAX, 0),
     };
     format!(
-        "{len}:{modified}:{board_rev}:{auto_confirm}:{auto_confirmed}:{}:{}",
+        "{len}:{modified}:{board_rev}:{auto_confirm}:{auto_confirmed}:{spend_mode}:{}:{}",
         if clearing { 'c' } else { '-' },
         output_dir.display()
     )
@@ -99,6 +100,11 @@ pub struct GuiState {
     cwd: PathBuf,
     /// 全局自动确认开关（运行态真源；与每个批次的 `AutoConfirm` 共享）。
     auto_confirm: Arc<AtomicBool>,
+    /// 花积分开关（运行态真源；与调度器的 `Shared.spend_mode` 共享）。
+    ///
+    /// ⚠️ **不落盘**：每次启动恒 `false`。忘了关就是整批按 fast 计费，
+    ///    所以这个开关不能跨会话记着（与自动确认不同，它的副作用更大）。
+    spend_mode: Arc<AtomicBool>,
     /// `.env` 读-改-写互斥：保存设置与切开关会同时改同一个文件。
     env_lock: Mutex<()>,
     /// **批次级**告警 —— 用户**必须看到**、且看板**表达不了**的那些事。
@@ -145,6 +151,8 @@ impl GuiState {
             alerts: Mutex::new(Vec::new()),
             view: Mutex::new(ViewCache::default()),
             auto_confirm: Arc::new(AtomicBool::new(auto_confirm)),
+            // 恒关：不读 `.env`，也没有默认值可配（见字段注释）。
+            spend_mode: Arc::new(AtomicBool::new(false)),
             env_lock: Mutex::new(()),
             single_instance: Mutex::new(None),
             scheduler: Mutex::new(None),
@@ -266,6 +274,7 @@ impl GuiState {
             tuning: SchedulerTuning::from_settings(&settings),
             retry_failed: false,
             auto_confirm,
+            spend_mode: Arc::clone(&self.spend_mode),
             log: Arc::new(|message: &str| crate::engine::runlog::line(message)),
             ports: None,
             on_session_end: Some(on_session_end),
@@ -333,6 +342,8 @@ struct ViewInput {
     auto_confirmed: usize,
     clearing: bool,
     auto_confirm: bool,
+    /// 花积分开关：进指纹 ⇒ 切换后必有一轮全量，界面不会停在旧 chip。
+    spend_mode: bool,
     board_rev: u64,
 }
 
@@ -345,6 +356,7 @@ impl ViewInput {
             self.clearing,
             self.auto_confirm,
             self.auto_confirmed,
+            self.spend_mode,
         )
     }
 }
@@ -354,6 +366,7 @@ fn view_input(state: &GuiState) -> ViewInput {
     let state_file = state.state_file();
     let output_dir = state.output_dir();
     let auto_confirm = state.auto_confirm.load(Ordering::Relaxed);
+    let spend_mode = state.spend_mode.load(Ordering::Relaxed);
 
     // 判据只有一处：**调度器**说的是不是真话。先克隆再放槽锁，避免与 ctx 锁长嵌套。
     let scheduler = {
@@ -383,6 +396,7 @@ fn view_input(state: &GuiState) -> ViewInput {
         // 清空已改成锁内同步完成，不再有"清空中"这个中间态。
         clearing: false,
         auto_confirm,
+        spend_mode,
         // 指纹只要「起停」这一位：`held_ids` 每秒都在变，进指纹会让缓存永远失效。
         board_rev: u64::from(running),
     }
@@ -425,6 +439,7 @@ fn finish_payload(view: &Mutex<ViewCache>, input: &ViewInput, key: String, mut p
         );
         object.insert("autoConfirm".to_string(), Value::Bool(input.auto_confirm));
         object.insert("autoConfirmed".to_string(), json!(input.auto_confirmed));
+        object.insert("spendMode".to_string(), Value::Bool(input.spend_mode));
 
         let mut elapsed: Vec<(String, Option<String>)> = Vec::new();
         if let Some(tasks) = object.get_mut("tasks").and_then(Value::as_array_mut) {
@@ -1512,6 +1527,24 @@ fn set_auto_confirm(state: tauri::State<'_, GuiState>, enabled: bool) -> Result<
     Ok(enabled)
 }
 
+/// 切换**花积分模式** —— 唯一的写入口（顶栏 chip 用它）。
+///
+/// ── 它是什么 ────────────────────────────────────────────────────────
+/// 只决定「提交前把服务端设成哪条通道」：开 ⇒ fast（不排队、按张扣积分），
+/// 关 ⇒ 免费排队。**不落盘**：重启后恒关（忘了关就是整批按 fast 计费）。
+/// 与「自动确认」无关 —— fast 只买"不排队"，**不跳过**上游的确认（`lovart/task.rs`）。
+///
+/// ── 为什么只改内存、不在这里发 `/mode/set` ─────────────────────────
+/// 服务端模式的**唯一写点**是调度器的 `ensure_mode`（每条提交前一次，参数按这个
+/// 开关现算）。在这里再补一次"关闭时立刻还原 `Queue`"，等于造出第二个写点、
+/// 第二种失败语义，而收益只是把窗口从"下一条提交前"缩到"此刻" ——
+/// 不提交本来就不花钱。见 `docs/plan/14` §5「不做」。
+#[tauri::command]
+fn set_spend_mode(state: tauri::State<'_, GuiState>, enabled: bool) -> bool {
+    state.spend_mode.store(enabled, Ordering::Relaxed);
+    enabled
+}
+
 /// 停止当前批次（协作式取消：调度器会在下一个检查点退出）。
 #[tauri::command]
 async fn stop_run(state: tauri::State<'_, GuiState>) -> Result<(), String> {
@@ -1696,6 +1729,7 @@ pub fn run() {
             get_settings,
             save_settings,
             set_auto_confirm,
+            set_spend_mode,
             stop_run
         ])
         .run(tauri::generate_context!())
@@ -1784,6 +1818,7 @@ mod tests {
             auto_confirmed: 0,
             clearing: false,
             auto_confirm: false,
+            spend_mode: false,
             board_rev: 0,
         }
     }

@@ -63,6 +63,13 @@
     <span class="auto-switch-dot" aria-hidden="true"></span>
     <span id="autoConfirmLabel">自动确认关</span>
   </button>
+  <!-- 花积分模式：与自动确认**不是**一回事 —— 它管"提交时走哪条通道"，
+       自动确认管"上游要求确认时替不替人点"。不落盘，重启恒关。 -->
+  <button class="btn btn-sm auto-switch" id="btnSpendMode" aria-pressed="false"
+    title="提交时走 fast 通道：不排队、按张扣积分（不跳过上游的确认）">
+    <span class="auto-switch-dot" aria-hidden="true"></span>
+    <span id="spendModeLabel">花积分关</span>
+  </button>
   <button class="btn btn-sm btn-quiet" id="btnSettings">设置</button>
 </header>
 

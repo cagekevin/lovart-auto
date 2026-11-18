@@ -383,12 +383,48 @@ pub fn create_project(deps: &ClientDeps) -> Result<String, LovartError> {
         .to_string())
 }
 
-/// 切换生成模式。**每次提交前调用**（服务端是持久设置，别指望它自己保持）。
+/// 生成模式 —— `/mode/set` 的**唯一参数语义**（服务端是账号级持久设置）。
 ///
-/// `unlimited = true` ⇒ 排队模式（免费，可能要等很久）；`false` ⇒ fast（扣积分）。
-pub fn set_mode(deps: &ClientDeps, unlimited: bool) -> Result<(), LovartError> {
+/// | 值 | `unlimited` | 速度 | 花钱 |
+/// |---|---|---|---|
+/// | [`Mode::Queue`] | `true` | 排队，可能要几十分钟 | **免费** |
+/// | [`Mode::Fast`] | `false` | 立刻出图 | **扣积分** |
+///
+/// ⚠️ 全项目**只认这个枚举**，不许再写 `set_mode(deps, true)` 这种裸布尔：
+///    调用处看不出"免费还是花钱"，而 2026-11-04 那批就是被静默扣了 9 张 ——
+///    日志里只有 `unlimited` 一个词，事后没法一眼判断该是哪种。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// `unlimited = true`：排队模式，免费。
+    Queue,
+    /// `unlimited = false`：fast，扣积分。
+    Fast,
+}
+
+impl Mode {
+    /// 传给 `/mode/set` 的 `unlimited` 字段（映射只有这一处）。
+    pub fn unlimited(self) -> bool {
+        matches!(self, Mode::Queue)
+    }
+
+    /// 开关 → 模式：`true` = 花积分（fast），`false` = 免费排队。
+    ///
+    /// ⚠️ **唯一的 bool → Mode 映射**。这一位反了就是整批按 fast 计费，
+    ///    所以它必须由单测锁住（见文件末尾 `spend_mode_maps_to_fast`），
+    ///    不许在调用处手写 `if … { Fast } else { Queue }`。
+    pub fn from_spend(enabled: bool) -> Mode {
+        if enabled {
+            Mode::Fast
+        } else {
+            Mode::Queue
+        }
+    }
+}
+
+/// 切换生成模式。**每次提交前调用**（服务端是持久设置，别指望它自己保持）。
+pub fn set_mode(deps: &ClientDeps, mode: Mode) -> Result<(), LovartError> {
     let mut body = Map::new();
-    body.insert("unlimited".to_string(), Value::Bool(unlimited));
+    body.insert("unlimited".to_string(), Value::Bool(mode.unlimited()));
     lovart_request(deps, Method::Post, "/mode/set", Some(&Value::Object(body)), &[])?;
     Ok(())
 }
@@ -492,4 +528,20 @@ pub fn upload_file(
         return Err(LovartError::internal("上传未返回 CDN URL", ErrType::UploadFailed));
     }
     Ok(url.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Mode;
+
+    /// 开关的方向只能有一个答案：开 ⇒ fast（扣积分），关 ⇒ 免费排队。
+    /// 反了的后果是**整批按 fast 计费**，所以这条断言必须存在。
+    #[test]
+    fn spend_mode_maps_to_fast() {
+        assert_eq!(Mode::from_spend(true), Mode::Fast);
+        assert_eq!(Mode::from_spend(false), Mode::Queue);
+        // 报文里的 `unlimited`：只有 Queue 是 true。
+        assert!(Mode::Queue.unlimited());
+        assert!(!Mode::Fast.unlimited());
+    }
 }
