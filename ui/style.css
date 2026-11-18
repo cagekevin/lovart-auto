@@ -1696,6 +1696,23 @@ select:focus { border-color: var(--ink); }
 /* 编辑态：**整块换掉**列表（不是把空 textarea 摆在列表上面） */
 .preset-editor { padding: 0 var(--sp-4); }
 
+/* 名字：单行标签，与 textarea 同一套外观；可留空（留空时列表用正文首行兜底） */
+.preset-name {
+  display: block;
+  width: 100%;
+  height: var(--h-ctl);
+  margin-bottom: var(--sp-2);
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg-sub);
+  color: var(--ink);
+  font-size: var(--fs-md);
+  outline: none;
+}
+
+.preset-name:focus { border-color: var(--ink); background: var(--bg); }
+
 .preset-text {
   display: block;
   width: 100%;

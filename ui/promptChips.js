@@ -245,17 +245,12 @@
   }
 
   window.PromptChips = {
-    promptChipRe,
-    buildChipText,
-    ZWSP,
     isChipEl,
-    isBrEl,
     ensureCaretSlotBeforeChip,
     normalizeChipSlots,
     serializeDOM,
     writePrompt,
     buildChipEl,
-    renderPromptToNodes,
     resolvePromptChips,
     inflatePromptChips,
   };

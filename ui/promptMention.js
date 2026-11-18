@@ -84,11 +84,7 @@
   }
 
   window.PromptMention = {
-    MENTION_MAX_QUERY,
     MENTION_PANEL_W,
-    MENTION_PANEL_MAX_H,
-    MENTION_FLIP_MIN_H,
-    BREAK,
     detectMentionQuery,
     computeMentionPlacement,
   };

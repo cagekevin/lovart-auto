@@ -485,6 +485,11 @@ async function refreshBoard() {
   refreshInFlight = true;
   try {
     await refreshBoardOnce();
+  } catch (error) {
+    // ⚠️ 异常**不许逃出去**：调用方是自排定时器（`scheduleRefresh`）和按钮点击，
+    //    逃出去 = 下一轮不再排 + 无人处理的 rejection ⇒ 看板永久不动、零提示。
+    //    `refreshBoardOnce` 自己只兜了「读不到状态」，画的过程中抛错归这里管。
+    notice(`刷新看板失败：${error}`);
   } finally {
     refreshInFlight = false;
     if (refreshAgain) {
@@ -1467,19 +1472,19 @@ async function loadTaskIntoEditor(task) {
 
 // ── 提示词预设（界面侧）──────────────────────────────────────────────
 /**
- * 预设的**形状 / 仓储 / 名字派生**在 `ui/presets.js`（`window.Presets`，纯函数）。
+ * 预设的**形状 / 仓储 / 名字兜底**在 `ui/presets.js`（`window.Presets`，纯函数）。
  * 这里只做壳该做的事：翻译 `reason`、画两态、接线。
  *
  * ── 两态 ─────────────────────────────────────────────────────────────
- * 列表态（默认）= "挑一条来用"；编辑态 = 新建 / 修改共用同一个 textarea。
+ * 列表态（默认）= "挑一条来用"；编辑态 = 新建 / 修改共用「名字 + textarea」两个输入。
  * 状态只有**一个**对象：`presetEditor`
  *   null             ⇒ 列表态
  *   { id }           ⇒ 编辑态（`id === null` 表示新建）
  * ⚠️ 不能只用 `editingId`：列表态和新建态都为"没有 id"，会串态。
  *
  * ── 与编辑区的关系 ───────────────────────────────────────────────────
- * **只写不读**：唯一接触点是 `applyPreset` 里的 `chips.writePrompt(..., null)`。
- * 存/改的文本只来自面板的 textarea —— 编辑区只负责"装提示词"。
+ * **只写不读**：唯一接触点是 `applyPreset` 里的 `window.PromptChips.writePrompt(..., null)`。
+ * 存/改的名字与文本只来自面板的两个输入 —— 编辑区只负责"装提示词"。
  */
 let presetEditor = null;
 
@@ -1520,8 +1525,9 @@ function renderPresetList() {
     const pick = el('button', 'preset-pick');
     pick.type = 'button';
     pick.title = '取用这条预设';
-    pick.appendChild(el('span', 'preset-pick-name', window.Presets.nameFrom(preset.text)));
-    // 预览被省略号截断，全文挂 title（名字本身就是首行截断，全文只能在这里看）
+    // 名字是**存的**（用户起的），留空时由库拿正文首行兜底 —— 界面不自己派生
+    pick.appendChild(el('span', 'preset-pick-name', window.Presets.displayName(preset)));
+    // 预览被省略号截断，全文挂 title（名字可能与正文无关，全文只能在这里看）
     const preview = el('span', 'preset-pick-text', preset.text);
     preview.title = preset.text;
     pick.appendChild(preview);
@@ -1572,19 +1578,27 @@ function applyPreset(preset) {
 function openPresetEditor(preset) {
   presetEditor = { id: preset ? preset.id : null };
   $('presetsTitle').textContent = preset ? '修改预设' : '新建预设';
+  const name = $('presetName');
   const input = $('presetText');
+  name.value = preset ? preset.name || '' : '';
   input.value = preset ? preset.text : '';
   show($('presetListView'), false);
   show($('presetFormView'), true);
-  input.focus();
-  // 光标在末尾：改错字是常态，别全选（一敲就把整条替换掉）
-  input.setSelectionRange(input.value.length, input.value.length);
+  if (preset) {
+    input.focus();
+    // 光标在末尾：改错字是常态，别全选（一敲就把整条替换掉）
+    input.setSelectionRange(input.value.length, input.value.length);
+  } else {
+    // 新建先起名字：列表里靠它区分，正文可能很长
+    name.focus();
+  }
 }
 
 /** 回列表态（也用于"取消"）：丢弃编辑中的内容，重新从存储画一遍。 */
 function closePresetEditor() {
   presetEditor = null;
   $('presetsTitle').textContent = '提示词预设';
+  $('presetName').value = '';
   $('presetText').value = '';
   show($('presetFormView'), false);
   show($('presetListView'), true);
@@ -1592,11 +1606,12 @@ function closePresetEditor() {
 }
 
 function savePresetForm() {
+  const name = $('presetName').value;
   const text = $('presetText').value;
   const editingId = presetEditor ? presetEditor.id : null;
   const result = editingId
-    ? window.Presets.update(editingId, text)
-    : window.Presets.create(text);
+    ? window.Presets.update(editingId, name, text)
+    : window.Presets.create(name, text);
   if (!result.ok) {
     notice(presetMessage(result));
     return;

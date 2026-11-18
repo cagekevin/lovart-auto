@@ -301,7 +301,8 @@
 
 <!-- ══ 提示词预设 ══
      两态互斥：默认是**列表**（点一行 = 取用），新建 / 修改换到编辑器。
-     ⚠️ 面板**不读**编辑区（`#promptInput`）：存/改的文本一律来自这里的 textarea。 -->
+     ⚠️ 面板**不读**编辑区（`#promptInput`）：存/改的名字与文本一律来自这里的
+    `#presetName` / `#presetText`。 -->
 <div class="mask" id="maskPresets" hidden>
   <div class="dialog dialog-mid" role="dialog" aria-modal="true" aria-labelledby="presetsTitle">
     <div class="dialog-head">
@@ -320,6 +321,8 @@
     <!-- 态二：编辑器（新建 / 修改共用） -->
     <div id="presetFormView" hidden>
       <div class="preset-editor">
+        <!-- 名字是给人看的标签：可留空，留空时列表用正文首行兜底 -->
+        <input class="preset-name" id="presetName" type="text" placeholder="名字（留空就用首行）" />
         <textarea class="preset-text" id="presetText" placeholder="写一条提示词…"></textarea>
       </div>
       <div class="dialog-foot">
