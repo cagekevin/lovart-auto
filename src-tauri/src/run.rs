@@ -352,6 +352,16 @@ pub(crate) fn is_board_finished(status: TaskStatus) -> bool {
     !is_board_open(status)
 }
 
+/// 看板上「**排队中**」= `queued` 组：**还没提交**（没有 `threadId`，上游不知道它存在）。
+///
+/// 这是「取消排队」的**作用域判据**，与上面两条共用 [`task_group`] 这一份实现。
+///
+/// ⚠️ 它**故意**只等于 `queued`：`active` 是已提交（在等结果）、`waiting` 是上游已创建
+///    但要你确认（要花积分）—— 那两者删掉只是"本地不再取图"，和"还没发出去"不是一件事。
+pub(crate) fn is_board_queued(status: TaskStatus) -> bool {
+    task_group(status) == "queued"
+}
+
 /// 「**正在生产**已持续多久」—— 只有 `active` 组才有值。
 ///
 /// ── 为什么必须收在这里 ────────────────────────────────────────────

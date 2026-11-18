@@ -1308,22 +1308,18 @@ async fn remove_tasks(state: tauri::State<'_, GuiState>, ids: Vec<String>) -> Re
     }
 }
 
-/// 删除**看板未结束**的记录（`active` / `queued` / `waiting`），返回删除条数。
+/// 删除看板上**某一组**的记录（无调度器分支），返回删除条数。
 ///
-/// ── 为什么它不是一个 Tauri 命令 ──────────────────────────────────────
-/// 它要跑在"批次已经退出、又没人能开新批"的那一段里（见 `GuiState::finish_batch`），
-/// 由 `cancel_all_tasks` 与批次线程**共用同一个实现** —— 不另开第二个删除入口。
-///
-/// 判据用 [`crate::run::is_board_open`]（看板分组本体），**不是** `is_unfinished`：
-/// 后者是 `!terminal`，会把终态的 `needs_confirm`（待处理）漏掉。
+/// 「哪一组」由调用方传判据（`run::is_board_*`）—— 这是**唯一**的"改文件"实现：
+/// 三组各抄一份的话，`ids.is_empty()`（一条都没有时**不写盘**）这类细节迟早漏一份。
 ///
 /// 一次 `remove` = 一次 `compact`（临时文件 + rename）⇒ 要么全删要么全不删。
-pub fn remove_open_tasks_core(state_file: &Path) -> Result<usize, String> {
+fn remove_board_tasks_core(state_file: &Path, keep: fn(TaskStatus) -> bool) -> Result<usize, String> {
     let mut store = StateStore::open(state_file).map_err(|error| error.to_string())?;
     let ids: Vec<String> = store
         .all()
         .into_iter()
-        .filter(|record| crate::run::is_board_open(record.status))
+        .filter(|record| keep(record.status))
         .map(|record| record.id.clone())
         .collect();
     if ids.is_empty() {
@@ -1333,61 +1329,51 @@ pub fn remove_open_tasks_core(state_file: &Path) -> Result<usize, String> {
     store.remove(&ids).map_err(|error| error.to_string())
 }
 
-/// 删除**看板已完成**的记录（`finished` 组），返回删除条数。
+/// 按**判据**批量删记录：调度器在就走它（唯一写者），否则直接改文件。
 ///
-/// 判据用 [`crate::run::is_board_finished`] —— 与 `remove_open_tasks_core` 同一份
-/// 分组本体、互为补集，所以两个入口加起来正好覆盖全表、不会重叠也不会漏。
-/// 一条都没有时**不写盘**（没有要删的就别重写整个文件）。
-pub fn remove_finished_tasks_core(state_file: &Path) -> Result<usize, String> {
-    let mut store = StateStore::open(state_file).map_err(|error| error.to_string())?;
-    let ids: Vec<String> = store
-        .all()
-        .into_iter()
-        .filter(|record| crate::run::is_board_finished(record.status))
-        .map(|record| record.id.clone())
-        .collect();
-    if ids.is_empty() {
-        return Ok(0);
-    }
-    store.remove(&ids).map_err(|error| error.to_string())
+/// 三个板级清理动作（未结束 / 排队 / 已完成）只差"挑哪些"这一个判据，
+/// 删除路径只有这一条 ⇒ 不再出现三份 `match scheduler_snapshot()`。
+fn remove_board_tasks(state: &GuiState, keep: fn(TaskStatus) -> bool) -> Result<usize, String> {
+    let cleared = match state.scheduler_snapshot() {
+        Some(scheduler) => scheduler
+            .remove_where(keep)
+            .map_err(|error| error.message().to_string())?,
+        None => remove_board_tasks_core(&state.state_file(), keep)?,
+    };
+    state.invalidate_view();
+    Ok(cleared)
 }
 
 /// 清空所有已完成任务：删除 `finished` 组的全部记录，返回删除条数。
 ///
-/// ── 与「取消所有未完成任务」的区别 ────────────────────────────────
-/// 它**不碰批次**（已结束的记录本来没人在跟），所以不置 `wipe`、也不需要停批；
-/// 但它和单删一样是**重写整个 `state.jsonl`**，因此共用那两道闸：
-/// 清空未结束任务期间拒绝（`ensure_not_clearing`）、跑批中拒绝（追加写会打架）。
-/// 只删记录，图片文件与报告都不动。
+/// 不碰批次（已结束的记录本来没人在跟）；只删记录，图片文件与报告都不动。
 #[tauri::command]
 async fn clear_finished_tasks(state: tauri::State<'_, GuiState>) -> Result<usize, String> {
-    match state.scheduler_snapshot() {
-        // 调度器在 ⇒ 删除必须走它（唯一写者），否则重写文件会冲掉在飞任务刚写的行。
-        Some(scheduler) => scheduler
-            .remove_finished()
-            .map_err(|error| error.message().to_string()),
-        // 还没建调度器 ⇒ 没有写者在跑，按旧路径删。
-        None => remove_finished_tasks_core(&state.state_file()),
-    }
+    remove_board_tasks(state.inner(), crate::run::is_board_finished)
 }
 
-/// 取消所有未完成任务：停掉当前批次（若有）→ 等它退出 → 删除全部未结束记录。
+/// 取消**排队中**（还没提交）的任务：删除 `queued` 组的记录，返回删除条数。
 ///
-/// 返回值：
-/// - 空闲：`{"cleared": N, "stopping": false}`（N 就是实际删除条数）
-/// - 跑批中：`{"cleared": 0, "stopping": true}`，最终条数在批次收尾时由告警给出
+/// 与「取消所有未完成」的区别：作用域只有 `queued`，**不停批次**、不关会话 ——
+/// 已提交的（`active`）和上游等你确认的（`waiting`）都不动。
+/// 这些记录还没有 `threadId`（上游不知道它们存在）⇒ 删除没有上游副作用。
+#[tauri::command]
+async fn cancel_queued_tasks(state: tauri::State<'_, GuiState>) -> Result<usize, String> {
+    remove_board_tasks(state.inner(), crate::run::is_board_queued)
+}
+
+/// 取消所有未完成任务：**停会话** + 删除看板未结束的记录，返回 `{ cleared }`。
 ///
-/// 为什么跑批中**立刻返回**而不是同步等 60 秒：取消是协作式的，
-/// 等下去会把 UI 线程挂住（用户看到的是"点了没反应"）。
+/// ⚠️ 比另外两个多一步"停会话"（`remove_open` 内部置 `stopped` / `cancelled` 并
+/// 关掉本次会话），所以它不能走 [`remove_board_tasks`]；没有调度器时只剩"删记录"。
 #[tauri::command]
 async fn cancel_all_tasks(state: tauri::State<'_, GuiState>) -> Result<Value, String> {
     let cleared = match state.scheduler_snapshot() {
-        // 调度器在 ⇒ 锁内删：与 worker 的写入天然串行，不再需要「先停批、等退出」。
         Some(scheduler) => scheduler
             .remove_open()
             .map_err(|error| error.message().to_string())?,
         // 还没建调度器 ⇒ 没有写者在跑。
-        None => remove_open_tasks_core(&state.state_file())?,
+        None => remove_board_tasks_core(&state.state_file(), crate::run::is_board_open)?,
     };
     state.invalidate_view();
     Ok(json!({ "cleared": cleared }))
@@ -1723,6 +1709,7 @@ pub fn run() {
             resume_unfinished,
             remove_tasks,
             clear_finished_tasks,
+            cancel_queued_tasks,
             cancel_all_tasks,
             reveal_path,
             open_output_dir,

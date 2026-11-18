@@ -1202,7 +1202,10 @@ function menuItem(label, onClick, danger, disabled) {
 }
 
 /**
- * 板级 ⋯ 菜单（2026-10-20）：**两个板级清理动作的唯一入口**。
+ * 板级 ⋯ 菜单（2026-10-20）：**三个板级清理动作的唯一入口**。
+ *
+ * 三者作用域**不重叠**：`queued`（还没提交）⊂ `open`（未结束），`finished` 是 `open` 的补集；
+ * 「取消排队」只清前者，所以它不停批次、也不碰已提交的任务。
  *
  * 为什么从卡片搬到这里：原入口只在 `task.group === 'active'` 的卡片菜单里，
  * **没有处理中任务时它根本不存在**。而"一条 `needs_confirm` 卡着、取消不掉"
@@ -1229,6 +1232,10 @@ function bindBoardMenu() {
     }
     const menu = el('div', 'menu');
     // 禁用的菜单项仍然渲染：藏起来会让人以为功能没了。
+    menu.appendChild(menuItem('取消排队中的任务', () => {
+      closeMenu();
+      cancelQueuedTasks();
+    }, true, false));
     menu.appendChild(menuItem('取消所有未完成任务', () => {
       closeMenu();
       cancelAllTasks();
@@ -2693,6 +2700,40 @@ async function clearFinishedTasks() {
     notice(cleared > 0 ? `已清空 ${cleared} 条已完成任务记录（图片与报告未删除）` : '没有已完成的任务可清空');
   } catch (error) {
     notice(`清空已完成任务失败：${error}`);
+  } finally {
+    cancelAllBusy = false;
+    await refreshBoard();
+  }
+}
+
+/**
+ * 取消**排队中**的任务 = 删除「排队」组的全部记录（图片、报告都不动）。
+ *
+ * 与另两个清理动作的区别：作用域只有 `queued`（还没提交给上游的那些），
+ * **不停批次**、不碰处理中 / 待确认。这些记录还没有 threadId ⇒ 删除没有任何上游副作用。
+ *
+ * 条数从 `lastBoardData` 里数（与「清空已完成」同一手法）：分组判据仍来自 Rust 下发的
+ * `group`，前端不自己判状态；真正删哪些由后端在锁内挑，不拿这份快照去删。
+ */
+async function cancelQueuedTasks() {
+  if (cancelAllBusy) return;
+  const count = (lastBoardData?.tasks || []).filter((task) => task.group === 'queued').length;
+  if (count === 0) {
+    notice('没有排队中的任务可取消');
+    return;
+  }
+  cancelAllBusy = true;
+  try {
+    const ok = await askConfirm(
+      '取消所有排队中的任务？',
+      `会删除 ${count} 条排队中任务的记录。它们还没提交给上游，删除后等于没发生过；`
+        + '批次不会停，正在处理的和已完成的都不受影响。此操作不能撤销。',
+    );
+    if (!ok) return;
+    const cleared = await invoke('cancel_queued_tasks');
+    notice(cleared > 0 ? `已取消 ${cleared} 条排队中的任务` : '没有排队中的任务可取消');
+  } catch (error) {
+    notice(`取消排队任务失败：${error}`);
   } finally {
     cancelAllBusy = false;
     await refreshBoard();

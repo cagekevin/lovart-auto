@@ -2240,27 +2240,30 @@ impl Scheduler {
         Ok(count)
     }
 
-    /// 删除**已结束**的记录（锁内）。
-    pub fn remove_finished(&self) -> Result<usize, LovartError> {
+    /// 按**判据**批量删记录：锁内挑 id → 唯一的 [`Self::remove`]。
+    ///
+    /// 「删哪一组」由调用方传判据（`run::is_board_*`）。原先三组各写一份"挑 id 的循环"，
+    /// 是同一件事的三份实现；而 `remove` 里的队列/在飞/墓碑摘除**必须**只有一份
+    /// （否则记录删了、id 还在 `ctx.queue` 里 ⇒ worker 照样提交，界面上却看不见）。
+    pub fn remove_where(&self, keep: fn(TaskStatus) -> bool) -> Result<usize, LovartError> {
         let ids: Vec<String> = {
             let ctx = self.lock();
             ctx.state
                 .all()
                 .into_iter()
-                // 与旧的「清空已完成」同一条判据（看板的 `finished` 组），
-                // 不用 `is_terminal`：后者会把终态的 `needs_confirm` 也算进来。
-                .filter(|record| crate::run::is_board_finished(record.status))
+                .filter(|record| keep(record.status))
                 .map(|record| record.id.clone())
                 .collect()
         };
         self.remove(&ids)
     }
 
-    /// 取消所有未完成：**锁内**删除看板未结束的记录（含终态的 `needs_confirm`），
-    /// 返回删除条数。
+    /// 取消所有未完成：**停会话** + 删除看板未结束的记录（含终态的 `needs_confirm`）。
     ///
-    /// 与旧实现（先停批 → 等线程退出 → 再删）相比不再需要等待：写者只有调度器自己，
-    /// 删除与 worker 的写入天然串行。在飞任务随后收尾时命中墓碑，静默丢弃（§2.5）。
+    /// 与另两组（直接走 [`Self::remove_where`]）的**唯一区别**就是前面那段"停"：
+    /// 置 `stopped` / `cancelled`，并在真的删到东西时关掉本次会话（下一条投喂开新的）。
+    /// 写者只有调度器自己，删除与 worker 的写入天然串行；在飞任务收尾时命中墓碑，
+    /// 静默丢弃（§2.5）—— 所以不需要"先停批、等线程退出"。
     pub fn remove_open(&self) -> Result<usize, LovartError> {
         // 先停：在飞任务收尾时走 `stopped` 分支（只改状态、不入队）。
         self.shared.stopped.store(true, Ordering::SeqCst);
@@ -2268,18 +2271,7 @@ impl Scheduler {
         // 立刻叫醒阻塞在 `wait` 的 worker，让它们重新评估 `stopped`
         // （否则下面 `remove` 万一失败提前返回，worker 还睡着）。
         self.shared.wake.notify_all();
-        // 只负责「挑哪些 id」（锁内），清理统一交给 [`Self::remove`] ——
-        // 队列/在飞/墓碑/task_by_id 的摘除逻辑只有那一份。
-        let ids: Vec<String> = {
-            let ctx = self.lock();
-            ctx.state
-                .all()
-                .into_iter()
-                .filter(|record| crate::run::is_board_open(record.status))
-                .map(|record| record.id.clone())
-                .collect()
-        };
-        let removed = self.remove(&ids)?;
+        let removed = self.remove_where(crate::run::is_board_open)?;
         if removed > 0 {
             // 取消全部 = 这次会话到此为止（下一条投喂开新会话）。
             // 不写报告：用户要的是「清空」，一份空报告没有意义。
