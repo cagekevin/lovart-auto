@@ -11,18 +11,10 @@
 //!   --ref <路径|URL|data:>   参考图（图生图），可重复或用逗号分隔
 //!   --refs-cache <file>      参考图 CDN 缓存（默认 var/refs-cache.json）
 //!   --no-refs-cache          不读写参考图缓存
-//!   --concurrency <n>        并发任务数，硬上限 8（默认 7）
 //!   --model <alias>          默认模型（默认 nano-bn-2）
 //!   --ratio <w:h>            默认比例（默认 3:4）
 //!   --size <1K|2K|4K>        默认尺寸（默认 2K）
-//!   --max-attempts <n>       可重试失败上限（默认 3）
-//!   --max-busy-retries <n>   402/409 重投上限（默认 300）
-//!   --task-interval-ms <n>   全局任务间隔（ms，缺省跟随 .env / 设置页，兜底 5000；0 关闭）
 //!   --retry-failed           重置无 threadId 的 Failed 并重跑
-//!   --max-timeouts <n>       累计超时多少次后释放槽位（默认 3）
-//!   --download-retries <n>   单张产物下载重试次数（默认 3）
-//!   --task-timeout <分钟>    单任务轮询总超时（默认 90）
-//!   --recheck-timeout <分钟> 复查已超时任务的轮询超时（默认 30）
 //!   --allow-unknown-model    未知模型名只警告，不终止（默认终止）
 //!   --auto-confirm           自动确认高成本操作（会扣积分；每任务每批最多一次）
 //!   --no-auto-confirm        关闭自动确认（覆盖 .env）
@@ -35,6 +27,11 @@
 //!   --json                   配合 --status：输出机器可读 JSON（供客户端读取）
 //!   -h / --help              打印本说明
 //! ```
+//!
+//! ⚠️ **运行参数（并发 / 提交间隔 / 重试 / 超时）没有命令行开关**（2026-11-18 定）：
+//! 它们是「机器怎么跑」，只能由用户在界面「设置」里改（落到 `.env`）。
+//! 命令行只决定「画什么」。传这些参数会**报错退出**并指出该去哪里改 —— 见 `cli.rs`
+//! 的 `RETIRED_TUNING_KEYS`。理由：CLI 是 AI 的入口，AI 不该能调这些旋钮。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -44,12 +41,12 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::cli::{arg_list, arg_number_opt, arg_string, has_arg, parse_args, ParsedArgs};
+use crate::cli::{arg_list, arg_string, has_arg, parse_args, ParsedArgs};
 use crate::engine::refs::read_ref_inputs;
 use crate::engine::scheduler::{
     run_scheduler, AutoConfirm, SchedulerOptions, SchedulerSummary, SchedulerTuning,
 };
-use crate::engine::settings::{self, Settings};
+use crate::engine::settings::Settings;
 use crate::engine::state::{
     is_not_done, row as status_row, Action, StateStore, TaskRecord, TaskStatus, STATUS_TABLE,
 };
@@ -70,18 +67,10 @@ fn known_args() -> BTreeSet<String> {
         "ref",
         "refs-cache",
         "no-refs-cache",
-        "concurrency",
         "model",
         "ratio",
         "size",
-        "max-attempts",
-        "max-busy-retries",
-        "task-interval-ms",
         "retry-failed",
-        "max-timeouts",
-        "download-retries",
-        "task-timeout",
-        "recheck-timeout",
         "allow-unknown-model",
         "auto-confirm",
         "no-auto-confirm",
@@ -921,44 +910,9 @@ pub fn main_with_args(argv: &[String]) -> Result<(), String> {
         eprintln!("⚠️ {warning}");
     }
 
-    // 调参：默认全部来自设置；命令行只覆盖**显式给出**的项。
-    // 不再写 `arg_number(&args, key, 3.0)` —— 那等于把默认值搬进 CLI 层。
-    let mut tuning = SchedulerTuning::from_settings(&current);
-    if let Some(value) = arg_number_opt(&args, "concurrency") {
-        let value = value.floor();
-        if !(1.0..=settings::MAX_CONCURRENCY as f64).contains(&value) {
-            return Err(format!(
-                "--concurrency 必须在 1..{} 之间（服务端最多同时 {} 个任务）",
-                settings::MAX_CONCURRENCY, settings::MAX_CONCURRENCY
-            ));
-        }
-        tuning.concurrency = value as usize;
-    }
-    if let Some(value) = arg_number_opt(&args, "max-attempts") {
-        tuning.max_attempts = value.floor().max(1.0) as u32;
-    }
-    if let Some(value) = arg_number_opt(&args, "max-busy-retries") {
-        tuning.max_busy_retries = value.floor().max(1.0) as u32;
-    }
-    if let Some(value) = arg_number_opt(&args, "max-timeouts") {
-        tuning.max_timeouts = value.floor().max(1.0) as u32;
-    }
-    if let Some(value) = arg_number_opt(&args, "download-retries") {
-        tuning.download_retries = value.floor().max(1.0) as u32;
-    }
-    // CLI 对外以「分钟」为单位（`--task-timeout 90`），运行时/落盘统一用 ms。
-    if let Some(value) = arg_number_opt(&args, "task-timeout") {
-        tuning.task_timeout = Duration::from_secs_f64(value.max(1.0) * 60.0);
-    }
-    if let Some(value) = arg_number_opt(&args, "recheck-timeout") {
-        tuning.recheck_timeout = Duration::from_secs_f64(value.max(1.0) * 60.0);
-    }
-    if let Some(value) = arg_number_opt(&args, "task-interval-ms") {
-        // 与设置页同一道上限（R2-4：原先 CLI 没有上限，和 GUI 已经漂移）。
-        tuning.task_interval = Duration::from_millis(
-            (value.max(0.0) as u64).min(settings::MAX_TASK_INTERVAL_MS),
-        );
-    }
+    // 运行参数**只来自设置**（`.env`，由界面「设置」写入）：CLI 不提供覆盖入口。
+    // 这不是删能力 —— 用户在设置页照旧能改；关掉的是 AI 唯一够得着的那个面。
+    let tuning = SchedulerTuning::from_settings(&current);
     let retry_failed = has_arg(&args, "retry-failed");
     // 取值顺序：命令行 > `.env`（LOVART_DEFAULT_*）> 内置默认。与 GUI 设置页同一套兜底。
     let defaults = PromptDefaults {
@@ -1380,5 +1334,30 @@ mod tests {
     fn c6_对账行() {
         assert_eq!(auto_confirm_line(0), None, "0 条不打印，不制造噪音");
         assert_eq!(auto_confirm_line(3).unwrap(), "本批自动确认 3 条");
+    }
+
+    /// 运行参数没有命令行入口：**能力还在**（设置页 / `.env`），只是 AI 够不着。
+    /// 报错必须指向「设置」，否则用户会以为是自己拼错了。
+    #[test]
+    fn c7_运行参数不接受命令行覆盖() {
+        for key in crate::cli::RETIRED_TUNING_KEYS {
+            let flag = format!("--{key}");
+            let args = parsed(&[flag.as_str(), "3"]);
+            assert_eq!(args.errors.len(), 1, "--{key} 必须被拒绝：{:?}", args.errors);
+            assert!(
+                args.errors[0].contains("设置"),
+                "--{key} 的报错要指出该去哪里改：{:?}",
+                args.errors
+            );
+        }
+    }
+
+    /// 反向约束：参数名表里**不能**再出现这些键，否则上面的拒绝会被 `known_keys` 短路。
+    #[test]
+    fn c8_运行参数不在已知参数表里() {
+        let known = known_args();
+        for key in crate::cli::RETIRED_TUNING_KEYS {
+            assert!(!known.contains(*key), "{key} 不该出现在 known_args()");
+        }
     }
 }

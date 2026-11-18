@@ -30,6 +30,25 @@ pub struct ParsedArgs {
     pub errors: Vec<String>,
 }
 
+/// 已从命令行**移除**的运行参数（2026-11-18）。
+///
+/// 能力没有删：并发 / 提交间隔 / 重试 / 超时仍然存在，用户照旧能在界面「设置」里改
+/// （落到 `.env`，`engine::settings` 是唯一读取点）。移除的只是**命令行这一面** ——
+/// 因为 CLI 是 AI 的入口，这些「机器怎么跑」的旋钮不该由 AI 拧。
+///
+/// 单独列表而不是任其报「未知参数」：拼错和「故意不给」是两件事，
+/// 前者要提示拼写，后者要告诉用户**去哪改**。
+pub const RETIRED_TUNING_KEYS: &[&str] = &[
+    "concurrency",
+    "max-attempts",
+    "max-busy-retries",
+    "max-timeouts",
+    "download-retries",
+    "task-timeout",
+    "recheck-timeout",
+    "task-interval-ms",
+];
+
 /// 解析 argv（**不含**程序名本身）。
 ///
 /// `known_keys` = 允许的参数名（不含 `--` 前缀）；未知的一律进 `errors`。
@@ -66,7 +85,13 @@ pub fn parse_args(argv: &[String], known_keys: &BTreeSet<String>) -> ParsedArgs 
             None => &token[2..],
         };
         if !known_keys.contains(key) {
-            args.errors.push(format!("未知参数「--{key}」"));
+            if RETIRED_TUNING_KEYS.contains(&key) {
+                args.errors.push(format!(
+                    "「--{key}」不是命令行参数：并发 / 提交间隔 / 重试 / 超时只能由用户在界面「设置」里改（写入 .env），命令行不提供"
+                ));
+            } else {
+                args.errors.push(format!("未知参数「--{key}」"));
+            }
             continue;
         }
 
