@@ -431,6 +431,9 @@ async function toggleAutoConfirm() {
     );
     if (!ok) return;
     await applyAutoConfirm(true);
+  } catch (error) {
+    // ⚠️ 只有 `finally` 没有 `catch` ⇒ 失败会变成无人处理的 rejection（界面毫无反应）。
+    notice(`切换自动确认失败：${error.message || error}`);
   } finally {
     autoConfirmBusy = false;
   }
@@ -2856,16 +2859,19 @@ function renderDefaultSelects(value) {
 
   // 比例：与模型/尺寸同款下拉。`.env` 里手改的非常用值（如 7:5）补一项，
   // 否则下拉会"跳回第一个"，看起来像设置丢了。
+  // 比例：**先算出唯一的目标值**，再补候选、再画 —— 顺序反过来就会出现
+  // "候选补齐了、`.value` 却写的是另一个（不存在的）变量"这种错。
   const ratioBox = $('setDefaultRatio');
   clear(ratioBox);
+  const desiredRatio = value.defaultRatio || draft.ratio || RATIO_CHOICES[0];
   const ratioChoices = [...RATIO_CHOICES];
-  ensureOption(ratioChoices, value.defaultRatio || draft.ratio);
+  ensureOption(ratioChoices, desiredRatio);
   for (const ratio of ratioChoices) {
     const option = el('option', '', ratio);
     option.value = ratio;
     ratioBox.appendChild(option);
   }
-  ratioBox.value = currentRatio;
+  ratioBox.value = desiredRatio;
 
   const sizeBox = $('setDefaultSize');
   clear(sizeBox);
@@ -2915,26 +2921,34 @@ function renderSettingsNote(warnings, maxWallClockMin) {
 }
 
 async function openSettings() {
-  const value = await loadSettings();
-  if (value) {
-    // 后端给的都是**已换算好的显示单位**（秒 / 分钟 / 次），这里直接填。
-    $('setAccessKey').value = value.accessKey || '';
-    $('setSecretKey').value = value.secretKey || '';
-    $('setConcurrency').value = value.concurrency;
-    $('setTaskInterval').value = value.taskIntervalSec;
-    $('setOutput').value = value.outputDir || '';
-    $('setTaskTimeout').value = value.taskTimeoutMin;
-    $('setRecheckTimeout').value = value.recheckTimeoutMin;
-    $('setMaxAttempts').value = value.maxAttempts;
-    $('setMaxTimeouts').value = value.maxTimeouts;
-    $('setMaxBusyRetries').value = value.maxBusyRetries;
-    $('setDownloadRetries').value = value.downloadRetries;
-    $('setPollInterval').value = value.pollIntervalSec;
-    $('setPollMaxInterval').value = value.pollMaxIntervalSec;
-    renderDefaultSelects(value);
-    renderSettingsNote(value.warnings, value.maxWallClockMin);
+  try {
+    const value = await loadSettings();
+    if (value) {
+      // 后端给的都是**已换算好的显示单位**（秒 / 分钟 / 次），这里直接填。
+      $('setAccessKey').value = value.accessKey || '';
+      $('setSecretKey').value = value.secretKey || '';
+      $('setConcurrency').value = value.concurrency;
+      $('setTaskInterval').value = value.taskIntervalSec;
+      $('setOutput').value = value.outputDir || '';
+      $('setTaskTimeout').value = value.taskTimeoutMin;
+      $('setRecheckTimeout').value = value.recheckTimeoutMin;
+      $('setMaxAttempts').value = value.maxAttempts;
+      $('setMaxTimeouts').value = value.maxTimeouts;
+      $('setMaxBusyRetries').value = value.maxBusyRetries;
+      $('setDownloadRetries').value = value.downloadRetries;
+      $('setPollInterval').value = value.pollIntervalSec;
+      $('setPollMaxInterval').value = value.pollMaxIntervalSec;
+      renderDefaultSelects(value);
+      renderSettingsNote(value.warnings, value.maxWallClockMin);
+    }
+    openMask('maskSettings');
+  } catch (error) {
+    // ⚠️ **错误出口归函数自己**：这个函数整体是 `async`，抛出去会变成无人处理的
+    //    rejection —— 对话框不打开、界面毫无反应、连日志都不一定看得到
+    //    （"设置点不开"就是这么查出来的：内部一处 `ratioBox.value = currentRatio`，
+    //    `currentRatio` 根本不存在）。
+    notice(`打开设置失败：${error.message || error}`);
   }
-  openMask('maskSettings');
 }
 
 async function saveSettings() {
@@ -3259,6 +3273,8 @@ window.addEventListener('DOMContentLoaded', async () => {
 
   bindBoardMenu();
   $('btnAutoConfirm').addEventListener('click', toggleAutoConfirm);
+  // 设置的两个动作各自**内部**已经负责报错（`openSettings` / `saveSettings`），
+  // 绑定处不再包第二层 —— 一个动作只留一个错误出口。
   $('btnSettings').addEventListener('click', openSettings);
   $('btnSettingsCancel').addEventListener('click', () => closeMask('maskSettings'));
   $('btnSettingsSave').addEventListener('click', saveSettings);
