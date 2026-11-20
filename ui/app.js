@@ -2912,11 +2912,15 @@ async function loadSettings() {
  */
 function applyDefaultSettings(settings) {
   // 无论有没有读到设置都要走一趟：三个下拉不能是空白。
-  // 尺寸/模型只认清单里的（后端能兜非法值，界面不该显示一个发不出去的值）。
+  // ⚠️ 尺寸**不在前端校验**：`defaultSize` 从 `.env` 读入时已被 `PromptDefaults` 归一
+  //    （非法值兜成默认并告警，`settings.rs` 有测试锁）⇒ 这里再 `includes` 一次，
+  //    等于补一个不存在的洞，还是"前端判合法性"的老毛病。
+  //    真要不在候选里，`renderParamSelect` 会 `ensureOption` 补一项，不会显示成空。
+  // 模型仍走 `hasModel`：别名表是异步拉的（`list_models` 失败时为空表），与尺寸不同。
   setParams({
     model: hasModel(settings?.defaultModel) ? settings.defaultModel : '',
     ratio: settings?.defaultRatio || draft.ratio,
-    size: SIZES.includes(settings?.defaultSize) ? settings.defaultSize : draft.size,
+    size: settings?.defaultSize || draft.size,
   });
 }
 

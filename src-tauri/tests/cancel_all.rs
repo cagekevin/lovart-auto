@@ -1,22 +1,24 @@
 //! 两个板级清理动作的删除核心：
 //!
-//! - 「取消所有未完成任务」→ [`remove_open_tasks_core`]：只删看板**未结束**
-//!   （处理中 / 排队 / 待处理），已结束原样保留；
-//! - 「清空所有已完成任务」→ [`remove_finished_tasks_core`]：只删 `finished` 组，
-//!   未结束（含待处理）原样保留。
+//! - 「取消所有未完成任务」→ `remove_board_tasks_core(path, is_board_open)`：
+//!   只删看板**未结束**（处理中 / 排队 / 待处理），已结束原样保留；
+//! - 「清空所有已完成任务」→ `remove_board_tasks_core(path, is_board_finished)`：
+//!   只删 `finished` 组，未结束（含待处理）原样保留。
 //!
 //! 两个作用域互为补集，所以下面**两边都立了"对方那条一条都不许动"的用例** ——
 //! 只测自己那半，"顺手把另一半也删了"这种错就测不出来。
 //!
-//! 落点说明：判据与删除都只有一份实现（`run::is_board_open` / `run::is_board_finished`
-//! + `StateStore::remove`），这里测的是"选谁"和"该不该写盘"，不重复测状态表本身。
+//! 落点说明：判据与删除都只有一份实现（`engine::group::is_board_open` /
+//! `engine::group::is_board_finished` + `StateStore::remove`），这里测的是"选谁"
+//! 和"该不该写盘"，不重复测状态表本身。
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use lovart_client::engine::group::{is_board_finished, is_board_open};
 use lovart_client::engine::state::StateStore;
-use lovart_client::gui::{remove_finished_tasks_core, remove_open_tasks_core};
+use lovart_client::gui::remove_board_tasks_core;
 
 /// 每次一个独立目录 —— 与 `state_invariants.rs` 同款（不引 `tempfile` 依赖）。
 static SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -67,7 +69,7 @@ fn 只删未结束的记录_已结束原样保留() {
         ],
     );
 
-    let removed = remove_open_tasks_core(&path).unwrap();
+    let removed = remove_board_tasks_core(&path, is_board_open).unwrap();
 
     assert_eq!(removed, 3, "处理中 + 排队 + 待处理都该删");
     assert_eq!(
@@ -83,7 +85,7 @@ fn 没有未结束的记录_不写盘() {
     let path = write_state(&dir, &[line("1-done", "done"), line("2-no-artifact", "no_artifact")]);
     let before = fs::read(&path).unwrap();
 
-    let removed = remove_open_tasks_core(&path).unwrap();
+    let removed = remove_board_tasks_core(&path, is_board_open).unwrap();
 
     assert_eq!(removed, 0);
     assert_eq!(
@@ -98,7 +100,7 @@ fn 状态文件不存在_返回零而不是报错() {
     let dir = temp_dir("missing");
     let path = dir.join("var/state.jsonl");
 
-    assert_eq!(remove_open_tasks_core(&path).unwrap(), 0, "没有 ≠ 读失败");
+    assert_eq!(remove_board_tasks_core(&path, is_board_open).unwrap(), 0, "没有 ≠ 读失败");
     assert!(!path.exists(), "不许顺手建出一个空文件");
 }
 
@@ -110,7 +112,7 @@ fn 坏行不影响清空() {
         &[line("1-running", "running"), r#"{"id":"bad""#.to_string()],
     );
 
-    assert_eq!(remove_open_tasks_core(&path).unwrap(), 1);
+    assert_eq!(remove_board_tasks_core(&path, is_board_open).unwrap(), 1);
     assert!(remaining_ids(&path).is_empty(), "坏行按既有语义跳过，未结束照删");
 }
 
@@ -129,7 +131,7 @@ fn 清空已完成_只删已结束的记录() {
         ],
     );
 
-    let removed = remove_finished_tasks_core(&path).unwrap();
+    let removed = remove_board_tasks_core(&path, is_board_finished).unwrap();
 
     assert_eq!(removed, 2, "只删已结束的两条");
     let mut left = remaining_ids(&path);
@@ -150,7 +152,7 @@ fn 没有已结束的记录_不写盘() {
     );
     let before = fs::read(&path).unwrap();
 
-    assert_eq!(remove_finished_tasks_core(&path).unwrap(), 0);
+    assert_eq!(remove_board_tasks_core(&path, is_board_finished).unwrap(), 0);
     assert_eq!(
         fs::read(&path).unwrap(),
         before,
@@ -163,6 +165,6 @@ fn 清空已完成_状态文件不存在_返回零而不是报错() {
     let dir = temp_dir("clear-finished-missing");
     let path = dir.join("var/state.jsonl");
 
-    assert_eq!(remove_finished_tasks_core(&path).unwrap(), 0, "没有 ≠ 读失败");
+    assert_eq!(remove_board_tasks_core(&path, is_board_finished).unwrap(), 0, "没有 ≠ 读失败");
     assert!(!path.exists(), "不许顺手建出一个空文件");
 }

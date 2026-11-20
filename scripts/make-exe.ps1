@@ -39,7 +39,9 @@ $Root     = Split-Path -Parent $PSScriptRoot          # 仓库根（scripts/ 的
 $SrcTauri = Join-Path $Root 'src-tauri'
 $IconPng  = Join-Path $Root 'assets\icon.png'
 $IconIco  = Join-Path $SrcTauri 'icons\icon.ico'
-$Bin      = Join-Path $SrcTauri 'target\release\lovart-client.exe'
+# 拆出 `crates/lovart-core` 后是 workspace：产物落在**仓库根**的 target/，
+# 不在 `src-tauri/target/`（那是拆分前的旧路径）。
+$Bin      = Join-Path $Root 'target\release\lovart-client.exe'
 $Out      = Join-Path $Root 'lovart-client.exe'
 
 # ── 工具定位 ────────────────────────────────────────────────────────

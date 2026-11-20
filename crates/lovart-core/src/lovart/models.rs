@@ -31,113 +31,102 @@ impl Category {
     }
 }
 
-/// 模型规格（对应 TS `LovartModelSpec`）。
+/// 模型规格。
+///
+/// 只有「这个模型叫什么、属于哪类、界面上显示什么」三件事。
+/// **不含工具名**：`model → 工具` 的映射在 `IMAGE_RULES` / `VIDEO_RULES`（别名子串匹配，
+/// 覆盖 `gptimage2low` 这类写法，且要区分「仅自然语言路」）—— 那才是唯一真源。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelSpec {
     /// 模型 id（表键）。
     pub id: &'static str,
     pub category: Category,
-    /// 结构化路选模型用的工具名；`None` ⇒ 仅自然语言路（prompt_only）。
-    pub tool: Option<&'static str>,
     pub readable_name: &'static str,
 }
 
-/// 模型 id → 规格。**顺序与 TS 的 `LOVART_MODEL_SPECS` 一致**（便于逐行比对）。
+/// 模型 id → 规格（**人工精选子集**，不用的模型不进表）。
+///
+/// 新增模型只追加一条，**不加分支**；顺序不影响任何匹配 —— `model_spec` 是精确查键，
+/// 别名匹配走 `IMAGE_RULES` / `VIDEO_RULES`（那两张表才顺序敏感）。
 pub const MODEL_SPECS: &[ModelSpec] = &[
     ModelSpec {
         id: "gpt-image-2-low",
         category: Category::Image,
-        tool: None,
         readable_name: "GPT Image 2 Low",
     },
     ModelSpec {
         id: "gpt-image-2-medium",
         category: Category::Image,
-        tool: None,
         readable_name: "GPT Image 2 Medium",
     },
     ModelSpec {
         id: "gpt-image-2-high",
         category: Category::Image,
-        tool: None,
         readable_name: "GPT Image 2 High",
     },
     ModelSpec {
         id: "nano-bn-pro",
         category: Category::Image,
-        tool: None,
         readable_name: "Nano Banana Pro",
     },
     ModelSpec {
         id: "nano-bn-2",
         category: Category::Image,
-        tool: None,
         readable_name: "Nano Banana 2",
     },
     ModelSpec {
         id: "nano-bn-2-lite",
         category: Category::Image,
-        tool: None,
         readable_name: "Nano Banana 2 Lite",
     },
     ModelSpec {
         id: "gpt-image-2.6-sunburst-low",
         category: Category::Image,
-        tool: None,
         readable_name: "GPT Image 2.6 Sunburst Low",
     },
     ModelSpec {
         id: "gpt-image-2.6-sunburst-medium",
         category: Category::Image,
-        tool: None,
         readable_name: "GPT Image 2.6 Sunburst Medium",
     },
     ModelSpec {
         id: "gpt-image-2.6-flare-low",
         category: Category::Image,
-        tool: None,
         readable_name: "GPT Image 2.6 Flare Low",
     },
     ModelSpec {
         id: "gpt-image-2.6-flare-medium",
         category: Category::Image,
-        tool: None,
         readable_name: "GPT Image 2.6 Flare Medium",
     },
     ModelSpec {
         id: "lovart-chat",
         category: Category::Chat,
-        tool: Some("lovart-chat"),
         readable_name: "Lovart Chat",
     },
     ModelSpec {
         id: "seedance-2.0-fast",
         category: Category::Video,
-        tool: None,
         readable_name: "Seedance 2.0 Fast",
     },
     ModelSpec {
         id: "seedance-2",
         category: Category::Video,
-        tool: None,
         readable_name: "Seedance 2",
     },
     ModelSpec {
         id: "seedance-2.0-mini",
         category: Category::Video,
-        tool: None,
         readable_name: "Seedance 2.0 Mini",
     },
     ModelSpec {
         id: "minimax-h3",
         category: Category::Video,
-        tool: None,
         readable_name: "MiniMax H3",
     },
     ModelSpec {
         id: "kling-v3-omni",
         category: Category::Video,
-        tool: None,
         readable_name: "Kling V3 Omni",
     },
 ];

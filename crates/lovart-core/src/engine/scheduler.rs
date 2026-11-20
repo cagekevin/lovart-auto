@@ -192,7 +192,7 @@ pub enum Batch {
 /// ⚠️ 协议层（`lovart::task`）不认识这个类型，只收 `allow` 回调 + 计数器引用 ——
 ///    花钱策略属于调度层，协议层只管"怎么发请求"。
 pub struct AutoConfirm {
-    /// 全局开关：与 `GuiState.auto_confirm` 共享同一个原子量 ⇒ 切换立即生效。
+    /// 全局开关：与 `Workbench` 的自动确认开关共享同一个原子量 ⇒ 切换立即生效。
     enabled: Arc<AtomicBool>,
     /// 本批已自动确认次数（`confirm` 成功那一刻 +1，与轮询收场无关）。
     confirmed: AtomicUsize,
@@ -591,7 +591,7 @@ struct Shared {
     on_session_end: Option<SessionEndFn>,
     /// 自动确认策略（全局开关 + 本批计数 + 本批许可）。
     auto_confirm: Arc<AutoConfirm>,
-    /// 花积分开关（与 `GuiState.spend_mode` 共享同一个原子量 ⇒ 切换立即生效）。
+    /// 花积分开关（与 `Workbench` 的花积分开关共享同一个原子量 ⇒ 切换立即生效）。
     ///
     /// ⚠️ 它**只**决定「提交前把服务端设成哪条通道」，不参与排队、不进 `Ctx`、
     ///    不落盘。CLI 恒 `false`（命令行永远免费）。
@@ -1082,7 +1082,7 @@ fn write_report_file(
     log: &LogFn,
 ) {
     archive_previous_report(path, log);
-    if let Err(error) = crate::run::write_report(path, &summary.records, tasks, output_dir) {
+    if let Err(error) = crate::engine::report::write_report(path, &summary.records, tasks, output_dir) {
         log(&format!(
             "写报告失败（图已经出了，只是这份 CSV 没生成）：{error}"
         ));
@@ -2132,7 +2132,9 @@ impl Scheduler {
     }
 
     /// 取一份 `ClientDeps` 克隆（参考图上传等锁外工作要用）。
-    pub(crate) fn deps(&self) -> ClientDeps {
+    /// ⚠️ 必须 `pub`：`gui.rs` 的 `resolve_refs_core` 要用它重试参考图
+    /// （`gui.rs:696`）。拆 crate 后 `pub(crate)` 只覆盖 core 内部。
+    pub fn deps(&self) -> ClientDeps {
         self.lock().deps.clone()
     }
 
@@ -2271,7 +2273,7 @@ impl Scheduler {
         // 立刻叫醒阻塞在 `wait` 的 worker，让它们重新评估 `stopped`
         // （否则下面 `remove` 万一失败提前返回，worker 还睡着）。
         self.shared.wake.notify_all();
-        let removed = self.remove_where(crate::run::is_board_open)?;
+        let removed = self.remove_where(crate::engine::group::is_board_open)?;
         if removed > 0 {
             // 取消全部 = 这次会话到此为止（下一条投喂开新会话）。
             // 不写报告：用户要的是「清空」，一份空报告没有意义。

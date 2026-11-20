@@ -32,7 +32,7 @@ use lovart_client::engine::scheduler::{
     SchedulerTuning,
 };
 use lovart_client::engine::state::{normalize_state_text, NormalizedState, StateStore};
-use lovart_client::lovart::client::{ClientDeps, HttpRequest, HttpResponse, Transport};
+use lovart_client::lovart::client::{ClientDeps, HttpRequest, HttpResponse, Mode, Transport};
 use lovart_client::lovart::errors::LovartError;
 use lovart_client::lovart::prompt::{parse_prompts, ParseOptions, PromptDefaults, PromptTask};
 use lovart_client::lovart::task::AutoConfirmDecision;
@@ -297,8 +297,8 @@ impl ReplayPorts {
 }
 
 impl Ports for ReplayPorts {
-    fn set_mode(&self, deps: &ClientDeps, unlimited: bool) -> Result<(), LovartError> {
-        self.inner.set_mode(deps, unlimited)
+    fn set_mode(&self, deps: &ClientDeps, mode: Mode) -> Result<(), LovartError> {
+        self.inner.set_mode(deps, mode)
     }
 
     fn send(&self, deps: &ClientDeps, input: &lovart_client::lovart::contract::SendInput) -> Result<(String, String), LovartError> {

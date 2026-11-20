@@ -3,7 +3,7 @@
 //! ── 职责边界 ────────────────────────────────────────────────────────
 //! 这一层**只做三件事**：读状态给前端看 · 列 inbox 并校验 · 起/停一个批次。
 //! 它**不重新实现任何业务规则** —— 校验走 `parse_prompts`、开跑走 `run_scheduler`、
-//! 看板数据走 `run::build_status_json`，与 CLI 是**同一份代码**。
+//! 看板数据走 `service::snapshot::build_status_json`，与 CLI 是**同一份代码**。
 //! （若在这里抄第二份解析/渲染，"窗口里看到的"与"终端看到的"必然分叉。）
 //!
 //! ── 为什么前端用轮询而不是事件推送 ──────────────────────────────────
@@ -11,9 +11,7 @@
 //! 不如让前端每秒重读一次状态文件 —— 少一套会漂移的并行真相。
 //! （而且这也让「另一个进程在跑批」时窗口照样能看，见方案的「观察模式」。）
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
@@ -21,457 +19,37 @@ use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 
 use crate::engine::lockfile::FileLock;
-use crate::engine::scheduler::{
-    AutoConfirm, Batch, Scheduler, SchedulerConfig, SchedulerSummary, SchedulerTuning,
-};
 use crate::engine::settings::{self, Settings};
 use crate::engine::state::{
-    is_unfinished, row as status_row, Action, RecordPatch, StateStore, StateStoreOptions,
-    TaskRecord, TaskStatus,
+    is_unfinished, row as status_row, Action, RecordPatch, StateStore, TaskRecord, TaskStatus,
 };
 use crate::engine::text::{read_text, read_text_required};
+use crate::service::wiring::to_client_deps;
 use crate::lovart::connection::{
-    load_dot_env, read_auto_confirm, reload_dot_env, resolve_connection, to_client_deps,
-    update_env_keys, AUTO_CONFIRM_KEY,
+    load_dot_env, reload_dot_env, resolve_connection, update_env_keys, AUTO_CONFIRM_KEY,
 };
 use crate::lovart::prompt::{parse_prompts, ParseOptions, PromptDefaults, PromptTask};
-use crate::run::build_status_json;
-
-/// `get_state` 的「没变就别重算」缓存。
-///
-/// ── 为什么需要它 ────────────────────────────────────────────────────
-/// `get_state` 每秒跑一次，而它做的事是**全量**的：读整个 `state.jsonl` →
-/// 逐行反序列化 → 每条记录再 `serde_json::to_value` → 整体序列化给 IPC。
-/// 实测 2263 条 = 一次约 200ms、载荷约 4MB；而其中 `finished` 的记录
-/// **永远不再变**。界面静止时，这 200ms 与 4MB 全是白干。
-///
-/// ⇒ 指纹（[`view_key`]）没变就只回 active 那几条「已持续」文案（几十字节）。
-/// 指纹变了才走全量。
-#[derive(Default)]
-struct ViewCache {
-    /// 上次全量重算时的指纹。空串 = 没有缓存 / 被 [`GuiState::invalidate_view`] 作废。
-    key: String,
-    /// `(id, state_since)` —— 只有 `stateSinceText` 非空的那几条（= `active` 组）。
-    ///
-    /// 命中缓存时**只重算这几条文案**：它们是全量载荷里唯一每秒都在变的东西，
-    /// 其余一个字节都没变。判据用的是 Rust 已经下发过的字段，不另写状态清单。
-    elapsed: Vec<(String, Option<String>)>,
-}
-
-/// `get_state` 的指纹：**文件侧**（长度 + 修改时间）+ **内存侧**（看板 rev / 清空 / 自动确认 /
-/// 花积分）+ **输出目录**。
-///
-/// 文件侧用 `len + mtime` 而不是内容哈希：追加和压实都会改这两个值，
-/// 而一次 `metadata()` 是微秒级（对照：2263 条全量重算是 200ms 级）。
-///
-/// ⚠️ 输出目录**必须进指纹**：设置里改了输出目录时 `state.jsonl` 一个字都不会变，
-/// 但 `filesPresent`（绝对路径 + 在不在盘上）与 `missingArtifact` 全都变了。
-/// 漏了它 ⇒ 改完设置，界面继续指着旧目录说"图在 / 图缺"。
-fn view_key(
-    state_file: &Path,
-    output_dir: &Path,
-    board_rev: u64,
-    clearing: bool,
-    auto_confirm: bool,
-    auto_confirmed: usize,
-    spend_mode: bool,
-) -> String {
-    let (len, modified) = match std::fs::metadata(state_file) {
-        Ok(meta) => (
-            meta.len(),
-            meta.modified()
-                .ok()
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|elapsed| elapsed.as_nanos())
-                .unwrap_or(0),
-        ),
-        // 文件还没建：与「存在但为空」不是一回事，用哨兵长度区分开。
-        Err(_) => (u64::MAX, 0),
-    };
-    format!(
-        "{len}:{modified}:{board_rev}:{auto_confirm}:{auto_confirmed}:{spend_mode}:{}:{}",
-        if clearing { 'c' } else { '-' },
-        output_dir.display()
-    )
-}
-
-/// GUI 全局状态。
-pub struct GuiState {
-    cwd: PathBuf,
-    /// 全局自动确认开关（运行态真源；与每个批次的 `AutoConfirm` 共享）。
-    auto_confirm: Arc<AtomicBool>,
-    /// 花积分开关（运行态真源；与调度器的 `Shared.spend_mode` 共享）。
-    ///
-    /// ⚠️ **不落盘**：每次启动恒 `false`。忘了关就是整批按 fast 计费，
-    ///    所以这个开关不能跨会话记着（与自动确认不同，它的副作用更大）。
-    spend_mode: Arc<AtomicBool>,
-    /// `.env` 读-改-写互斥：保存设置与切开关会同时改同一个文件。
-    env_lock: Mutex<()>,
-    /// **批次级**告警 —— 用户**必须看到**、且看板**表达不了**的那些事。
-    ///
-    /// ── 为什么它取代了原来的 `log` ────────────────────────────────────
-    ///
-    /// 原来这里存「最近 300 条日志」，出口是 `get_log` 命令 —— **而前端一次都没调过它**
-    /// （DEBT TD-05-15）。于是 `start_run` 里所有失败（打不开状态文件 / 参考图解析失败 /
-    /// 批次返回 Err / 写报告失败）**只写进一个没人读的 Vec**，
-    /// 界面照常显示「发布成功」—— **失败伪装成成功**（DEBT TD-05-21）。
-    ///
-    /// ── 为什么不是「把日志接上」而是换成一个告警列表 ──────────────────
-    ///
-    /// 调度器那 30 多条输出**绝大多数是过程**（「已提交」「复查」「补下载」），
-    /// 而**任务级的结果（含失败原因）已经落在 `state.jsonl` 里** ——
-    /// 看板就是它的显示器。往这里再灌一份，是**同一个事实的第二份真相**。
-    ///
-    /// ⇒ 边界划清：**任务级 = `state.jsonl`（看板）**；**批次级 = 这里（告警）**。
-    /// 两者不重叠，谁也不替谁兜底。
-    ///
-    /// 与 `log` 的另一个区别：**告警不裁剪**。日志可以丢，告警丢了就是骗人。
-    alerts: Mutex<Vec<String>>,
-    /// 看板载荷的「没变就别重算」缓存（见 [`ViewCache`]）。
-    view: Mutex<ViewCache>,
-    /// 单实例锁（`engine::lockfile`）。由 `setup` 注入，**必须活到窗口关闭** ——
-    /// 句柄一关，另一个进程就能进来写 `state.jsonl`。
-    ///
-    /// 用 `Mutex<Option<_>>` 而不是直接持有：`GuiState::new` 时 Tauri 还没起来，
-    /// 拿不到对话框，抢锁失败要根据平台给用户一句人话（见 `run` 的 `setup`）。
-    single_instance: Mutex<Option<FileLock>>,
-    /// 常驻调度器（**惰性启动**：第一次投喂时才建，没配凭据的用户启动不报错）。
-    scheduler: Mutex<Option<Scheduler>>,
-    /// 投喂串行锁：`refs-cache.json` 是「读-合并-写」，两次并发投喂会互相覆盖
-    /// （`docs/plan/09` §1.5.4）。代价可接受 —— 投喂是人工动作。
-    intake_lock: Mutex<()>,
-}
-
-impl GuiState {
-    pub fn new(cwd: PathBuf) -> Self {
-        // 自动确认开关只认 `.env`（不读进程环境变量）。非法值 / 读失败 ⇒ 关 + 一条告警。
-        let (auto_confirm, auto_confirm_warning) = read_auto_confirm(&cwd.join(".env"));
-        let state = Self {
-            cwd,
-            alerts: Mutex::new(Vec::new()),
-            view: Mutex::new(ViewCache::default()),
-            auto_confirm: Arc::new(AtomicBool::new(auto_confirm)),
-            // 恒关：不读 `.env`，也没有默认值可配（见字段注释）。
-            spend_mode: Arc::new(AtomicBool::new(false)),
-            env_lock: Mutex::new(()),
-            single_instance: Mutex::new(None),
-            scheduler: Mutex::new(None),
-            intake_lock: Mutex::new(()),
-        };
-
-        // ⚠️ 启动就把 `.env` 载进来：设置里的「并发数 / 输出文件夹」也住在那里，
-        //    不先载入，`get_settings` 读到的永远是默认值（= 设置界面是假的）。
-        //
-        // 失败**必须上报**：载入失败 ⇒ 后面所有读环境变量的地方都拿到默认值 ⇒
-        // 设置界面显示的是**假配置**。原先是 `let _ =`，等于把这件事藏起来（DEBT TD-05-24）。
-        if let Err(error) = load_dot_env(&state.cwd.join(".env")) {
-            state.push_alert(&format!("配置载入失败，界面上的设置可能不是真实配置：{error}"));
-        }
-        if let Some(warning) = auto_confirm_warning {
-            state.push_alert(&warning);
-        }
-        // 设置里的非法值（兜底参数 + 新增的 8 个键）：**启动就说**，
-        // 否则用户会以为设置生效了。此刻 `from_env` ≈ 文件（`load_dot_env` 刚跑完）。
-        let (_, settings_warnings) = Settings::from_env();
-        for warning in settings_warnings {
-            state.push_alert(&warning);
-        }
-        state
-    }
-
-    /// 收下单实例锁（`run` 的 `setup` 调用，抢到之后）。
-    ///
-    /// ⚠️ 不提供「没锁也能跑」的分支：抢锁失败时调用方必须让进程退出，
-    /// 而不是带着半个锁继续（两个写者 = 记录被覆盖）。
-    fn hold_lock(&self, lock: FileLock) {
-        let mut slot = self
-            .single_instance
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        *slot = Some(lock);
-    }
-
-    /// 取（必要时创建）常驻调度器。
-    ///
-    /// ⚠️ 返回**克隆**而不是 guard：调用方随后会锁 `Mutex<Ctx>`，若拿着槽锁去锁它，
-    /// 任何反向路径都会死锁（`docs/plan/09` §1.5.3）。
-    fn ensure_scheduler(&self, app: &tauri::AppHandle) -> Result<Scheduler, String> {
-        let mut slot = self
-            .scheduler
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if let Some(scheduler) = slot.as_ref() {
-            return Ok(scheduler.clone());
-        }
-
-        // 每次创建前重新载入 `.env`（覆盖语义）：手改后点提交仍要用新值。
-        reload_dot_env(&self.cwd.join(".env"))?;
-        let (settings, warnings) = Settings::from_file(&self.cwd.join(".env"))
-            .map_err(|error| format!("读不了 .env：{error}"))?;
-        for warning in &warnings {
-            self.push_alert(&format!("⚠️ {warning}"));
-        }
-        let connection = resolve_connection()?;
-        let deps = to_client_deps(&connection)?;
-        crate::engine::runlog::init(self.cwd.join("var/run.log"));
-
-        // 落盘失败 ⇒ 跑的中途就上报一次（`on_write_error` 只调一次，不刷屏）。
-        let alert_handle = app.clone();
-        let store = StateStore::open_with(
-            &self.state_file(),
-            StateStoreOptions {
-                on_write_error: Some(Box::new(move |message: &str| {
-                    if let Some(state) = alert_handle.try_state::<GuiState>() {
-                        state.push_alert(&format!(
-                            "状态写不进磁盘（断点续跑会失效，重启后进度可能全丢）：{message}"
-                        ));
-                    }
-                })),
-            },
-        )
-        .map_err(|error| format!("打不开状态文件：{error}"))?;
-
-        let auto_confirm = AutoConfirm::new(Arc::clone(&self.auto_confirm));
-        // 会话封口回调：把「本会话跑完」变成告警与日志行（原先这段在 `run_scheduler` 返回后）。
-        let auto_for_cb = Arc::clone(&auto_confirm);
-        let end_handle = app.clone();
-        let on_session_end: crate::engine::scheduler::SessionEndFn = Arc::new(
-            move |summary: &SchedulerSummary| {
-                let counts: Vec<String> = summary
-                    .counts
-                    .iter()
-                    .filter(|(_, count)| **count > 0)
-                    .map(|(key, count)| format!("{key}={count}"))
-                    .collect();
-                crate::engine::runlog::line(&format!(
-                    "会话结束：共 {} 条（{}），未完成 {} 条",
-                    summary.total,
-                    counts.join(" "),
-                    summary.unfinished
-                ));
-                let Some(state) = end_handle.try_state::<GuiState>() else {
-                    return;
-                };
-                if summary.persist_failed {
-                    state.push_alert(
-                        "收尾时状态文件写不进去：本次进度可能续不上，重启后需要重新提交",
-                    );
-                }
-                let confirmed = auto_for_cb.count();
-                if confirmed > 0 {
-                    state.push_alert(&format!(
-                        "本会话自动确认 {confirmed} 条（已扣积分，明细以上游账单为准）"
-                    ));
-                }
-            },
-        );
-
-        let scheduler = Scheduler::start(SchedulerConfig {
-            deps,
-            state: store,
-            output_dir: self.cwd.join(&settings.output_dir),
-            report_file: Some(self.cwd.join("var/report.csv")),
-            tuning: SchedulerTuning::from_settings(&settings),
-            retry_failed: false,
-            auto_confirm,
-            spend_mode: Arc::clone(&self.spend_mode),
-            log: Arc::new(|message: &str| crate::engine::runlog::line(message)),
-            ports: None,
-            on_session_end: Some(on_session_end),
-        })
-        .map_err(|error| format!("调度器启动失败：{}", error.message()))?;
-
-        *slot = Some(scheduler.clone());
-        Ok(scheduler)
-    }
-
-    /// 取调度器克隆（`None` = 还没创建）。不把 guard 交出去，避免与 ctx 锁嵌套。
-    fn scheduler_snapshot(&self) -> Option<Scheduler> {
-        self.scheduler
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone()
-    }
-
-    fn state_file(&self) -> PathBuf {
-        self.cwd.join("var/state.jsonl")
-    }
-
-    /// 作废看板缓存 ⇒ 下一轮 `get_state` 强制全量重算。
-    ///
-    /// ⚠️ **上游探针必须调它**：探针改的是界面标题行那句结论，而它是 JS 里拼的、
-    /// 不落 `state.jsonl` ⇒ 文件指纹不变。不作废，标题行会永远停在「探测中…」。
-    fn invalidate_view(&self) {
-        let mut view = self.view.lock().unwrap_or_else(|error| error.into_inner());
-        view.key.clear();
-    }
-
-    fn output_dir(&self) -> PathBuf {
-        // 1Hz 的 `get_state` 会调它：读环境（微秒级），不读盘。
-        // 手改 `.env` 的目录要等点「开始」才统一（N19）—— 这里刻意不跟文件，
-        // 否则每秒做一次磁盘 I/O。
-        self.cwd.join(Settings::from_env().0.output_dir)
-    }
-
-    /// 记一条**批次级**告警（用户必须看到的事）。
-    ///
-    /// 只做「追加」——**不裁剪**。日志可以丢，告警丢了就是骗人。
-    /// 消费方是 [`take_alerts`]：前端每轮拉走，拉走即清（不重复弹）。
-    fn push_alert(&self, message: &str) {
-        // 告警也落日志：弹窗**关掉就没了**，而挂机出问题时人不在电脑前。
-        crate::engine::runlog::line(&format!("⚠️ 告警：{message}"));
-        let mut alerts = self.alerts.lock().unwrap_or_else(|error| error.into_inner());
-        alerts.push(format!(
-            "[{}] {message}",
-            chrono::Local::now().format("%H:%M:%S")
-        ));
-    }
-}
+use crate::service::api::RunSource;
+use crate::service::snapshot::{is_retryable, unchanged_payload};
+use lovart_core::service::Workbench;
 
 // ── 命令 ──────────────────────────────────────────────────────────────
 
-/// 一次 `get_state` 需要的**内存侧面**（与磁盘无关）。
+/// GUI 自己的看板缓存（`2B-2`）：只存上次的指纹与「已持续」原料。
 ///
-/// 抽成结构体的理由：`get_state` 要 `await` 读盘，而锁不能跨 `await` 持有；
-/// 同时它让"读哪些内存、拼什么指纹"变成一个可以直接单测的东西（见文件末尾 v1–v4）。
-struct ViewInput {
-    state_file: PathBuf,
-    output_dir: PathBuf,
-    batch_label: Option<String>,
-    batch_ids: BTreeSet<String>,
-    auto_confirmed: usize,
-    clearing: bool,
-    auto_confirm: bool,
-    /// 花积分开关：进指纹 ⇒ 切换后必有一轮全量，界面不会停在旧 chip。
-    spend_mode: bool,
-    board_rev: u64,
+/// ⚠️ 缓存**只在 GUI**：service 里没有缓存字段 ⇒ HTTP `/state` 不可能拿到
+/// `unchanged`（`ADR-0005` 的"一个能力一个入口"）。
+#[derive(Default)]
+struct GuiViewCache {
+    key: String,
+    elapsed: Vec<(String, Option<String>)>,
 }
 
-impl ViewInput {
-    fn key(&self) -> String {
-        view_key(
-            &self.state_file,
-            &self.output_dir,
-            self.board_rev,
-            self.clearing,
-            self.auto_confirm,
-            self.auto_confirmed,
-            self.spend_mode,
-        )
+impl GuiViewCache {
+    fn clear(&mut self) {
+        self.key.clear();
+        self.elapsed.clear();
     }
-}
-
-/// 取内存侧快照：只碰锁与原子量，**不读盘**。
-fn view_input(state: &GuiState) -> ViewInput {
-    let state_file = state.state_file();
-    let output_dir = state.output_dir();
-    let auto_confirm = state.auto_confirm.load(Ordering::Relaxed);
-    let spend_mode = state.spend_mode.load(Ordering::Relaxed);
-
-    // 判据只有一处：**调度器**说的是不是真话。先克隆再放槽锁，避免与 ctx 锁长嵌套。
-    let scheduler = {
-        let slot = state
-            .scheduler
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        slot.clone()
-    };
-    // 计数只在本会话存在时有意义；没有就是 0（不伪造"上次跑到多少"）。
-    let (batch_label, batch_ids, auto_confirmed, running) = match scheduler {
-        Some(scheduler) if scheduler.is_live() => (
-            Some("处理中".to_string()),
-            scheduler.held_ids(),
-            scheduler.auto_confirmed(),
-            true,
-        ),
-        _ => (None, BTreeSet::new(), 0, false),
-    };
-
-    ViewInput {
-        state_file,
-        output_dir,
-        batch_label,
-        batch_ids,
-        auto_confirmed,
-        // 清空已改成锁内同步完成，不再有"清空中"这个中间态。
-        clearing: false,
-        auto_confirm,
-        spend_mode,
-        // 指纹只要「起停」这一位：`held_ids` 每秒都在变，进指纹会让缓存永远失效。
-        board_rev: u64::from(running),
-    }
-}
-
-/// 缓存命中 ⇒ `{ unchanged, elapsed }`；未命中 ⇒ `None`（调用方去读盘）。
-///
-/// ⚠️ 命中时**仍然重算**那几条「已持续」：它们是全量载荷里唯一每秒都在变的东西。
-/// 文案实现只有 `run::active_elapsed_text` 一份，这里不自己拼字。
-fn cached_payload(view: &Mutex<ViewCache>, key: &str) -> Option<Value> {
-    let view = view.lock().unwrap_or_else(|error| error.into_inner());
-    if view.key != key {
-        return None;
-    }
-    let elapsed: Vec<Value> = view
-        .elapsed
-        .iter()
-        .filter_map(|(id, since)| {
-            crate::run::active_elapsed_text(since.as_deref())
-                .map(|text| json!({ "id": id, "text": text }))
-        })
-        .collect();
-    Some(json!({ "unchanged": true, "elapsed": elapsed }))
-}
-
-/// 全量载荷的收尾：并入内存侧字段、逐条 `following`，并把指纹与 elapsed 写回缓存。
-///
-/// ⚠️ **只在读盘成功之后调** —— 失败时不落指纹，下一轮自然会重算。
-fn finish_payload(view: &Mutex<ViewCache>, input: &ViewInput, key: String, mut payload: Value) -> Value {
-    if let Some(object) = payload.as_object_mut() {
-        object.insert("running".to_string(), Value::Bool(input.batch_label.is_some()));
-        object.insert("clearing".to_string(), Value::Bool(input.clearing));
-        object.insert(
-            "runningBatch".to_string(),
-            input
-                .batch_label
-                .clone()
-                .map(Value::String)
-                .unwrap_or(Value::Null),
-        );
-        object.insert("autoConfirm".to_string(), Value::Bool(input.auto_confirm));
-        object.insert("autoConfirmed".to_string(), json!(input.auto_confirmed));
-        object.insert("spendMode".to_string(), Value::Bool(input.spend_mode));
-
-        let mut elapsed: Vec<(String, Option<String>)> = Vec::new();
-        if let Some(tasks) = object.get_mut("tasks").and_then(Value::as_array_mut) {
-            for task in tasks {
-                let Some(id) = task.get("id").and_then(Value::as_str) else {
-                    continue;
-                };
-                let following = input.batch_ids.contains(id);
-                // 缓存只收**已经有文案**的那几条（= `active` 组）：判据仍是 Rust 自己
-                // 下发的 `stateSinceText`，不在这里另写一遍"哪些状态要计时"。
-                if task
-                    .get("stateSinceText")
-                    .is_some_and(|value| !value.is_null())
-                {
-                    elapsed.push((
-                        id.to_string(),
-                        task.get("stateSince")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                    ));
-                }
-                if let Some(task) = task.as_object_mut() {
-                    task.insert("following".to_string(), Value::Bool(following));
-                }
-            }
-        }
-
-        let mut cached = view.lock().unwrap_or_else(|error| error.into_inner());
-        cached.key = key;
-        cached.elapsed = elapsed;
-    }
-    payload
 }
 
 /// 看板数据（与 `--status --json` **同一份构造**）。
@@ -502,35 +80,46 @@ fn finish_payload(view: &Mutex<ViewCache>, input: &ViewInput, key: String, mut p
 /// 不再读盘、不再序列化（见 [`ViewCache`]）。指纹一变仍走全量 —— 也就是
 /// 这个函数在任何时刻返回的都是"真话"，只是**没变的时候不必把同一句话重说一遍**。
 #[tauri::command]
-async fn get_state(state: tauri::State<'_, GuiState>) -> Result<Value, String> {
+async fn get_state(
+    state: tauri::State<'_, Arc<Workbench>>,
+    view: tauri::State<'_, Mutex<GuiViewCache>>,
+) -> Result<Value, String> {
     // ── 为什么是 `async`（与 `probe_unfinished` 同一条理由）──────────
     // Tauri 的**同步**命令在主线程上 inline 执行，而这里要读整个 `state.jsonl`
     // 再整体序列化给 IPC（实测 2263 条 ≈ 200ms）。每秒堵主线程 200ms = 每秒掉一批帧。
     // ⇒ 读盘那半段挪进 `spawn_blocking`，界面线程始终能响应。
-    //
-    // 三段：① 取内存快照（便宜）→ ② 指纹命中就直接回 → ③ 否则读盘 + 收尾。
-    let input = view_input(&state);
-    let key = input.key();
-    if let Some(hit) = cached_payload(&state.view, &key) {
-        return Ok(hit);
+    let since = {
+        let cache = view.lock().unwrap_or_else(|error| error.into_inner());
+        if cache.key.is_empty() {
+            None
+        } else {
+            Some(cache.key.clone())
+        }
+    };
+    let core = Arc::clone(state.inner());
+    let snapshot = tauri::async_runtime::spawn_blocking(move || core.snapshot(since.as_deref()))
+        .await
+        .map_err(|error| format!("状态线程异常退出：{error}"))??;
+
+    let mut cache = view.lock().unwrap_or_else(|error| error.into_inner());
+    match snapshot.payload {
+        // 命中：只回「已持续」那几条（用上次全量留下的原料重算）。
+        None => Ok(unchanged_payload(&cache.elapsed)),
+        Some(payload) => {
+            cache.key = snapshot.key;
+            cache.elapsed = snapshot.active;
+            Ok(payload)
+        }
     }
-    let read_file = input.state_file.clone();
-    let read_dir = input.output_dir.clone();
-    let built =
-        tauri::async_runtime::spawn_blocking(move || build_status_json(&read_file, &read_dir))
-            .await
-            .map_err(|error| format!("状态线程异常退出：{error}"))?;
-    Ok(finish_payload(&state.view, &input, key, built?))
 }
 
 /// 取走**尚未读过的**批次级告警（取走即清，不重复弹）。
 ///
-/// 这是 [`GuiState::push_alert`] 的**唯一消费口** —— 与「有产无消」的旧 `get_log`
+/// 这是 [`Arc<Workbench>::push_alert`] 的**唯一消费口** —— 与「有产无消」的旧 `get_log`
 /// 相对。前端每轮轮询调一次；返回非空就显示给用户。
 #[tauri::command]
-fn take_alerts(state: tauri::State<'_, GuiState>) -> Vec<String> {
-    let mut alerts = state.alerts.lock().unwrap_or_else(|error| error.into_inner());
-    std::mem::take(&mut *alerts)
+fn take_alerts(state: tauri::State<'_, Arc<Workbench>>) -> Vec<String> {
+    state.take_alerts()
 }
 
 /// 列 `inbox/*.jsonl`，**导入前就校验**（复用 `parse_prompts`，与 CLI 同一份契约）。
@@ -538,8 +127,8 @@ fn take_alerts(state: tauri::State<'_, GuiState>) -> Vec<String> {
 /// 为什么要在导入前校验：未知模型名在**出图时**才会静默退回默认模型 ——
 /// 几百条一起跑就是整批跑错。宁可在这里就报出来。
 #[tauri::command]
-fn list_inbox(state: tauri::State<'_, GuiState>) -> Result<Value, String> {
-    let dir = state.cwd.join("inbox");
+fn list_inbox(state: tauri::State<'_, Arc<Workbench>>) -> Result<Value, String> {
+    let dir = state.inbox_dir();
     // 与真正开跑**同一份**兜底参数（`.env` 的 LOVART_DEFAULT_*）：导入前的校验/预览
     // 若用内置默认值，用户会看到"检查通过"而跑出来的是另一组参数。
     let (defaults, _) = PromptDefaults::from_env();
@@ -619,7 +208,7 @@ fn inspect_jsonl(path: &Path, defaults: &PromptDefaults, in_inbox: bool) -> Resu
 /// 提示词文件可以放在任何目录，用户想导哪份就导哪份。
 #[tauri::command]
 fn pick_prompt_file(
-    state: tauri::State<'_, GuiState>,
+    state: tauri::State<'_, Arc<Workbench>>,
     app: tauri::AppHandle,
 ) -> Result<Option<String>, String> {
     let mut dialog = app
@@ -627,7 +216,7 @@ fn pick_prompt_file(
         .file()
         .set_title("选择提示词文件（.jsonl）")
         .add_filter("提示词文件", &["jsonl"]);
-    let inbox = state.cwd.join("inbox");
+    let inbox = state.inbox_dir();
     if inbox.is_dir() {
         dialog = dialog.set_directory(inbox);
     }
@@ -640,117 +229,25 @@ fn pick_prompt_file(
 
 /// 校验用户自选的一个文件（**只读，不移动**）。
 #[tauri::command]
-fn inspect_prompt_file(state: tauri::State<'_, GuiState>, path: String) -> Result<Value, String> {
+fn inspect_prompt_file(state: tauri::State<'_, Arc<Workbench>>, path: String) -> Result<Value, String> {
     let path = PathBuf::from(&path);
     if !path.extension().is_some_and(|ext| ext == "jsonl") {
         return Err(format!("不是 .jsonl 文件：{}", path.display()));
     }
     let (defaults, _) = PromptDefaults::from_env();
-    let in_inbox = is_inbox_child(&state.cwd, &path);
+    let in_inbox = is_inbox_child(&state.inbox_dir(), &path);
     inspect_jsonl(&path, &defaults, in_inbox)
-}
-
-/// 起一个批次：把 inbox 里的某个文件交给调度器跑。
-///
-/// ⚠️ **绝不自动开跑** —— 只有用户点了「开始」才走到这里。这是方案的硬约束：
-/// AI 写文件，人决定发不发。
-///
-/// ⚠️ **不是 `#[tauri::command]`**（2026-10-01，DEBT TD-05-15）：原先它注册进了
-/// `generate_handler!`，但前端一次都没调过它 —— 而它只被 `publish_queue` /
-/// `retry_one` / `retry_abnormal` **在 Rust 内部**调用。注册它等于**多开一个没守的入口**：
-/// 前端可以传任意 `file` 路径直接开跑，绕过 `publish_queue` 的落盘与校验。
-fn start_run(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, GuiState>,
-    source: RunSource,
-) -> Result<(), String> {
-    // ── 两种来源：声明 / 派工（理由见 [`RunSource`]）─────────────────
-    let batch = match source {
-        // 声明：编辑框投喂的任务，校验与 id 已在 `intake::tasks_from_inputs` 完成。
-        RunSource::Declared(tasks) => Batch::Declared(tasks),
-        // 派工：**不解析参考图** —— 记录里的垫图已经是 CDN URL，重传一遍纯属浪费。
-        RunSource::Records(ids) => Batch::Records(ids),
-    };
-
-    // **惰性启动**：第一次投喂才读凭据 / 开状态文件。没配凭据的用户此刻才看到错，
-    // 与改造前「点发布才报错」一致。
-    let scheduler = state.ensure_scheduler(&app)?;
-
-    // 参考图解析要联网 + 读写缓存 ⇒ 后台线程；投喂也在同一线程并持有 `intake_lock`
-    // （`refs-cache.json` 是「读-合并-写」，并发投喂会互相覆盖）。
-    let app_for_thread = app.clone();
-    std::thread::spawn(move || {
-        let Some(state) = app_for_thread.try_state::<GuiState>() else {
-            return;
-        };
-        let _guard = state
-            .intake_lock
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-
-        let mut batch = batch;
-        // ⚠️ **只有"声明"要解析参考图**（派工的垫图已经是 CDN URL，重传一遍纯属浪费）。
-        if let Batch::Declared(tasks) = &mut batch {
-            let refs_cache = state.cwd.join("var/refs-cache.json");
-            let deps = scheduler.deps();
-            if let Err(message) = crate::run::resolve_refs_core(
-                &deps,
-                tasks,
-                &state.cwd,
-                &[],
-                Some(refs_cache.as_path()),
-            ) {
-                state.push_alert(&format!("参考图处理失败，这一批没有开跑：{message}"));
-                return;
-            }
-        }
-
-        match scheduler.enqueue(batch) {
-            Ok(outcome) => {
-                if !outcome.opened {
-                    // 会话内追加：与「批次开始」分开记，第二天能看出是中途加过任务。
-                    crate::engine::runlog::line(&format!(
-                        "===== 会话内追加：{} 条 =====",
-                        outcome.tasks.len()
-                    ));
-                }
-                // 被拒绝的条目必须**明说**：编辑框保留文字后用户会重复点提交，
-                // 静默跳过就是「假成功」（界面说已提交，实际什么都没发生）。
-                if !outcome.rejected.is_empty() {
-                    let mut lines: Vec<String> = outcome
-                        .rejected
-                        .iter()
-                        .take(3)
-                        .map(|rejection| rejection.describe())
-                        .collect();
-                    if outcome.rejected.len() > 3 {
-                        lines.push(format!("……另有 {} 条", outcome.rejected.len() - 3));
-                    }
-                    state.push_alert(&format!(
-                        "有 {} 条没有提交：{}",
-                        outcome.rejected.len(),
-                        lines.join("；")
-                    ));
-                }
-            }
-            Err(error) => {
-                state.push_alert(&format!("投喂失败：{}", error.message()));
-            }
-        }
-    });
-
-    Ok(())
 }
 
 /// 出图模型清单（前端下拉用）。
 ///
-/// ⚠️ **与 `--list-models --json` 共用同一份投影**（`run::image_models_json`）——
+/// ⚠️ **与 `--list-models --json` 共用同一份投影**（`service::meta::image_models_json`）——
 /// 这里曾自己 `filter + map` 一遍，键名写成 `id`（CLI 那边是 `alias`）：
 /// 同一份数据、同一个二进制、两个键名，正是「同一个事实两个投影」。
 /// 别名才是本工具的对外契约（`prompts.jsonl` 的 `model` 字段写的就是它）。
 #[tauri::command]
 fn list_models() -> Vec<Value> {
-    crate::run::image_models_json()
+    crate::service::meta::image_models_json()
 }
 
 /// 读一个提示词文件 → 前端用的任务 JSON（**唯一投影**）。
@@ -820,7 +317,7 @@ fn validate_draft(text: String) -> Result<Value, String> {
 /// `lovart-client --prompts 它 --check`，也能被「导入」读回来。
 #[tauri::command]
 fn export_draft(
-    state: tauri::State<'_, GuiState>,
+    state: tauri::State<'_, Arc<Workbench>>,
     app: tauri::AppHandle,
     text: String,
 ) -> Result<Option<String>, String> {
@@ -834,7 +331,7 @@ fn export_draft(
             chrono::Local::now().format("%Y%m%d-%H%M")
         ));
     // 起始目录给 `inbox/`：下次「导入」直接能在列表里看到它。
-    let inbox = state.cwd.join("inbox");
+    let inbox = state.inbox_dir();
     if inbox.is_dir() {
         dialog = dialog.set_directory(inbox);
     }
@@ -847,8 +344,8 @@ fn export_draft(
 }
 
 #[tauri::command]
-fn import_inbox(state: tauri::State<'_, GuiState>, file: String) -> Result<Value, String> {
-    import_inbox_core(&state.cwd, Path::new(&file))
+fn import_inbox(state: tauri::State<'_, Arc<Workbench>>, file: String) -> Result<Value, String> {
+    import_inbox_core(&state.inbox_dir(), Path::new(&file))
 }
 
 /// 把前端读出来的 `data:` 垫图落成本机文件，返回绝对路径。
@@ -869,8 +366,8 @@ fn save_ref_image_core(dir: &Path, data: &str) -> Result<String, String> {
 ///
 /// **async**：解码 10MB base64 是几百毫秒级的活，不能压在主线程上。
 #[tauri::command]
-async fn save_ref_image(state: tauri::State<'_, GuiState>, data: String) -> Result<String, String> {
-    let dir = state.cwd.join("var").join("refs");
+async fn save_ref_image(state: tauri::State<'_, Arc<Workbench>>, data: String) -> Result<String, String> {
+    let dir = state.refs_dir();
     tauri::async_runtime::spawn_blocking(move || save_ref_image_core(&dir, &data))
         .await
         .map_err(|error| format!("保存垫图线程异常退出：{error}"))?
@@ -878,14 +375,14 @@ async fn save_ref_image(state: tauri::State<'_, GuiState>, data: String) -> Resu
 
 /// 导入的**核心** —— 不依赖 Tauri，集成测试直接打这里。
 ///
-/// （`import_inbox` 只是把 `cwd` 从 `State` 里取出来。分开的理由与 `run::build_status_json`
+/// （`import_inbox` 只是把 `cwd` 从 `State` 里取出来。分开的理由与 `service::snapshot::build_status_json`
 /// 相同：**能力要有一个不绑框架的入口**，否则只能靠真跑 GUI 才能验证。）
-pub fn import_inbox_core(cwd: &Path, file: &Path) -> Result<Value, String> {
+pub fn import_inbox_core(inbox: &Path, file: &Path) -> Result<Value, String> {
     let value = prompts_json(file)?;
     // ⚠️ 只归位 `inbox/` 的**直属**文件。用户从别的目录挑来的文件属于他自己的文件夹：
     // 搬走 = 替用户动了别人的目录（且不可逆）。防重复导入靠前端队列里看得见的重复条目。
-    if is_inbox_child(cwd, file) {
-        move_to_imported(cwd, file)?;
+    if is_inbox_child(inbox, file) {
+        move_to_imported(inbox, file)?;
     }
     Ok(value)
 }
@@ -893,11 +390,11 @@ pub fn import_inbox_core(cwd: &Path, file: &Path) -> Result<Value, String> {
 /// 这个文件是不是 `inbox/` 的直属子项（`inbox/imported/` 里的不算）。
 ///
 /// 比较**父目录**而不是拼字符串：`..`、相对路径、符号链接都能对上真实位置。
-fn is_inbox_child(cwd: &Path, file: &Path) -> bool {
+fn is_inbox_child(inbox: &Path, file: &Path) -> bool {
     let Some(parent) = file.parent() else {
         return false;
     };
-    let Ok(inbox) = std::fs::canonicalize(cwd.join("inbox")) else {
+    let Ok(inbox) = std::fs::canonicalize(inbox) else {
         return false;
     };
     std::fs::canonicalize(parent).is_ok_and(|dir| dir == inbox)
@@ -906,8 +403,8 @@ fn is_inbox_child(cwd: &Path, file: &Path) -> bool {
 /// 把导入过的 inbox 文件移进 `inbox/imported/`。
 ///
 /// 重名**加时间戳**，不覆盖 —— 同名文件很可能是**另一批**提示词，覆盖 = 丢数据。
-fn move_to_imported(cwd: &Path, file: &Path) -> Result<(), String> {
-    let dir = cwd.join("inbox").join("imported");
+fn move_to_imported(inbox: &Path, file: &Path) -> Result<(), String> {
+    let dir = inbox.join("imported");
     std::fs::create_dir_all(&dir).map_err(|error| format!("建 inbox/imported 失败：{error}"))?;
     let name = file
         .file_name()
@@ -924,34 +421,15 @@ fn move_to_imported(cwd: &Path, file: &Path) -> Result<(), String> {
     std::fs::rename(file, &target).map_err(|error| format!("搬去 inbox/imported 失败：{error}"))
 }
 
-/// 起一批要跑的活 —— **两种来源**（语义分界见 `engine::scheduler::Batch`）。
-///
-/// ⚠️ **派工不走文件**：原先「重跑 / 接着查 / 确认」都是先**伪造**一份单行提示词文件
-///    再交给调度器。伪造用的 `record_to_task` 只挑 4 个字段 ⇒ 垫图在那份"声明"里为空
-///    ⇒ 调度器按「以文件为准」把记录里的垫图覆盖掉（2026-10-01 实测：确认后垫图消失）。
-///    这里把两种来源分开：**声明以本次投喂为准，派工以记录为准**。
-enum RunSource {
-    /// 用户从编辑框投喂的任务（**声明**）：校验与 id 已由 `intake` 完成。
-    Declared(Vec<crate::lovart::prompt::PromptTask>),
-    /// 对已有记录的派工：只处理这些 id（**记录才是真相**）。
-    Records(Vec<String>),
-}
-
 /// 发布队列 —— 落文件后走**与 CLI 同一条开跑路径**。
 #[tauri::command]
 async fn publish_queue(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, GuiState>,
+    state: tauri::State<'_, Arc<Workbench>>,
     tasks: Vec<crate::engine::intake::TaskInput>,
 ) -> Result<(), String> {
     // 结构化入参：**不再**落 `queue.jsonl` 再读回来（那是同一份数据的第二次序列化）。
     // 校验 / id / 默认值全部由 `intake` 一处完成，与 CLI 解析文件共用同一批函数。
-    let (defaults, _) = PromptDefaults::from_env();
-    let parsed = crate::engine::intake::tasks_from_inputs(&tasks, &defaults)?;
-    if parsed.is_empty() {
-        return Err("待发是空的".to_string());
-    }
-    start_run(app, state, RunSource::Declared(parsed))
+    state.publish(tasks).map(|_| ())
 }
 
 /// 重跑 = **显式**把这条重置为待提交。
@@ -962,7 +440,7 @@ async fn publish_queue(
 ///    它们还是有效的 CDN 地址，重跑当然要接着用。
 ///
 /// ⚠️ 必须做在起批**之前**：派工只处理**非终态**记录，终态的没重置就不会被处理。
-fn reset_for_retry(state: &tauri::State<'_, GuiState>, id: &str) -> Result<(), String> {
+fn reset_for_retry(state: &tauri::State<'_, Arc<Workbench>>, id: &str) -> Result<(), String> {
     match state.scheduler_snapshot() {
         // 走调度器：锁内重置，与 worker 串行。跑批中也允许（旧的「先停止」闸撤掉）。
         Some(scheduler) => scheduler
@@ -982,8 +460,7 @@ fn reset_for_retry(state: &tauri::State<'_, GuiState>, id: &str) -> Result<(), S
 /// 重跑某一条（异常行菜单里的「重跑这一条」）。
 #[tauri::command]
 async fn retry_one(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, GuiState>,
+    state: tauri::State<'_, Arc<Workbench>>,
     id: String,
 ) -> Result<(), String> {
     let store = StateStore::open_read_only(&state.state_file()).map_err(|error| error.to_string())?;
@@ -993,14 +470,14 @@ async fn retry_one(
         .find(|item| item.id == id)
         .ok_or_else(|| format!("找不到这条任务：{id}"))?
         .clone();
-    if !crate::run::is_retryable(record.status) {
+    if !is_retryable(record.status) {
         return Err("这一条重跑没有意义（内容没过审 / 已按政策拒绝）".to_string());
     }
     // ⚠️ 原先这里有第二道闸：「用了垫图就不许重跑」。它不是设计，是在硬扛
     //    `record_to_task` 丢字段 —— 重跑必须重置记录，而旧路子的重置会把垫图一起清掉。
     //    现在重置是**显式**的、**垫图原样保留** ⇒ 闸撤掉，能力恢复。
     reset_for_retry(&state, &id)?;
-    start_run(app, state, RunSource::Records(vec![id]))
+    state.start_run(RunSource::Records(vec![id]))
 }
 
 /// 「接着查这一条」—— 把**这一条**未完成记录交回调度器
@@ -1013,8 +490,7 @@ async fn retry_one(
 /// 不在这里写第二份"哪些状态能接着查"。
 #[tauri::command]
 async fn resume_one(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, GuiState>,
+    state: tauri::State<'_, Arc<Workbench>>,
     id: String,
 ) -> Result<(), String> {
     let store = StateStore::open_read_only(&state.state_file()).map_err(|error| error.to_string())?;
@@ -1028,7 +504,7 @@ async fn resume_one(
     if !row.actions.contains(&crate::engine::state::Action::Resume) {
         return Err(format!("「{}」没有「接着查」这个动作", row.label));
     }
-    start_run(app, state, RunSource::Records(vec![id]))
+    state.start_run(RunSource::Records(vec![id]))
 }
 
 /// 「确认并继续」**之前**先看一眼要花什么 —— **只读，不花钱**。
@@ -1042,7 +518,7 @@ async fn resume_one(
 /// **不猜字段名**（官方文档只给了模板 `{estimated_cost}`，真实形状没实测过；
 /// 猜一个字段名就是把不知道的数字写成肯定句）。
 #[tauri::command]
-fn preview_confirm(state: tauri::State<'_, GuiState>, id: String) -> Result<Value, String> {
+fn preview_confirm(state: tauri::State<'_, Arc<Workbench>>, id: String) -> Result<Value, String> {
     let (_record, thread_id) = confirmable(&state, &id)?;
     let deps = to_client_deps(&resolve_connection()?)?;
     let result =
@@ -1061,7 +537,7 @@ fn preview_confirm(state: tauri::State<'_, GuiState>, id: String) -> Result<Valu
 /// [`preview_confirm`] 与 [`confirm_task`] 共用它。两处各写一遍
 /// 「读表有没有 `Confirm` / 有没有 `threadId`」就是同一能力的两份判据（一归闸）。
 fn confirmable(
-    state: &tauri::State<'_, GuiState>,
+    state: &tauri::State<'_, Arc<Workbench>>,
     id: &str,
 ) -> Result<(TaskRecord, String), String> {
     let store = StateStore::open_read_only(&state.state_file()).map_err(|error| error.to_string())?;
@@ -1099,8 +575,7 @@ fn confirmable(
 /// 确认只能由人按，进了队列就是"下次跑批自动确认"，即静默花钱。
 #[tauri::command]
 async fn confirm_task(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, GuiState>,
+    state: tauri::State<'_, Arc<Workbench>>,
     id: String,
 ) -> Result<String, String> {
     let (_record, thread_id) = confirmable(&state, &id)?;
@@ -1133,18 +608,18 @@ async fn confirm_task(
 
     // A 方案：**立刻单独把这一条跑掉** —— **派工，不经过提示词文件**
     // （经过文件就会按"以文件为准"把记录里的垫图覆盖掉，那是本次修的 bug）。
-    start_run(app, state, RunSource::Records(vec![id]))?;
+    state.start_run(RunSource::Records(vec![id]))?;
     Ok("已确认，正在接着跑".to_string())
 }
 
 /// 重跑全部**可重跑**的异常。返回一句人话说明跳过了什么。
 #[tauri::command]
-fn retry_abnormal(app: tauri::AppHandle, state: tauri::State<'_, GuiState>) -> Result<String, String> {
+fn retry_abnormal(state: tauri::State<'_, Arc<Workbench>>) -> Result<String, String> {
     let store = StateStore::open_read_only(&state.state_file()).map_err(|error| error.to_string())?;
     let all: Vec<_> = store.all().into_iter().cloned().collect();
     let retryable: Vec<_> = all
         .iter()
-        .filter(|record| crate::run::is_retryable(record.status))
+        .filter(|record| is_retryable(record.status))
         .collect();
     if retryable.is_empty() {
         return Err("没有可重跑的异常".to_string());
@@ -1156,7 +631,7 @@ fn retry_abnormal(app: tauri::AppHandle, state: tauri::State<'_, GuiState>) -> R
         reset_for_retry(&state, id)?;
     }
     let count = ids.len();
-    start_run(app, state, RunSource::Records(ids))?;
+    state.start_run(RunSource::Records(ids))?;
     Ok(format!("已重跑 {count} 条"))
 }
 
@@ -1175,11 +650,11 @@ fn retry_abnormal(app: tauri::AppHandle, state: tauri::State<'_, GuiState>) -> R
 /// · 没有 `threadId` 的（上次连提交都没跑完）返回 `upstream: null` —— 上游没有这个东西，
 ///   无从探测，这不是错误。
 /// 探测的**实现**（不绑 Tauri，阻塞式网络请求全在这里）。
-fn probe_unfinished_core(cwd: &Path) -> Result<Value, String> {
-    load_dot_env(&cwd.join(".env"))?;
+fn probe_unfinished_core(env_path: &Path, state_file: &Path) -> Result<Value, String> {
+    load_dot_env(env_path)?;
     let connection = resolve_connection()?;
     let deps = to_client_deps(&connection)?;
-    let store = StateStore::open_read_only(&cwd.join("var/state.jsonl"))
+    let store = StateStore::open_read_only(state_file)
         .map_err(|error| error.to_string())?;
 
     let mut probes: Vec<Value> = Vec::new();
@@ -1229,15 +704,21 @@ fn probe_unfinished_core(cwd: &Path) -> Result<Value, String> {
 /// HTTP（单次超时 60s）—— 写成同步就是"点开界面卡住几十秒"。
 /// `async` + `spawn_blocking` 把阻塞的活挪到工作线程，界面始终能响应。
 #[tauri::command]
-async fn probe_unfinished(state: tauri::State<'_, GuiState>) -> Result<Value, String> {
-    let cwd = state.cwd.clone();
-    let probes = tauri::async_runtime::spawn_blocking(move || probe_unfinished_core(&cwd))
+async fn probe_unfinished(
+    state: tauri::State<'_, Arc<Workbench>>,
+    view: tauri::State<'_, Mutex<GuiViewCache>>,
+) -> Result<Value, String> {
+    let env_path = state.env_path();
+    let state_file = state.state_file();
+    let probes = tauri::async_runtime::spawn_blocking(move || {
+        probe_unfinished_core(&env_path, &state_file)
+    })
         .await
         .map_err(|error| format!("探测线程异常退出：{error}"))?;
     // ⚠️ 探测结论**不落** `state.jsonl`（它是界面标题行那句话的原料）⇒ 文件指纹不变。
     //    不作废缓存，标题行会永远停在「探测中…」（`upstreamSummary()` 进了前端签名，
     //    但签名只在收到全量载荷时才算）。
-    state.invalidate_view();
+    view.lock().unwrap_or_else(|error| error.into_inner()).clear();
     probes
 }
 
@@ -1257,7 +738,7 @@ async fn probe_unfinished(state: tauri::State<'_, GuiState>) -> Result<Value, St
 /// 界面上它只在**真有没人跟的未完成记录**时出现（见 `ui/app.js` 的 `renderBoard`），
 /// 所以正常跑批时它是一个不存在的按钮，不会诱导用户乱点。
 #[tauri::command]
-fn resume_unfinished(app: tauri::AppHandle, state: tauri::State<'_, GuiState>) -> Result<String, String> {
+fn resume_unfinished(state: tauri::State<'_, Arc<Workbench>>) -> Result<String, String> {
     let store = StateStore::open_read_only(&state.state_file()).map_err(|error| error.to_string())?;
     let all: Vec<_> = store.all().into_iter().cloned().collect();
     let unfinished: Vec<_> = all
@@ -1269,7 +750,7 @@ fn resume_unfinished(app: tauri::AppHandle, state: tauri::State<'_, GuiState>) -
     }
     let ids: Vec<String> = unfinished.iter().map(|record| record.id.clone()).collect();
     let count = ids.len();
-    start_run(app, state, RunSource::Records(ids))?;
+    state.start_run(RunSource::Records(ids))?;
     Ok(format!("已接着查 {count} 条"))
 }
 
@@ -1291,7 +772,7 @@ fn resume_unfinished(app: tauri::AppHandle, state: tauri::State<'_, GuiState>) -
 /// 保留的代价（**由界面负责说清**）：未完成的任务，上游可能**还在生成**；
 /// 删掉本地记录后没人去取那张图，它会变成上游的孤儿。所以前端删除前弹确认。
 #[tauri::command]
-async fn remove_tasks(state: tauri::State<'_, GuiState>, ids: Vec<String>) -> Result<usize, String> {
+async fn remove_tasks(state: tauri::State<'_, Arc<Workbench>>, ids: Vec<String>) -> Result<usize, String> {
     if ids.is_empty() {
         return Ok(0);
     }
@@ -1310,11 +791,14 @@ async fn remove_tasks(state: tauri::State<'_, GuiState>, ids: Vec<String>) -> Re
 
 /// 删除看板上**某一组**的记录（无调度器分支），返回删除条数。
 ///
-/// 「哪一组」由调用方传判据（`run::is_board_*`）—— 这是**唯一**的"改文件"实现：
+/// 「哪一组」由调用方传判据（`engine::group::is_board_*`）—— 这是**唯一**的"改文件"实现：
 /// 三组各抄一份的话，`ids.is_empty()`（一条都没有时**不写盘**）这类细节迟早漏一份。
 ///
 /// 一次 `remove` = 一次 `compact`（临时文件 + rename）⇒ 要么全删要么全不删。
-fn remove_board_tasks_core(state_file: &Path, keep: fn(TaskStatus) -> bool) -> Result<usize, String> {
+///
+/// ⚠️ `pub` 是为了集成测试（`tests/cancel_all.rs` 直接测"选谁 + 该不该写盘"）；
+/// 业务调用一律走 `remove_board_tasks`（有调度器时走调度器的 `remove_where`）。
+pub fn remove_board_tasks_core(state_file: &Path, keep: fn(TaskStatus) -> bool) -> Result<usize, String> {
     let mut store = StateStore::open(state_file).map_err(|error| error.to_string())?;
     let ids: Vec<String> = store
         .all()
@@ -1333,14 +817,18 @@ fn remove_board_tasks_core(state_file: &Path, keep: fn(TaskStatus) -> bool) -> R
 ///
 /// 三个板级清理动作（未结束 / 排队 / 已完成）只差"挑哪些"这一个判据，
 /// 删除路径只有这一条 ⇒ 不再出现三份 `match scheduler_snapshot()`。
-fn remove_board_tasks(state: &GuiState, keep: fn(TaskStatus) -> bool) -> Result<usize, String> {
+fn remove_board_tasks(
+    state: &Arc<Workbench>,
+    view: &Mutex<GuiViewCache>,
+    keep: fn(TaskStatus) -> bool,
+) -> Result<usize, String> {
     let cleared = match state.scheduler_snapshot() {
         Some(scheduler) => scheduler
             .remove_where(keep)
             .map_err(|error| error.message().to_string())?,
         None => remove_board_tasks_core(&state.state_file(), keep)?,
     };
-    state.invalidate_view();
+    view.lock().unwrap_or_else(|error| error.into_inner()).clear();
     Ok(cleared)
 }
 
@@ -1348,8 +836,15 @@ fn remove_board_tasks(state: &GuiState, keep: fn(TaskStatus) -> bool) -> Result<
 ///
 /// 不碰批次（已结束的记录本来没人在跟）；只删记录，图片文件与报告都不动。
 #[tauri::command]
-async fn clear_finished_tasks(state: tauri::State<'_, GuiState>) -> Result<usize, String> {
-    remove_board_tasks(state.inner(), crate::run::is_board_finished)
+async fn clear_finished_tasks(
+    state: tauri::State<'_, Arc<Workbench>>,
+    view: tauri::State<'_, Mutex<GuiViewCache>>,
+) -> Result<usize, String> {
+    remove_board_tasks(
+        state.inner(),
+        view.inner(),
+        crate::engine::group::is_board_finished,
+    )
 }
 
 /// 取消**排队中**（还没提交）的任务：删除 `queued` 组的记录，返回删除条数。
@@ -1358,8 +853,15 @@ async fn clear_finished_tasks(state: tauri::State<'_, GuiState>) -> Result<usize
 /// 已提交的（`active`）和上游等你确认的（`waiting`）都不动。
 /// 这些记录还没有 `threadId`（上游不知道它们存在）⇒ 删除没有上游副作用。
 #[tauri::command]
-async fn cancel_queued_tasks(state: tauri::State<'_, GuiState>) -> Result<usize, String> {
-    remove_board_tasks(state.inner(), crate::run::is_board_queued)
+async fn cancel_queued_tasks(
+    state: tauri::State<'_, Arc<Workbench>>,
+    view: tauri::State<'_, Mutex<GuiViewCache>>,
+) -> Result<usize, String> {
+    remove_board_tasks(
+        state.inner(),
+        view.inner(),
+        crate::engine::group::is_board_queued,
+    )
 }
 
 /// 取消所有未完成任务：**停会话** + 删除看板未结束的记录，返回 `{ cleared }`。
@@ -1367,15 +869,18 @@ async fn cancel_queued_tasks(state: tauri::State<'_, GuiState>) -> Result<usize,
 /// ⚠️ 比另外两个多一步"停会话"（`remove_open` 内部置 `stopped` / `cancelled` 并
 /// 关掉本次会话），所以它不能走 [`remove_board_tasks`]；没有调度器时只剩"删记录"。
 #[tauri::command]
-async fn cancel_all_tasks(state: tauri::State<'_, GuiState>) -> Result<Value, String> {
+async fn cancel_all_tasks(
+    state: tauri::State<'_, Arc<Workbench>>,
+    view: tauri::State<'_, Mutex<GuiViewCache>>,
+) -> Result<Value, String> {
     let cleared = match state.scheduler_snapshot() {
         Some(scheduler) => scheduler
             .remove_open()
             .map_err(|error| error.message().to_string())?,
         // 还没建调度器 ⇒ 没有写者在跑。
-        None => remove_board_tasks_core(&state.state_file(), crate::run::is_board_open)?,
+        None => remove_board_tasks_core(&state.state_file(), crate::engine::group::is_board_open)?,
     };
-    state.invalidate_view();
+    view.lock().unwrap_or_else(|error| error.into_inner()).clear();
     Ok(json!({ "cleared": cleared }))
 }
 
@@ -1410,7 +915,7 @@ fn reveal_path(path: String) -> Result<(), String> {
 
 /// 打开输出文件夹。
 #[tauri::command]
-fn open_output_dir(state: tauri::State<'_, GuiState>) -> Result<(), String> {
+fn open_output_dir(state: tauri::State<'_, Arc<Workbench>>) -> Result<(), String> {
     let dir = state.output_dir();
     std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     reveal_path(dir.display().to_string())
@@ -1422,11 +927,11 @@ fn open_output_dir(state: tauri::State<'_, GuiState>) -> Result<(), String> {
 /// 原先两者都是 `unwrap_or_default()` ⇒ 读失败时界面显示空白，
 /// 用户以为密钥丢了（DEBT TD-05-19）。
 #[tauri::command]
-fn get_settings(state: tauri::State<'_, GuiState>) -> Result<Value, String> {
+fn get_settings(state: tauri::State<'_, Arc<Workbench>>) -> Result<Value, String> {
     // **读文件**，不读进程环境（`docs/plan/07` N7）：
     // 手改 `.env` 后打开设置页，若读环境会显示旧值，用户一点保存就把手改覆盖掉。
     // 设置页显示 = 文件内容 = 点「开始」后的生效值（`start_run` 会 reload）。
-    let (current, warnings) = Settings::from_file(&state.cwd.join(".env"))?;
+    let (current, warnings) = Settings::from_file(&state.env_path())?;
     Ok(json!({
         "accessKey": current.access_key,
         "secretKey": current.secret_key,
@@ -1455,12 +960,9 @@ fn get_settings(state: tauri::State<'_, GuiState>) -> Result<Value, String> {
 ///
 /// ⚠️ 读失败**绝不能兜底成空**：那会把用户的配置整个冲掉（DEBT TD-05-19）。
 #[tauri::command]
-fn save_settings(state: tauri::State<'_, GuiState>, payload: Value) -> Result<Value, String> {
-    let path = state.cwd.join(".env");
-    let _guard = state
-        .env_lock
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+fn save_settings(state: tauri::State<'_, Arc<Workbench>>, payload: Value) -> Result<Value, String> {
+    let path = state.env_path();
+    let _guard = state.lock_env();
 
     // 先读**文件当前值**：差异写靠它（N8），非法键修复也靠它（N16）。
     let (current, file_warnings) = Settings::from_file(&path)?;
@@ -1475,7 +977,7 @@ fn save_settings(state: tauri::State<'_, GuiState>, payload: Value) -> Result<Va
     }
 
     // ⚠️ 必须是 `reload_dot_env` 而不是 `load_dot_env`：后者是「不覆盖」语义，
-    // 而 `GuiState::new` 启动时已经载入过一次 ⇒ 用它会**整段跳过**
+    // 而 `Workbench::new` 启动时已经载入过一次 ⇒ 用它会**整段跳过**
     // —— 文件改了、运行时还用旧值（DEBT TD-05-11）。
     //
     // reload 失败**不回滚、不返回 Err**：盘已经改了，报错会让用户以为没保存而反复点。
@@ -1501,15 +1003,12 @@ fn save_settings(state: tauri::State<'_, GuiState>, payload: Value) -> Result<Va
 /// ⚠️ 顺序必须是「先写盘成功、后改内存」：反过来会出现"界面显示开、磁盘是 false"，
 /// 重启后悄悄变回去 —— 又一个"看着生效其实没生效"。
 #[tauri::command]
-fn set_auto_confirm(state: tauri::State<'_, GuiState>, enabled: bool) -> Result<bool, String> {
-    let _guard = state
-        .env_lock
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let path = state.cwd.join(".env");
+fn set_auto_confirm(state: tauri::State<'_, Arc<Workbench>>, enabled: bool) -> Result<bool, String> {
+    let _guard = state.lock_env();
+    let path = state.env_path();
     let value = if enabled { "true" } else { "false" };
     update_env_keys(&path, &[(AUTO_CONFIRM_KEY, value.to_string())])?;
-    state.auto_confirm.store(enabled, Ordering::Relaxed);
+    state.set_auto_confirm(enabled);
     Ok(enabled)
 }
 
@@ -1526,33 +1025,23 @@ fn set_auto_confirm(state: tauri::State<'_, GuiState>, enabled: bool) -> Result<
 /// 第二种失败语义，而收益只是把窗口从"下一条提交前"缩到"此刻" ——
 /// 不提交本来就不花钱。见 `docs/plan/14` §5「不做」。
 #[tauri::command]
-fn set_spend_mode(state: tauri::State<'_, GuiState>, enabled: bool) -> bool {
-    state.spend_mode.store(enabled, Ordering::Relaxed);
+fn set_spend_mode(state: tauri::State<'_, Arc<Workbench>>, enabled: bool) -> bool {
+    state.set_spend_mode(enabled);
     enabled
 }
 
 /// 停止当前批次（协作式取消：调度器会在下一个检查点退出）。
 #[tauri::command]
-async fn stop_run(state: tauri::State<'_, GuiState>) -> Result<(), String> {
-    let scheduler = {
-        let slot = state
-            .scheduler
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        slot.clone()
-    };
-    match scheduler {
-        Some(scheduler) => {
-            scheduler.stop_session();
-            state.invalidate_view();
-            // 取消是**协作式**的：最坏要等当前那次 HTTP 请求超时（60 秒）才真的退出。
-            // 这句必须让用户看到 —— 否则点完界面没动静，用户以为按钮坏了。
-            state.push_alert("已请求停止：最坏要等当前这次请求结束（约 60 秒）才真正退出");
-            Ok(())
-        }
-        // 调度器还没建 ⇒ 从来没投喂过，没有在跑的会话。
-        None => Err("当前没有在跑的批次".to_string()),
-    }
+async fn stop_run(
+    state: tauri::State<'_, Arc<Workbench>>,
+    view: tauri::State<'_, Mutex<GuiViewCache>>,
+) -> Result<(), String> {
+    // 取消是**协作式**的：最坏要等当前那次 HTTP 请求超时（60 秒）才真的退出。
+    // 这句必须让用户看到 —— 否则点完界面没动静，用户以为按钮坏了。
+    let ack = state.stop()?;
+    view.lock().unwrap_or_else(|error| error.into_inner()).clear();
+    state.push_alert(&ack.note);
+    Ok(())
 }
 
 // ⚠️ `get_log` / `get_cwd` 已删（2026-10-01，DEBT TD-05-15）：
@@ -1654,19 +1143,22 @@ pub fn run() {
             std::process::exit(1);
         }
     };
-    // 单实例锁的路径先算好：`cwd` 随后被 move 进 `GuiState`。
-    let lock_path = cwd.join("var/.lock");
+    // 锁路径由 `Workbench` 给：与 `state_file` / `output_dir` 同一处定义（ADR-0001）。
+    let core = Workbench::new(cwd);
+    let lock_path = core.lock_path();
     tauri::Builder::default()
         // 原生文件对话框（`pick_prompt_file` 用它）：提示词文件不绑定 `inbox/`。
         .plugin(tauri_plugin_dialog::init())
-        .manage(GuiState::new(cwd))
+        .manage(core)
+        // 看板缓存只在 GUI 层（service 无缓存 ⇒ HTTP 不可能拿到 unchanged）。
+        .manage(Mutex::new(GuiViewCache::default()))
         .setup(move |app| {
             // `state.jsonl` 只有一个写者（`engine::lockfile` 文件头）。
             // 放在 setup 而不是 `run()` 开头：抢不到时要能弹对话框 ——
             // GUI 没有可见终端（`windows_subsystem = "windows"`），
             // 只 `eprintln!` 就是「双击没反应」。
             match FileLock::acquire(&lock_path) {
-                Ok(lock) => app.state::<GuiState>().hold_lock(lock),
+                Ok(lock) => app.state::<Arc<Workbench>>().hold_lock(lock),
                 Err(message) => {
                     app.dialog()
                         .message(message)
@@ -1675,13 +1167,16 @@ pub fn run() {
                     std::process::exit(1);
                 }
             }
+            // 本机 HTTP：只服务同一台机器上的另一个前端（token 在 `var/http-token`）。
+            // 失败只告警，不阻断 GUI（端口占用 / token 读失败）。
+            crate::http::spawn(app.state::<Arc<Workbench>>().inner().clone());
             Ok(())
         })
         // 关窗前把攒批的状态落盘：合并写之后不 drain，最多丢最近 2 秒的进度。
         // ⚠️ 只落盘、**不停 worker**（`shutdown` 要 join 在飞 HTTP，最坏 60 秒）。
         .on_window_event(|window, event| {
             if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
-                if let Some(state) = window.try_state::<GuiState>() {
+                if let Some(state) = window.try_state::<Arc<Workbench>>() {
                     if let Some(scheduler) = state.scheduler_snapshot() {
                         let _ = scheduler.flush_now();
                     }
@@ -1726,6 +1221,9 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 看板投影已下沉到 `service::snapshot`，这几项只在用例里直接构造。
+    use lovart_core::service::snapshot::ViewInput;
+    use std::collections::BTreeSet;
 
     // ── `get_state` 的「没变就别重算」缓存（v1–v4）────────────────────
     //
@@ -1814,32 +1312,27 @@ mod tests {
     fn v1_指纹没变_第二次必须命中且只回计时() {
         let dir = temp_dir("v1");
         let since = "2026-10-24T00:00:00.000Z";
-        let file = dir.join("state.jsonl");
+        std::fs::create_dir_all(dir.join("var")).expect("建 var");
+        let file = dir.join("var/state.jsonl");
         std::fs::write(&file, record_line("t1", "running", Some(since))).expect("写状态文件");
-        let input = input_of(file, dir);
-        let key = input.key();
-        let view = Mutex::new(ViewCache::default());
 
-        assert!(cached_payload(&view, &key).is_none(), "首次必须未命中");
-        let full = finish_payload(
-            &view,
-            &input,
-            key.clone(),
-            build_status_json(&input.state_file, &input.output_dir).expect("构造看板"),
-        );
-        assert_eq!(full["tasks"].as_array().map(Vec::len), Some(1));
-        assert_eq!(full["tasks"][0]["following"], json!(false));
+        // 走真实构造：`state_file` / `output_dir` 与生产路径同一套推导
+        let state = Workbench::new(dir);
+        let first = state.snapshot(None).expect("首次全量");
+        let payload = first.payload.expect("首次必须是全量");
+        assert_eq!(payload["tasks"].as_array().map(Vec::len), Some(1));
+        assert_eq!(payload["tasks"][0]["following"], json!(false));
 
-        let hit = cached_payload(&view, &key).expect("第二次必须命中");
-        assert_eq!(hit["unchanged"], json!(true));
-        assert_eq!(hit["elapsed"][0]["id"], json!("t1"));
+        let hit = state.snapshot(Some(&first.key)).expect("第二次");
+        assert!(hit.payload.is_none(), "命中时不许再带全量任务（那 4MB 就是白搭的）");
+        let unchanged = unchanged_payload(&first.active);
+        assert_eq!(unchanged["unchanged"], json!(true));
+        assert_eq!(unchanged["elapsed"][0]["id"], json!("t1"));
         assert!(
-            hit["elapsed"][0]["text"].as_str().is_some_and(|text| !text.is_empty()),
+            unchanged["elapsed"][0]["text"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty()),
             "命中时仍然要重算「已持续」——它是唯一每秒都在变的东西"
-        );
-        assert!(
-            hit["tasks"].is_null(),
-            "命中时不许再带全量任务（那 4MB 就是白搭的）"
         );
     }
 
@@ -1905,33 +1398,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn v4_探针回来必须作废缓存() {
-        let dir = temp_dir("v4");
-        std::fs::create_dir_all(dir.join("var")).expect("建 var");
-        let file = dir.join("var/state.jsonl");
-        std::fs::write(
-            &file,
-            record_line("t1", "running", Some("2026-10-24T00:00:00.000Z")),
-        )
-        .expect("写状态文件");
-
-        // 走真实构造：`state_file` / `output_dir` 与生产路径同一套推导
-        let state = GuiState::new(dir);
-        let input = view_input(&state);
-        let key = input.key();
-        finish_payload(
-            &state.view,
-            &input,
-            key.clone(),
-            build_status_json(&input.state_file, &input.output_dir).expect("构造看板"),
-        );
-        assert!(cached_payload(&state.view, &key).is_some(), "先造出命中");
-
-        state.invalidate_view();
-        assert!(
-            cached_payload(&state.view, &key).is_none(),
-            "探针结论不落盘，不作废缓存 ⇒ 标题行永远停在「探测中…」"
-        );
-    }
 }

@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
-use lovart_client::run::resolve_file;
+use lovart_client::engine::report::resolve_file;
 
 #[test]
 fn 相对路径按当前输出目录拼回来() {

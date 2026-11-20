@@ -27,7 +27,8 @@ PLIST_SRC="$ROOT/packaging/macos/Info.plist"
 # 只拷旧二进制不会更新界面。
 echo "==> cargo build --release"
 (cd "$ROOT/src-tauri" && cargo build --release)
-BIN="$ROOT/src-tauri/target/release/lovart-client"
+# 拆出 `crates/lovart-core` 后是 workspace：产物在**仓库根**的 target/。
+BIN="$ROOT/target/release/lovart-client"
 [ -x "$BIN" ] || { echo "构建产物不存在：$BIN" >&2; exit 1; }
 
 # ── 2. 图标 ─────────────────────────────────────────────────────────

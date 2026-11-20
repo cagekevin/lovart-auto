@@ -1,0 +1,8 @@
+[workspace]
+members = ["crates/lovart-core", "src-tauri"]
+resolver = "2"
+
+# 拆分理由（ADR-0004 / ADR-0009 级 1）：
+# `lovart-core` 的 Cargo.toml 里**没有 tauri** ⇒ 该 crate 内写 `use tauri::…`
+# 是编译错误（E0432），不需要任何 grep 检查。
+# `src-tauri` 只留 Tauri 适配（gui）与 CLI 入口（run/main）。

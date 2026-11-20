@@ -28,7 +28,7 @@ fn 导入后文件必须离开_inbox_并归位到_imported() {
     let cwd = temp_dir("move");
     let file = write_inbox_file(&cwd, "batch.jsonl", "{\"prompt\":\"一只猫\"}\n");
 
-    let tasks = import_inbox_core(&cwd, &file).expect("导入应当成功");
+    let tasks = import_inbox_core(&cwd.join("inbox"), &file).expect("导入应当成功");
     assert_eq!(tasks.as_array().map(Vec::len), Some(1), "应当返回 1 条任务");
 
     // ① 原文件必须**离开** `inbox/` —— 否则 `list_inbox` 还会列到它，用户能再导一遍。
@@ -52,7 +52,7 @@ fn 归位重名不覆盖_换名进_imported() {
     std::fs::write(imported.join("batch.jsonl"), "{\"prompt\":\"上一批\"}\n").expect("写占位");
 
     let file = write_inbox_file(&cwd, "batch.jsonl", "{\"prompt\":\"这一批\"}\n");
-    import_inbox_core(&cwd, &file).expect("导入应当成功");
+    import_inbox_core(&cwd.join("inbox"), &file).expect("导入应当成功");
 
     // 占位那份**必须还在且内容没变** —— 同名很可能是**另一批**提示词，覆盖 = 丢数据。
     let kept = std::fs::read_to_string(imported.join("batch.jsonl")).expect("读占位");
@@ -73,7 +73,7 @@ fn inbox_之外的文件导入后原地不动() {
     let file = outside.join("batch.jsonl");
     std::fs::write(&file, "{\"prompt\":\"一只狗\"}\n").expect("写外部文件");
 
-    let tasks = import_inbox_core(&cwd, &file).expect("导入应当成功");
+    let tasks = import_inbox_core(&cwd.join("inbox"), &file).expect("导入应当成功");
     assert_eq!(tasks.as_array().map(Vec::len), Some(1), "应当返回 1 条任务");
 
     // 用户的目录不许被程序改动：文件还在原地，`imported/` 里也不该多出副本。
@@ -90,7 +90,7 @@ fn 校验不过的文件留在_inbox_不被搬走() {
     // 非法 JSON ⇒ 解析必然报错。
     let file = write_inbox_file(&cwd, "bad.jsonl", "这不是 JSON\n");
 
-    let message = import_inbox_core(&cwd, &file).expect_err("非法文件必须报错");
+    let message = import_inbox_core(&cwd.join("inbox"), &file).expect_err("非法文件必须报错");
     assert!(message.contains("第 1 行"), "报错要指到行，实际：{message}");
 
     // 顺序判据：**先读+校验、再归位** —— 校验不过 ⇒ 文件原地不动，

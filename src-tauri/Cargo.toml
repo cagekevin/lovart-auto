@@ -18,32 +18,29 @@ path = "src/main.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+# 协议层 + 调度层。**本 crate 只留 Tauri 适配与 CLI 入口**；
+# 业务编排不许写在这里（第二入口 HTTP 拿不到窗口）。
+lovart-core = { path = "../crates/lovart-core" }
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# 只用来产 ISO 8601（`2026-10-01T06:55:44.394Z`）—— 必须与 JS 的 `toISOString()` 逐字符一致。
-# 刻意不开 `serde` 特性（避免拖进时区数据库），只开 `clock` + `std`。
+# GUI 侧产 ISO 8601（`elapsed` 文案、状态时间戳），必须与 JS `toISOString()` 一致。
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-# 提示词 id = `sha1(文本)` 前 12 位十六进制。
-# ⚠️ **必须是 sha1**，不能"顺手换成更安全的 sha256" —— 换了 id 全变，
-#    已有 state.jsonl 全部失效（断点续跑归零、整批重跑）。这是跨实现契约，不是安全选择。
-sha1 = "0.10"
-hex = "0.4"
-# base64 编解码（参考图 `data:` URL ↔ 字节）。
-base64 = "0.22"
-# SIGINT 处理。只用一个 `signal()` 调用，不引 ctrlc（少一棵依赖树）。
+# 只用于 CLI 的 SIGINT 处理（`run.rs`），一个 `signal()` 调用。
 libc = "0.2"
-# GUI 壳。**同一个二进制**：双击 = GUI，带子命令 = 无头 CLI（`PLAN-客户端.md` 决策 3）。
+# 本机 HTTP 接口（`src/http.rs`）：阻塞式、每请求一线程的极简服务器。
+# 只监听 127.0.0.1，不做 TLS —— 它只服务同一台机器上的另一个进程。
+tiny_http = "0.12"
+
+# GUI 壳。**同一个二进制**：双击 = GUI，带子命令 = 无头 CLI。
 # `protocol-asset` 是**必须的**：出图结果在本地盘上，前端要用 `<img>` 显示它们。
 # 没有这个特性，Tauri 会拒绝 `asset:` 协议 ⇒ 所有缩略图和大图都是白板（且不报错）。
 tauri = { version = "2", features = ["protocol-asset"] }
 # 原生「选择文件」对话框：提示词文件**不限于** `inbox/` —— 用户想导哪份就导哪份。
 # 用官方插件而不是自己调 Win32/rfd：跨平台行为一致（macOS 侧同一个二进制）。
 tauri-plugin-dialog = "2"
-# HMAC-SHA256 鉴权（`hmac` = RustCrypto 的标准实现，配 `sha2` 作底层哈希）。
-hmac = "0.12"
-sha2 = "0.10"
-# HTTP —— **刻意用 `blocking` 而不是 async/tokio**，理由见 `src/lovart/client.rs` 文件头：
-# 并发只有 ≤8 且全程在等 API，tokio 的价值用不上；而阻塞代码没有 Send/Sync 与 lifetime
-# 约束，对一个 AI 主写的库是实打实的正确性收益。
-# `rustls-tls` 而不是 native-tls：不依赖系统 OpenSSL，交叉编译与分发都简单。
+
+[dev-dependencies]
+# 集成测试（`tests/support/mod.rs`）起 mock HTTP 服务器用；运行时不使用。
+# 运行时依赖已全部在 `lovart-core`，这里只为测试保留。
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "multipart"] }

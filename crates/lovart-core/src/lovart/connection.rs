@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use super::client::{ClientDeps, ReqwestTransport};
+
 use super::config::DEFAULT_BASE_URL;
 
 /// 连接信息（对应 TS `LovartConnection`）。
@@ -355,23 +355,8 @@ pub fn resolve_connection() -> Result<Connection, String> {
     })
 }
 
-/// 由连接构造客户端依赖。
-///
-/// 轮询参数在这里从设置填入 —— `ClientDeps::new` 保持**纯构造**（不读环境），
-/// 因为三处测试直接调它，读了 env 就依赖开发机的 `.env`。
-pub fn to_client_deps(connection: &Connection) -> Result<ClientDeps, String> {
-    let transport = ReqwestTransport::new()?;
-    let mut deps = ClientDeps::new(
-        connection.base_url.clone(),
-        connection.access_key.clone(),
-        connection.secret_key.clone(),
-        std::sync::Arc::new(transport),
-    );
-    let (settings, _) = crate::engine::settings::Settings::from_env();
-    deps.poll_interval = settings.poll_interval();
-    deps.poll_max_interval = settings.poll_max_interval();
-    Ok(deps)
-}
+// `to_client_deps` 已移到 `service::wiring`：它要读 `engine::settings`，
+// 留在 lovart 就是 `lovart → engine` 的反向依赖（`ADR-0007`）。
 
 #[cfg(test)]
 mod tests {

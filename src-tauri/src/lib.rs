@@ -29,7 +29,11 @@
 //! | 7 | **对账已通过 ⇒ TS 参照实现已退场** | ✅ |
 
 pub mod cli;
-pub mod engine;
 pub mod gui;
-pub mod lovart;
+pub mod http;
 pub mod run;
+
+// 协议层与调度层已移入 `crates/lovart-core`（该 crate 的 Cargo.toml 没有 tauri，
+// 在那边写 `use tauri::…` 是 E0432 —— 结构护栏，不是扫描闸）。
+// `pub use` 让 `crate::engine` / `crate::lovart` 在本 crate 与 `tests/` 里照旧可用。
+pub use lovart_core::{engine, lovart, service};

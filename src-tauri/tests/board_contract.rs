@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use lovart_client::run::build_status_json;
+use lovart_client::service::snapshot::build_status_json;
 use serde_json::{json, Value};
 
 static SEQ: AtomicUsize = AtomicUsize::new(0);

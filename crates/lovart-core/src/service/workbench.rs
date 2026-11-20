@@ -1,0 +1,305 @@
+//! 批次的**唯一持有者**：调度器、告警、看板缓存、单实例锁、投喂串行锁。
+//!
+//! 原名是 `gui.rs` 里的那个全局状态。搬到这里的目的不是"整理文件"，而是让
+//! **提交 / 停止 / 看板**只有一个实现，GUI 与 HTTP（下一步）都只能通过它。
+//!
+//! 字段全私有：外部只能走访问器；直接摸字段在 `src-tauri` 里是 **E0616**。
+//! 这是 `ADR-0004` / `ADR-0009` 第一级（能让写错编译不过），不是约定。
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use crate::engine::lockfile::FileLock;
+use crate::engine::scheduler::{
+    AutoConfirm, Scheduler, SchedulerConfig, SchedulerSummary, SchedulerTuning, SessionEndFn,
+};
+use crate::engine::settings::Settings;
+use crate::engine::state::{StateStore, StateStoreOptions};
+use crate::lovart::connection::{
+    load_dot_env, read_auto_confirm, reload_dot_env, resolve_connection,
+};
+use crate::service::wiring::to_client_deps;
+
+/// GUI / HTTP 共用的批次状态。
+pub struct Workbench {
+    cwd: PathBuf,
+    /// 全局自动确认开关（运行态真源；与每个批次的 `AutoConfirm` 共享）。
+    auto_confirm: Arc<AtomicBool>,
+    /// 花积分开关（运行态真源；与调度器的 `Shared.spend_mode` 共享）。
+    ///
+    /// ⚠️ **不落盘**：每次启动恒 `false`。忘了关就是整批按 fast 计费，
+    ///    所以这个开关不能跨会话记着（与自动确认不同，它的副作用更大）。
+    spend_mode: Arc<AtomicBool>,
+    /// `.env` 读-改-写互斥：保存设置与切开关会同时改同一个文件。
+    env_lock: Mutex<()>,
+    /// **批次级**告警 —— 用户**必须看到**、且看板**表达不了**的那些事。
+    ///
+    /// ── 边界 ──────────────────────────────────────────────────────────
+    /// **任务级 = `state.jsonl`（看板）**；**批次级 = 这里（告警）**。
+    /// 两者不重叠，谁也不替谁兜底。
+    ///
+    /// 与旧 `log` 的区别：**告警不裁剪**。日志可以丢，告警丢了就是骗人。
+    alerts: Mutex<Vec<String>>,
+    /// 看板载荷的「没变就别重算」缓存（`2B` 会搬去 GUI 层）。
+    /// 单实例锁（`engine::lockfile`）。由 `setup` 注入，**必须活到窗口关闭** ——
+    /// 句柄一关，另一个进程就能进来写 `state.jsonl`。
+    single_instance: Mutex<Option<FileLock>>,
+    /// 常驻调度器（**惰性启动**：第一次投喂时才建，没配凭据的用户启动不报错）。
+    scheduler: Mutex<Option<Scheduler>>,
+    /// 投喂串行锁：`refs-cache.json` 是「读-合并-写」，两次并发投喂会互相覆盖
+    /// （`docs/plan/09` §1.5.4）。代价可接受 —— 投喂是人工动作。
+    intake_lock: Mutex<()>,
+}
+
+impl Workbench {
+    /// ⚠️ 返回 `Arc`：`ensure_scheduler` 要给回调 `Weak<Self>`（否则 Arc 环）。
+    pub fn new(cwd: PathBuf) -> Arc<Self> {
+        // 自动确认开关只认 `.env`（不读进程环境变量）。非法值 / 读失败 ⇒ 关 + 一条告警。
+        let (auto_confirm, auto_confirm_warning) = read_auto_confirm(&cwd.join(".env"));
+        let state = Arc::new(Self {
+            cwd,
+            alerts: Mutex::new(Vec::new()),
+            auto_confirm: Arc::new(AtomicBool::new(auto_confirm)),
+            // 恒关：不读 `.env`，也没有默认值可配（见字段注释）。
+            spend_mode: Arc::new(AtomicBool::new(false)),
+            env_lock: Mutex::new(()),
+            single_instance: Mutex::new(None),
+            scheduler: Mutex::new(None),
+            intake_lock: Mutex::new(()),
+        });
+
+        // ⚠️ 启动就把 `.env` 载进来：设置里的「并发数 / 输出文件夹」也住在那里，
+        //    不先载入，`get_settings` 读到的永远是默认值（= 设置界面是假的）。
+        //
+        // 失败**必须上报**：载入失败 ⇒ 后面所有读环境变量的地方都拿到默认值 ⇒
+        // 设置界面显示的是**假配置**。原先是 `let _ =`，等于把这件事藏起来（DEBT TD-05-24）。
+        if let Err(error) = load_dot_env(&state.cwd.join(".env")) {
+            state.push_alert(&format!("配置载入失败，界面上的设置可能不是真实配置：{error}"));
+        }
+        if let Some(warning) = auto_confirm_warning {
+            state.push_alert(&warning);
+        }
+        // 设置里的非法值（兜底参数 + 新增的 8 个键）：**启动就说**，
+        // 否则用户会以为设置生效了。此刻 `from_env` ≈ 文件（`load_dot_env` 刚跑完）。
+        let (_, settings_warnings) = Settings::from_env();
+        for warning in settings_warnings {
+            state.push_alert(&warning);
+        }
+        state
+    }
+
+    /// 收下单实例锁（`run` 的 `setup` 调用，抢到之后）。
+    ///
+    /// ⚠️ 不提供「没锁也能跑」的分支：抢锁失败时调用方必须让进程退出，
+    /// 而不是带着半个锁继续（两个写者 = 记录被覆盖）。
+    pub fn hold_lock(&self, lock: FileLock) {
+        let mut slot = self
+            .single_instance
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *slot = Some(lock);
+    }
+
+    /// 取（必要时创建）常驻调度器。
+    ///
+    /// ⚠️ receiver 必须是 `&Arc<Self>`：回调要 `Arc::downgrade(self)`。
+    /// 回调一律持 `Weak`，否则 `Workbench → Scheduler → 回调 → Workbench` 是 Arc 环。
+    ///
+    /// ⚠️ 返回**克隆**而不是 guard：调用方随后会锁 `Mutex<Ctx>`，若拿着槽锁去锁它，
+    /// 任何反向路径都会死锁（`docs/plan/09` §1.5.3）。
+    pub fn ensure_scheduler(self: &Arc<Self>) -> Result<Scheduler, String> {
+        let mut slot = self
+            .scheduler
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(scheduler) = slot.as_ref() {
+            return Ok(scheduler.clone());
+        }
+
+        // 每次创建前重新载入 `.env`（覆盖语义）：手改后点提交仍要用新值。
+        reload_dot_env(&self.cwd.join(".env"))?;
+        let (settings, warnings) = Settings::from_file(&self.cwd.join(".env"))
+            .map_err(|error| format!("读不了 .env：{error}"))?;
+        for warning in &warnings {
+            self.push_alert(&format!("⚠️ {warning}"));
+        }
+        let connection = resolve_connection()?;
+        let deps = to_client_deps(&connection)?;
+        crate::engine::runlog::init(self.cwd.join("var/run.log"));
+
+        let weak = Arc::downgrade(self);
+
+        // 落盘失败 ⇒ 跑的中途就上报一次（`on_write_error` 只调一次，不刷屏）。
+        let alert_weak = weak.clone();
+        let store = StateStore::open_with(
+            &self.state_file(),
+            StateStoreOptions {
+                on_write_error: Some(Box::new(move |message: &str| {
+                    if let Some(workbench) = alert_weak.upgrade() {
+                        workbench.push_alert(&format!(
+                            "状态写不进磁盘（断点续跑会失效，重启后进度可能全丢）：{message}"
+                        ));
+                    }
+                })),
+            },
+        )
+        .map_err(|error| format!("打不开状态文件：{error}"))?;
+
+        let auto_confirm = AutoConfirm::new(Arc::clone(&self.auto_confirm));
+        // 会话封口回调：把「本会话跑完」变成告警与日志行（原先这段在 `run_scheduler` 返回后）。
+        let auto_for_cb = Arc::clone(&auto_confirm);
+        let end_weak = weak;
+        let on_session_end: SessionEndFn = Arc::new(move |summary: &SchedulerSummary| {
+            let counts: Vec<String> = summary
+                .counts
+                .iter()
+                .filter(|(_, count)| **count > 0)
+                .map(|(key, count)| format!("{key}={count}"))
+                .collect();
+            crate::engine::runlog::line(&format!(
+                "会话结束：共 {} 条（{}），未完成 {} 条",
+                summary.total,
+                counts.join(" "),
+                summary.unfinished
+            ));
+            let Some(workbench) = end_weak.upgrade() else {
+                return;
+            };
+            if summary.persist_failed {
+                workbench.push_alert(
+                    "收尾时状态文件写不进去：本次进度可能续不上，重启后需要重新提交",
+                );
+            }
+            let confirmed = auto_for_cb.count();
+            if confirmed > 0 {
+                workbench.push_alert(&format!(
+                    "本会话自动确认 {confirmed} 条（已扣积分，明细以上游账单为准）"
+                ));
+            }
+        });
+
+        let scheduler = Scheduler::start(SchedulerConfig {
+            deps,
+            state: store,
+            output_dir: self.cwd.join(&settings.output_dir),
+            report_file: Some(self.cwd.join("var/report.csv")),
+            tuning: SchedulerTuning::from_settings(&settings),
+            retry_failed: false,
+            auto_confirm,
+            spend_mode: Arc::clone(&self.spend_mode),
+            log: Arc::new(|message: &str| crate::engine::runlog::line(message)),
+            ports: None,
+            on_session_end: Some(on_session_end),
+        })
+        .map_err(|error| format!("调度器启动失败：{}", error.message()))?;
+
+        *slot = Some(scheduler.clone());
+        Ok(scheduler)
+    }
+
+    /// 取调度器克隆（`None` = 还没创建）。不把 guard 交出去，避免与 ctx 锁嵌套。
+    pub fn scheduler_snapshot(&self) -> Option<Scheduler> {
+        self.scheduler
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    pub fn state_file(&self) -> PathBuf {
+        self.cwd.join("var/state.jsonl")
+    }
+
+    pub fn output_dir(&self) -> PathBuf {
+        // 1Hz 的 `get_state` 会调它：读环境（微秒级），不读盘。
+        // 手改 `.env` 的目录要等点「开始」才统一（N19）—— 这里刻意不跟文件，
+        // 否则每秒做一次磁盘 I/O。
+        self.cwd.join(Settings::from_env().0.output_dir)
+    }
+
+    /// 记一条**批次级**告警（用户必须看到的事）。
+    ///
+    /// 只做「追加」——**不裁剪**。日志可以丢，告警丢了就是骗人。
+    /// 消费方是 [`Workbench::take_alerts`]：前端每轮拉走，拉走即清（不重复弹）。
+    pub fn push_alert(&self, message: &str) {
+        // 告警也落日志：弹窗**关掉就没了**，而挂机出问题时人不在电脑前。
+        crate::engine::runlog::line(&format!("⚠️ 告警：{message}"));
+        let mut alerts = self.alerts.lock().unwrap_or_else(|error| error.into_inner());
+        alerts.push(format!(
+            "[{}] {message}",
+            chrono::Local::now().format("%H:%M:%S")
+        ));
+    }
+
+    /// 取走**尚未读过的**批次级告警（取走即清，不重复弹）。
+    pub fn take_alerts(&self) -> Vec<String> {
+        let mut alerts = self.alerts.lock().unwrap_or_else(|error| error.into_inner());
+        std::mem::take(&mut *alerts)
+    }
+
+    /// ⚠️ `pub(crate)`：只有 service 内部（参考图解析）需要"工作区根"。
+    /// 外部调用方一律用下面的具名目录 —— 拼路径的写法在 `src-tauri` 里是 **E0624**。
+    pub(crate) fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    /// `.env` 的绝对路径（读-改-写都走这里，调用方不拼）。
+    pub fn env_path(&self) -> PathBuf {
+        self.cwd.join(".env")
+    }
+
+    /// `inbox/`（导入与列表的根）。
+    pub fn inbox_dir(&self) -> PathBuf {
+        self.cwd.join("inbox")
+    }
+
+    /// `var/`（运行产物根）。
+    pub fn var_dir(&self) -> PathBuf {
+        self.cwd.join("var")
+    }
+
+    /// `var/refs/`（参考图落盘目录）。
+    pub fn refs_dir(&self) -> PathBuf {
+        self.cwd.join("var").join("refs")
+    }
+
+    /// `var/refs-cache.json`。
+    pub fn refs_cache_file(&self) -> PathBuf {
+        self.cwd.join("var/refs-cache.json")
+    }
+
+    /// `var/.lock`（单实例锁）。
+    pub fn lock_path(&self) -> PathBuf {
+        self.cwd.join("var/.lock")
+    }
+
+    pub fn auto_confirm_on(&self) -> bool {
+        self.auto_confirm.load(Ordering::Relaxed)
+    }
+
+    pub fn spend_mode_on(&self) -> bool {
+        self.spend_mode.load(Ordering::Relaxed)
+    }
+
+    pub fn set_auto_confirm(&self, on: bool) {
+        self.auto_confirm.store(on, Ordering::Relaxed);
+    }
+
+    pub fn set_spend_mode(&self, on: bool) {
+        self.spend_mode.store(on, Ordering::Relaxed);
+    }
+
+    /// 投喂串行锁（`refs-cache.json` 读-合并-写）。
+    pub fn lock_intake(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.intake_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// `.env` 读-改-写互斥（保存设置 / 切开关）。
+    pub fn lock_env(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.env_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+}

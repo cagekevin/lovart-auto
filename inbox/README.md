@@ -94,7 +94,8 @@ lovart-client --dry-run --prompts inbox/2026-10-24-HKH真实生活静物-20.json
 lovart-client           --prompts inbox/2026-10-24-HKH真实生活静物-20.jsonl
 ```
 
-`lovart-client` = `src-tauri/target/release/lovart-client`；**双击它开界面**。
+`lovart-client` = 仓库根的 `target/release/lovart-client`（Windows 交付件是根目录的
+`lovart-client.exe`）；**双击它开界面**。
 
 ### 3.1 导入后归位
 

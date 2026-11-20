@@ -19,8 +19,10 @@
 
 check: check-rs
 
+# workspace：必须 `--workspace`，否则在 src-tauri 下只跑该包的测试，
+# `crates/lovart-core` 的用例会被静默跳过。
 check-rs:
-	cd src-tauri && cargo test
+	cargo test --workspace
 
 # ⚠️ 改过 `ui/` 也必须走它 —— 前端资源是在 `cargo build` 时嵌进二进制的，
 #    只拷旧二进制不会更新界面。
@@ -36,4 +38,4 @@ win:
 	pwsh -NoProfile -ExecutionPolicy Bypass -File ./scripts/make-exe.ps1
 
 clean-rs:
-	cd src-tauri && cargo clean
+	cargo clean

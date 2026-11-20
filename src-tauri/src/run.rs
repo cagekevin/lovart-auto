@@ -33,26 +33,32 @@
 //! 命令行只决定「画什么」。传这些参数会**报错退出**并指出该去哪里改 —— 见 `cli.rs`
 //! 的 `RETIRED_TUNING_KEYS`。理由：CLI 是 AI 的入口，AI 不该能调这些旋钮。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::json;
 
 use crate::cli::{arg_list, arg_string, has_arg, parse_args, ParsedArgs};
-use crate::engine::refs::read_ref_inputs;
+use crate::engine::group::task_group;
 use crate::engine::scheduler::{
     run_scheduler, AutoConfirm, SchedulerOptions, SchedulerSummary, SchedulerTuning,
 };
 use crate::engine::settings::Settings;
 use crate::engine::state::{
-    is_not_done, row as status_row, Action, StateStore, TaskRecord, TaskStatus, STATUS_TABLE,
+    is_not_done, StateStore, TaskRecord, TaskStatus, STATUS_TABLE,
 };
-use crate::lovart::client::{query_mode, set_mode, ClientDeps, Mode};
-use crate::lovart::connection::{load_dot_env, read_auto_confirm, resolve_connection, to_client_deps};
-use crate::lovart::models::MODEL_SPECS;
+use crate::service::meta::{image_models_json, image_models_text};
+use crate::service::refs::resolve_refs_core;
+use crate::service::snapshot::{
+    board_order, build_status_json, elapsed_text, files_present, format_clock, status_counts,
+    status_label,
+};
+use crate::service::wiring::to_client_deps;
+use crate::lovart::client::{query_mode, set_mode, Mode};
+use crate::lovart::connection::{load_dot_env, read_auto_confirm, resolve_connection};
 use crate::lovart::prompt::{parse_prompts, ParseOptions, PromptDefaults, PromptTask};
 
 /// 允许的参数名。**必须与文件头的用法注释一致** ——
@@ -144,87 +150,10 @@ extern "C" fn handle_sigint(_signal: libc::c_int) {
     // 写日志不是 async-signal-safe，所以这里只置标志；提示由 watcher 线程打。
 }
 
-// ── 报告 ──────────────────────────────────────────────────────────────
-
-fn csv_cell(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\"\""))
-}
-
-/// 记录里的产物路径 → **当前输出目录下能直接用的绝对路径**。
-///
-/// 记录里存的是**相对输出目录**的路径（例 `abc123_一只猫.png`）—— 理由见
-/// `engine::scheduler` 里写 `files` 的那段注释：绝对路径把"文件夹叫什么、放在哪"
-/// 钉进了数据。旧记录里是绝对路径 ⇒ **原样返回**（向后兼容；不替它猜搬到哪去了）。
-pub fn resolve_file(output_dir: &Path, file: &str) -> PathBuf {
-    let path = Path::new(file);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        output_dir.join(path)
-    }
-}
-
-/// 写 CSV 报告（带 BOM，Excel 打开中文不乱码）。
-pub fn write_report(
-    file: &Path,
-    records: &[TaskRecord],
-    tasks_by_id: &BTreeMap<String, PromptTask>,
-    output_dir: &Path,
-) -> std::io::Result<()> {
-    const HEADER: [&str; 11] = [
-        "line",
-        "id",
-        "status",
-        "mode",
-        "model",
-        "aspectRatio",
-        "imageSize",
-        "prompt",
-        "files",
-        "error",
-        "updatedAt",
-    ];
-    let mut lines = vec![HEADER.join(",")];
-    for record in records {
-        let line = record
-            .line
-            .or_else(|| tasks_by_id.get(&record.id).map(|task| task.line))
-            .map(|value| value.to_string())
-            .unwrap_or_default();
-        let mode = if tasks_by_id
-            .get(&record.id)
-            .and_then(|task| task.ref_files.as_ref())
-            .is_some_and(|files| !files.is_empty())
-        {
-            "图生图"
-        } else {
-            "文生图"
-        };
-        let cells = [
-            line,
-            record.id.clone(),
-            record.status.as_str().to_string(),
-            mode.to_string(),
-            record.model.clone(),
-            record.aspect_ratio.clone(),
-            record.image_size.clone(),
-            record.prompt.clone(),
-            // 报告给人看的 ⇒ 拼成绝对路径（记录里存的是相对路径，见 `resolve_file`）
-            record
-                .files
-                .clone()
-                .unwrap_or_default()
-                .iter()
-                .map(|item| resolve_file(output_dir, item).display().to_string())
-                .collect::<Vec<_>>()
-                .join(" | "),
-            record.error.clone().unwrap_or_default(),
-            record.updated_at.clone(),
-        ];
-        lines.push(cells.iter().map(|cell| csv_cell(cell)).collect::<Vec<_>>().join(","));
-    }
-    std::fs::write(file, format!("\u{feff}{}\n", lines.join("\n")))
-}
+// ── 报告 / 分组已下沉到 `engine` ──────────────────────────────────────
+// 原先定义在本文件，而 `engine::scheduler` 反向调用它们（`crate::run::*`）；
+// 拆 `lovart-core` 后那个方向编译不过（E0433），实现已搬进 `engine`。
+// ⚠️ 不做 `pub use` 转发：同名别名会让同一函数出现两个路径（ADR-0005 / 0006）。
 
 /// 打印「非 done」清单 —— 直接回答「哪些没跑完」。
 fn print_pending_list(records: &[TaskRecord]) {
@@ -263,343 +192,6 @@ fn clip(text: &str, max: usize) -> String {
     }
 }
 
-/// 给人看的状态短名。**读表**（`label` 列）—— 原先这里是一份穷尽 `match`。
-fn status_label(status: TaskStatus) -> &'static str {
-    status_row(status).label
-}
-
-/// 把「距今多久」格式化成 `45秒` / `12分30秒` / `1时05分`。
-///
-/// 拿不到时间（旧记录 / 非法值）⇒ `—`，**不猜**。
-fn format_elapsed(from: Option<&str>) -> String {
-    let Some(from) = from else {
-        return "—".to_string();
-    };
-    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(from) else {
-        return "—".to_string();
-    };
-    let millis = chrono::Utc::now().signed_duration_since(parsed).num_milliseconds();
-    if millis < 0 {
-        return "—".to_string();
-    }
-    let total = millis / 1000;
-    if total < 60 {
-        return format!("{total}秒");
-    }
-    let minutes = total / 60;
-    if minutes < 60 {
-        return format!("{minutes}分{:02}秒", total % 60);
-    }
-    format!("{}时{:02}分", minutes / 60, minutes % 60)
-}
-
-/// 任务在界面上的**分组**。
-///
-/// ⚠️ 判据**只此一份**：由 Rust 已有的谓词派生，不另立清单。
-/// 前端若自己再写一遍 `['pending','submitting',…]`，就是第二份真源 ——
-/// 本仓栽过的那个坑（两处同名不同口径）。所以分组随状态一起下发。
-///
-/// - `active`   拿到槽位、正在生成（`holds_slot`）；
-/// - `queued`   已发布但还没轮到（`is_unfinished` 里除去占槽的那部分）；
-/// - `finished` 这一轮结束了，不管结果（`!is_unfinished`，含终态与「待下次兜底」）。
-fn task_group(status: TaskStatus) -> &'static str {
-    // 「要你处理」—— **你不点它就不动**。今天只有 `needs_confirm`（表里带 `Confirm` 动作）。
-    //
-    // ⚠️ 它**绝不能归进 `finished`**：`needs_confirm` 是终态（`terminal: true`），
-    //    按"终态 ⇒ finished"的老口径它会躺在「已结束」里 ——
-    //    用户看到的是「**它自己完成了，没问我**」（2026-10-01 实测反馈）。
-    //    判据读**状态表**的 `actions` 列（有没有只有人能按的 `Confirm`），不另写清单。
-    if status_row(status).actions.contains(&Action::Confirm) {
-        return "waiting";
-    }
-    if crate::engine::state::holds_slot(status) {
-        "active"
-    } else if crate::engine::state::is_unfinished(status) {
-        "queued"
-    } else {
-        "finished"
-    }
-}
-
-/// 看板上「未结束」= `active` + `queued` + `waiting`（即**不在「已结束」组**）。
-///
-/// 这是「取消所有未完成任务」的**作用域判据**，也是它唯一的一份实现（`gui` 直接调）。
-///
-/// ⚠️ **不要**用 `engine::state::is_unfinished` 顶替：后者是 `!terminal`，
-/// 而 `needs_confirm`（待处理）是**终态** —— 于是"待处理"会被漏删。
-/// 也**不要**复用 `resume_unfinished` 的过滤（它按 `is_unfinished` 选，问题不同）。
-/// 判据就是分组本身（[`task_group`]），不另抄一份状态清单。
-pub(crate) fn is_board_open(status: TaskStatus) -> bool {
-    task_group(status) != "finished"
-}
-
-/// 看板上「**已完成**」= `finished` 组（[`is_board_open`] 的补集）。
-///
-/// 这是「清空所有已完成任务」的**作用域判据**，与上面那条共用同一份分组实现
-/// （补集写法是故意的：正着写第二份清单，迟早和 `is_board_open` 走岔）。
-pub(crate) fn is_board_finished(status: TaskStatus) -> bool {
-    !is_board_open(status)
-}
-
-/// 看板上「**排队中**」= `queued` 组：**还没提交**（没有 `threadId`，上游不知道它存在）。
-///
-/// 这是「取消排队」的**作用域判据**，与上面两条共用 [`task_group`] 这一份实现。
-///
-/// ⚠️ 它**故意**只等于 `queued`：`active` 是已提交（在等结果）、`waiting` 是上游已创建
-///    但要你确认（要花积分）—— 那两者删掉只是"本地不再取图"，和"还没发出去"不是一件事。
-pub(crate) fn is_board_queued(status: TaskStatus) -> bool {
-    task_group(status) == "queued"
-}
-
-/// 「**正在生产**已持续多久」—— 只有 `active` 组才有值。
-///
-/// ── 为什么必须收在这里 ────────────────────────────────────────────
-/// 界面要的是「这条开始动了多久」，而 `stateSinceText` 原先对**所有**状态都下发
-/// ⇒ 排队中（还没提交）也在跳秒，完成后还在涨。判据就是 [`task_group`]，
-/// **不另写状态清单**，也不在 JS/CLI 各判一次。
-///
-/// 旧记录没有 `stateSince` ⇒ `format_elapsed` 返回 `"—"` ⇒ 这里转成 `None`（不显示），
-/// 而不是让界面显示「已持续 —」。
-fn elapsed_text(status: TaskStatus, state_since: Option<&str>) -> Option<String> {
-    if task_group(status) != "active" {
-        return None;
-    }
-    active_elapsed_text(state_since)
-}
-
-/// 同一条文案的**后半段**：已知属于 `active` 时，只按 `state_since` 出字。
-///
-/// 存在的唯一理由是 `gui::get_state` 的缓存命中路径 —— 那时手里只有上一轮的
-/// `state_since`（`state.jsonl` 没变 ⇒ 状态也不可能变），不必为了重算这几个字
-/// 再读一遍全部记录。**文案实现仍然只有一份**（[`elapsed_text`] 调它）。
-pub(crate) fn active_elapsed_text(state_since: Option<&str>) -> Option<String> {
-    let text = format_elapsed(state_since);
-    (text != "—").then_some(text)
-}
-
-/// 绝对时刻 `MM-DD HH:MM`（与前端 `formatTime` 同格式）；解析不了 ⇒ `未知`。
-fn format_clock(value: Option<&str>) -> String {
-    let Some(value) = value else {
-        return "未知".to_string();
-    };
-    match chrono::DateTime::parse_from_rfc3339(value) {
-        Ok(parsed) => parsed
-            .with_timezone(&chrono::Local)
-            .format("%m-%d %H:%M")
-            .to_string(),
-        Err(_) => "未知".to_string(),
-    }
-}
-
-/// 异常状态 → 界面要用的两件套：`(色调, 一句人话)`。**读表**（`abnormal` 列）。
-///
-/// ⚠️ 文案里**不许出现实现黑话**（槽位 / 目录 / 500…），也不许口语化。
-/// 用户看的是「我的图怎么了」，不是「我们的管道怎么了」。
-/// 正常状态返回 `None` —— **正常不说话**，异常才多说一句。
-fn abnormal_info(status: TaskStatus) -> Option<(&'static str, &'static str)> {
-    status_row(status).abnormal
-}
-
-/// 这条异常**重跑有没有意义**。**读表**（`actions` 列里有没有 `Retry`）。
-///
-/// 「未产出」（内容没过审）与「已拒绝」（政策拒绝）重跑结果一样，
-/// 所以表里那两行的 `actions` 里**没有** `Retry` —— 给了就是骗人。
-/// 原先这里是 `matches!(status, DownloadFailed | Unresolved | Failed)`：
-/// 一个集合字面量，加状态**不报错**、口径会静默漏（普查第 3 类）。
-pub fn is_retryable(status: TaskStatus) -> bool {
-    status_row(status).actions.contains(&Action::Retry)
-}
-
-/// 板面顺序 —— **终端看板与窗口共用这一份**。
-///
-/// ── 规则 ──────────────────────────────────────────────────────────
-/// 先按 [`task_group`] 分档：`active` → `queued` → `waiting` → `finished`；
-/// · `active` / `queued`：按**先后顺序**（提示词行号 `line`）升序 —— 先发的在上；
-/// · `waiting` / `finished`：按**进入该状态的时刻**（`stateSince`）**倒序** —— 最近的在最上。
-///
-/// ── 为什么必须有它 ────────────────────────────────────────────────
-/// `StateStore::all()` 返回的是 `BTreeMap` 的**键序**，而键是**内容哈希 id**
-/// ⇒ 不排的话顺序看起来是随机的，与提交/完成时间都无关。
-/// （2026-10-01 实测：14:56 完成的那条 id 是 `1b9204894b5a`，不排就排在第 3 位。）
-/// 原先 `print_status` 与 `build_status_json` **各写了一遍** `sort_by_key(line)`，
-/// 且两边口径不同（终端按行号、窗口干脆不排）—— 这正是本仓禁的"两份真相"。
-///
-/// ⚠️ 完成时间**用 `stateSince` 而不是 `updatedAt`**：后者会被收尾时的顺带写污染，
-///    拿它当完成时间就是撒谎（本仓已有这条警告）。
-/// ⚠️ 旧记录没有 `stateSince`（TS 时代写的）⇒ 完成时间未知 ⇒ 降序时自然沉底，
-///    **不拿 `updatedAt` 冒充**。
-pub fn board_order(records: &mut [TaskRecord]) {
-    records.sort_by(|a, b| {
-        let (rank_a, rank_b) = (group_rank(a.status), group_rank(b.status));
-        // 跨组：active → queued → waiting → finished。
-        // ⚠️ 不能再用 `is_unfinished` 二分：`needs_confirm` 是终态，
-        //    那样会被排进「已结束」，与界面把它放在「待你处理」最上面矛盾。
-        if rank_a != rank_b {
-            return rank_a.cmp(&rank_b);
-        }
-        // 组内规则直接复用上面算好的 rank，不再第二次调 `task_group`。
-        match rank_a {
-            // 在跑/排队：按先后顺序（行号）。没有行号的用 id 兜底，保证顺序确定。
-            0 | 1 => a.line.cmp(&b.line).then_with(|| a.id.cmp(&b.id)),
-            // 待你处理/已结束：按进入该状态的时刻倒序（`None` 小于 `Some` ⇒ 未知的自然沉底）。
-            _ => b
-                .state_since
-                .cmp(&a.state_since)
-                .then_with(|| a.id.cmp(&b.id)),
-        }
-    });
-}
-
-/// 板面分档：`active` → `queued` → `waiting` → `finished`。
-fn group_rank(status: TaskStatus) -> u8 {
-    match task_group(status) {
-        "active" => 0,
-        "queued" => 1,
-        "waiting" => 2,
-        _ => 3,
-    }
-}
-
-/// 产物存在性：`文件名（记录里的原文）→ 是否真在盘上`。
-///
-/// 文本看板与 JSON 看板**共用这一份** —— 原先两处各写一遍
-/// `BTreeMap` + `resolve_file` + `is_file`，改口径时必然漏一处。
-fn files_present(records: &[TaskRecord], output_dir: &Path) -> BTreeMap<String, bool> {
-    let mut present: BTreeMap<String, bool> = BTreeMap::new();
-    for record in records {
-        for file in record.files.iter().flatten() {
-            // 记录里存的是**相对输出目录**的路径（旧记录是绝对路径）⇒ 先归一成绝对再看盘。
-            let resolved = resolve_file(output_dir, file);
-            present
-                .entry(file.clone())
-                .or_insert_with(|| resolved.is_file());
-        }
-    }
-    present
-}
-
-/// 逐状态计数（顺序 = `STATUS_TABLE`）。
-///
-/// 文本汇总与 JSON `summary` **共用这一份**：原先一边按表过滤 `count`、
-/// 一边 `all()` + `json_key` + `filter`，加状态时两边的口径可能悄悄分叉。
-fn status_counts(records: &[TaskRecord]) -> Vec<(TaskStatus, usize)> {
-    crate::engine::state::all()
-        .map(|status| {
-            let count = records
-                .iter()
-                .filter(|record| record.status == status)
-                .count();
-            (status, count)
-        })
-        .collect()
-}
-
-/// 看板的**机器可读**形态（`--status --json`）。
-///
-/// 抽成公开函数而不是留在 `print_status` 里，是为了让 GUI **复用同一份构造**
-/// —— 否则「终端看到的」与「窗口里看到的」会成为两份真相（DEBT TD-11-01 的母体）。
-pub fn build_status_json(state_file: &Path, output_dir: &Path) -> Result<Value, String> {
-    let state = StateStore::open_read_only(state_file).map_err(|error| error.to_string())?;
-    let mut records: Vec<TaskRecord> = state.all().into_iter().cloned().collect();
-    board_order(&mut records);
-
-    let present = files_present(&records, output_dir);
-    let tasks: Vec<Value> = records
-        .iter()
-        .map(|record| {
-            let mut value = serde_json::to_value(record).unwrap_or(Value::Null);
-            let files_present: Vec<Value> = record
-                .files
-                .clone()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|file| {
-                    let ok = present.get(&file).copied().unwrap_or(false);
-                    // 给前端的必须是**绝对路径**：`convertFileSrc` 与「打开所在位置」
-                    // 都只认绝对路径（相对路径在 webview 里会被解析成 5180 的端口路径）。
-                    let absolute = resolve_file(output_dir, &file).display().to_string();
-                    json!({ "file": absolute, "present": ok })
-                })
-                .collect();
-            // ⚠️ 必须在 `files_present` 被 move 进对象**之前**算。
-            let missing_artifact = !is_not_done(record.status)
-                && files_present
-                    .iter()
-                    .all(|entry| !entry.get("present").and_then(Value::as_bool).unwrap_or(false));
-
-            if let Some(object) = value.as_object_mut() {
-                object.insert("filesPresent".to_string(), Value::Array(files_present));
-                object.insert(
-                    "statusLabel".to_string(),
-                    Value::String(status_label(record.status).to_string()),
-                );
-                // ⚠️ **只在生产中的任务才有值**（`null` = 界面不显示时长）。
-                //    原先对所有状态都给字符串 ⇒ 排队中的卡片也在跳秒（2026-10-19 实测反馈）。
-                object.insert(
-                    "stateSinceText".to_string(),
-                    match elapsed_text(record.status, record.state_since.as_deref()) {
-                        Some(text) => Value::String(text),
-                        None => Value::Null,
-                    },
-                );
-                // ⚠️ 分组 / 异常 / **可做的动作**（`actions`）**一并下发**：前端不再自己写
-                //    一遍状态清单，否则「窗口里看到的」与「终端看到的」会分叉
-                //    （本仓 TD-11-01 的母体）。
-                object.insert(
-                    "group".to_string(),
-                    Value::String(task_group(record.status).to_string()),
-                );
-                // ⚠️ 原先这里还有一个 `retryable` 布尔 —— 它与下面的 `actions` 说的是
-                //    同一件事（"这条能不能重跑"），是**同一事实的两份投影** ⇒ 已删。
-                //    Rust 侧的闸仍走 `is_retryable`（`gui.rs` 的重跑命令用它）。
-                // 界面上能做的动作，**由状态表下发**（`actions` 列）——
-                // 前端不再自己判"这条能不能重跑 / 能不能接着查"。
-                object.insert(
-                    "actions".to_string(),
-                    Value::Array(
-                        status_row(record.status)
-                            .actions
-                            .iter()
-                            .map(|action| Value::String(action.as_str().to_string()))
-                            .collect(),
-                    ),
-                );
-                // 「说完成却没图」—— 判据是**表列 `not_done`**，不是 `status == "done"`。
-                // 原先这个判断写在前端（`ui/app.js`：`task.status === 'done'`），
-                // 是普查里"消费者自判"的两处之一 —— 前端不该知道 `done` 是什么。
-                object.insert(
-                    "missingArtifact".to_string(),
-                    Value::Bool(missing_artifact),
-                );
-                object.insert(
-                    "abnormal".to_string(),
-                    match abnormal_info(record.status) {
-                        // ⚠️ 只有 `(kind, reason)`：**状态名不在这里重复**
-                        //    （卡片头部已经写了；重复一遍就是把版面撑长）。
-                        Some((kind, reason)) => json!({ "kind": kind, "reason": reason }),
-                        None => Value::Null,
-                    },
-                );
-            }
-            value
-        })
-        .collect();
-
-    // 逐状态计数**由表生成**（`status_counts`，键名 = 线格式名的 camelCase）。
-    // 原先这里是手抄的 9 行，**漏了 `submitting`** —— 而且加状态时不报错。
-    let mut summary = serde_json::Map::new();
-    summary.insert("total".to_string(), json!(records.len()));
-    for (status, count) in status_counts(&records) {
-        summary.insert(crate::engine::state::json_key(status), json!(count));
-    }
-
-    Ok(json!({
-        "stateFile": state_file.display().to_string(),
-        "outputDir": output_dir.display().to_string(),
-        "summary": summary,
-        "tasks": tasks,
-    }))
-}
 
 /// 任务看板：不联网、不需要凭据，只读 state 文件渲染。
 ///
@@ -744,43 +336,6 @@ fn print_status(state_file: &Path, output_dir: &Path, full: bool, as_json: bool)
 //    （见它的文件头），往里塞 Rust 独有的展示函数会毁掉可比对性。
 //    这一块是**输出形态**，与 `build_status_json` 同类 —— 所以归这里，GUI 复用。
 
-/// 出图模型清单 —— `(别名, 本名)`。**筛选只此一处**（`Category::Image`）。
-fn image_models() -> Vec<(&'static str, &'static str)> {
-    MODEL_SPECS
-        .iter()
-        .filter(|spec| spec.category == crate::lovart::models::Category::Image)
-        .map(|spec| (spec.id, spec.readable_name))
-        .collect()
-}
-
-/// JSON 投影 —— `--list-models --json` 与 GUI 的下拉**共用这一份**（**键名只此一处**）。
-pub fn image_models_json() -> Vec<Value> {
-    image_models()
-        .into_iter()
-        .map(|(alias, name)| json!({ "alias": alias, "name": name }))
-        .collect()
-}
-
-/// 文本表格投影 —— `--list-models` 用。
-///
-/// 列宽**从数据算**，不写死：曾经写死 `{alias:<28}`，而最长的别名
-/// `gpt-image-2.6-sunburst-medium` 是 **30** 字符 ⇒ 那一行只剩一个空格、整列歪掉。
-/// 写死宽度与"文档里写死测试条数"是同一类病：写的时候对，加一个更长的名字就歪，
-/// **而且不会有任何东西变红**。
-fn image_models_text() -> String {
-    let models = image_models();
-    let width = models
-        .iter()
-        .map(|(alias, _)| alias.chars().count())
-        .max()
-        .unwrap_or(0);
-    models
-        .into_iter()
-        .map(|(alias, name)| format!("  {alias:<width$} {name}"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 /// 列出可用的**出图**模型别名。
 ///
 /// 为什么要有这个命令：AI 写提示词时需要知道有哪些别名，而唯一权威来源是代码里的
@@ -811,7 +366,12 @@ fn print_models(as_json: bool) {
     println!("{}", image_models_text());
     println!();
     println!("写进提示词：{{\"prompt\":\"…\",\"model\":\"nano-bn-pro\"}}");
-    println!("别名变体（空格 / 无连字符写法，如 \"nano bn pro\"）同样识别。");
+    // ⚠️ 这里**不能**写「空格写法同样识别」。别名是逐条枚举的：`nano bn pro` 在表里、
+    //    `GPT Image 2 Low` 不在 ⇒ 通则不成立（TD-01-3，2026-11-20 用 `--check` 实测）。
+    //    要支持更多写法，正确改法是让 `resolve_prefer_models` 归一化空白（1 处），
+    //    不是往别名表里逐条补 —— 补不满，还会给子串匹配添新的误吞面。
+    println!("别名匹配是子串包含：nano-bn-pro / nano bn pro / nanobnpro 都命中。");
+    println!("以上面的别名为准；写不准会报错并终止（不会静默退回默认模型）。");
     println!("本工具只出图；视频 / 对话模型不在列表内。");
 }
 
@@ -1063,7 +623,7 @@ pub fn main_with_args(argv: &[String]) -> Result<(), String> {
 
     // 4.5 参考图（图生图）：本地路径读盘 → 转 base64 → 上传 Lovart CDN。
     //     来源两处：命令行 `--ref`（整批默认）与行内 `refs`（**覆盖**命令行，不合并）。
-    resolve_refs(&args, &deps, &mut tasks, &cwd)?;
+    resolve_refs(&args, &mut tasks, &cwd)?;
 
     // 5. 中断处理
     install_sigint_handler();
@@ -1146,82 +706,9 @@ pub fn main_with_args(argv: &[String]) -> Result<(), String> {
 }
 
 /// 解析参考图并写回每条任务（行内 `refs` **覆盖**命令行 `--ref`，不合并）。
-fn resolve_refs(
-    args: &ParsedArgs,
-    deps: &ClientDeps,
-    tasks: &mut [PromptTask],
-    cwd: &Path,
-) -> Result<(), String> {
+fn resolve_refs(args: &ParsedArgs, tasks: &mut [PromptTask], cwd: &Path) -> Result<(), String> {
     let cli_refs = arg_list(args, "ref");
-    let refs_cache_file = if has_arg(args, "no-refs-cache") {
-        None
-    } else {
-        Some(cwd.join(arg_string(args, "refs-cache", "var/refs-cache.json")))
-    };
-    resolve_refs_core(deps, tasks, cwd, &cli_refs, refs_cache_file.as_deref())
-}
-
-/// 参考图解析的**核心**（CLI 与 GUI 共用同一份）。
-///
-/// ⚠️ 公开是为了让 GUI 复用 —— 抄第二份必然与 CLI 分叉（DEBT TD-11-01 的母体）。
-pub fn resolve_refs_core(
-    _deps: &ClientDeps,
-    tasks: &mut [PromptTask],
-    cwd: &Path,
-    cli_refs: &[String],
-    _refs_cache_file: Option<&Path>,
-) -> Result<(), String> {
-    let cli_refs = cli_refs.to_vec();
-    let mut needed: Vec<String> = cli_refs.clone();
-    for task in tasks.iter() {
-        for input in task.ref_inputs.clone().unwrap_or_default() {
-            if !needed.iter().any(|existing| existing == &input) {
-                needed.push(input);
-            }
-        }
-    }
-    if needed.is_empty() {
-        return Ok(());
-    }
-
-    // 只做「输入 → 来源（本机路径 / 公网 URL）」。**不在这里上传**：
-    // 上传推迟到真正发送那一刻，命中 `var/refs-cache.json` 就不重复传 ——
-    // 同一批同一张图只传一次，投喂也不会再被网络拖住。
-    let entries = read_ref_inputs(&needed, cwd)?;
-    let mut source_by_input: BTreeMap<String, String> = BTreeMap::new();
-    for entry in &entries {
-        // 公网 URL 上游能直接访问，原样留着；其余都在 `read_ref_inputs` 里落成了本机文件。
-        let source = entry
-            .local_path
-            .clone()
-            .unwrap_or_else(|| entry.input.clone());
-        source_by_input.insert(entry.input.clone(), source);
-    }
-
-    let mut image_to_image = 0usize;
-    for task in tasks.iter_mut() {
-        let own = task.ref_inputs.clone().unwrap_or_default();
-        let inputs = if own.is_empty() { cli_refs.clone() } else { own };
-        if inputs.is_empty() {
-            continue;
-        }
-        let mut files: Vec<String> = Vec::with_capacity(inputs.len());
-        for input in &inputs {
-            let Some(source) = source_by_input.get(input) else {
-                return Err(format!("参考图没解析出地址（内部 bug）：{input}"));
-            };
-            files.push(source.clone());
-        }
-        task.ref_files = Some(files);
-        image_to_image += 1;
-    }
-
-    log(&format!(
-        "参考图：{} 个素材；图生图任务 {image_to_image}/{} 条",
-        entries.len(),
-        tasks.len()
-    ));
-    Ok(())
+    resolve_refs_core(tasks, cwd, &cli_refs, &|message| log(message))
 }
 
 /// 终端对齐：把短名补到 9 个**显示列**（中日韩字符占 2 列）。

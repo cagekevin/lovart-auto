@@ -1,9 +1,11 @@
 //! 调度与状态 —— 对应 TS 的 `src/`。
 
 pub mod download;
+pub mod group;
 pub mod intake;
 pub mod lockfile;
 pub mod refs;
+pub mod report;
 pub mod runlog;
 pub mod scheduler;
 pub mod session;

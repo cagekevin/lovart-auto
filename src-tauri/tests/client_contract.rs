@@ -18,8 +18,8 @@ use serde_json::{json, Value};
 
 use lovart_client::lovart::client::{
     confirm_thread, create_project, get_result, get_status, hmac_sha256_hex, lovart_request,
-    send_chat, set_mode, upload_file, ClientDeps, HttpRequest, HttpResponse, Method, RequestBody,
-    Transport,
+    send_chat, set_mode, upload_file, ClientDeps, HttpRequest, HttpResponse, Method, Mode,
+    RequestBody, Transport,
 };
 use lovart_client::lovart::contract::{is_truthy, normalize_send_body, SendInput};
 use lovart_client::lovart::errors::{
@@ -337,7 +337,8 @@ fn normalize_send_body_只在非空时附_attachments_与_tool_config() {
 #[test]
 fn set_mode_发_unlimited() {
     let (deps, fake) = deps_ok();
-    set_mode(&deps, true).unwrap();
+    // `Mode::Queue` = 原 `unlimited = true`（排队模式，免费）；断言体仍是 `{"unlimited": true}`。
+    set_mode(&deps, Mode::Queue).unwrap();
     let RequestBody::Json(text) = &fake.last().body else {
         panic!("应为 JSON 体");
     };
