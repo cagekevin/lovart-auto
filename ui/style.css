@@ -1505,6 +1505,9 @@ select:focus { border-color: var(--ink); }
 
 .queue-row .task-text { flex: 1; }
 
+/* 待发：提示词显示到 6 行（发布前要能看清整条；看板卡片仍是 2 行）。 */
+.queue-row .task-prompt { -webkit-line-clamp: 6; }
+
 /* 查8：删除键**常显** */
 .queue-remove {
   flex: none;
