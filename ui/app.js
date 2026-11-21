@@ -1404,15 +1404,13 @@ function renderQueue() {
     if (item.refsError) text.appendChild(el('div', 'task-reason', `垫图读不到：${item.refsError}`));
     row.appendChild(text);
 
-    // 草稿行多一个「编辑」：载入编辑区改提示词 / 换垫图，改完再发。
-    if (item.draftId) {
-      const edit = el('button', 'queue-edit', '编辑');
-      edit.title = '载入编辑区，改完再发';
-      edit.addEventListener('click', () => {
-        void loadDraftIntoEditor(item);
-      });
-      row.appendChild(edit);
-    }
+    // 「编辑」：载入编辑区改提示词 / 换垫图，改完再发（草稿与手动任务都能改）。
+    const edit = el('button', 'queue-edit', '编辑');
+    edit.title = '载入编辑区，改完再发';
+    edit.addEventListener('click', () => {
+      void editQueueItem(item);
+    });
+    row.appendChild(edit);
 
     // 查8：删除键**常显**（不做 hover 才出现）
     const remove = el('button', 'queue-remove', '×');
@@ -1504,17 +1502,17 @@ async function syncDrafts() {
 }
 
 /**
- * 「载入编辑区」（草稿行）：回填提示词 / 参数 / 垫图，改完再发。
+ * 「编辑」（待发行）：回填提示词 / 参数 / 垫图，改完再发。
  *
- * ⚠️ 载入即**取走**：从队列移除 + 后端删 —— 不删的话改完发布后原草稿还在，
- *    同一条内容会出现两次。
+ * ⚠️ 编辑即**取走**：从队列移除（改完再发送）；草稿还要从后端删 ——
+ *    不删的话下一轮 `syncDrafts` 会把它加回来。
  */
-async function loadDraftIntoEditor(item) {
+async function editQueueItem(item) {
   if (!(await loadInputIntoEditor(item))) return;
   const at = queue.indexOf(item);
   if (at >= 0) queue.splice(at, 1);
   renderQueue();
-  forgetDrafts([item.draftId]);
+  if (item.draftId) forgetDrafts([item.draftId]);
 }
 
 /**
