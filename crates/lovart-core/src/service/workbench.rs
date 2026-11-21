@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::engine::intake::TaskInput;
 use crate::engine::lockfile::FileLock;
 use crate::engine::scheduler::{
     AutoConfirm, Scheduler, SchedulerConfig, SchedulerSummary, SchedulerTuning, SessionEndFn,
@@ -20,6 +21,76 @@ use crate::lovart::connection::{
     load_dot_env, read_auto_confirm, reload_dot_env, resolve_connection,
 };
 use crate::service::wiring::to_client_deps;
+
+/// 外部递送进来的一条草稿（**不是任务**：不写 `state.jsonl`、不占槽、不开跑）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Draft {
+    /// `d-<序号>`，收到时生成，本次进程内永不复用。
+    pub id: String,
+    /// 与前端队列项同形：`{...task, draftId}` 直接可用。
+    #[serde(flatten)]
+    pub task: TaskInput,
+    pub refs_state: RefsState,
+}
+
+/// 垫图在"人看得见"这件事上的状态（失败不许静默）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefsState {
+    Ready,
+    Unavailable(String),
+}
+
+/// 草稿集合（**只在内存**：关 GUI 即消失）。
+#[derive(Debug, Default)]
+pub struct DraftsStore {
+    items: Vec<Draft>,
+    seq: u32,
+}
+
+/// 把一条草稿的 refs 归一成"前端能显示的形式"，返回整体状态。
+///
+/// - 本机路径 → 绝对路径 + stat（`resolve_local_ref`）；
+/// - `data:` → 落盘成 `var/refs/<哈希>` 路径（`materialize_data_url`）；
+/// - `http(s):` → 原样（前端与发布链都认）。
+///
+/// **不拒收任何合法输入**：只有读不到 / 解不开才标 `Unavailable`。
+fn normalize_draft_refs(task: &mut TaskInput, cwd: &Path) -> RefsState {
+    let refs_dir = cwd.join("var").join("refs");
+    let mut problem: Option<String> = None;
+    for raw in task.refs.iter_mut() {
+        let input = raw.trim().to_string();
+        if input.is_empty() {
+            // 空项交给发布链拦（`tasks_from_inputs`），这里不替它做。
+            continue;
+        }
+        // 与 `read_ref_inputs` 同一口径：协议前缀大小写不敏感。
+        let lower = input.to_lowercase();
+        if lower.starts_with("data:") {
+            match crate::engine::refs::materialize_data_url(&refs_dir, &input) {
+                Ok(path) => *raw = path,
+                Err(reason) => {
+                    problem.get_or_insert(reason);
+                }
+            }
+            continue;
+        }
+        if lower.starts_with("http://") || lower.starts_with("https://") {
+            continue;
+        }
+        match crate::engine::refs::resolve_local_ref(&input, cwd) {
+            Ok(path) => *raw = path.display().to_string(),
+            Err(reason) => {
+                problem.get_or_insert(reason);
+            }
+        }
+    }
+    match problem {
+        Some(reason) => RefsState::Unavailable(reason),
+        None => RefsState::Ready,
+    }
+}
 
 /// GUI / HTTP 共用的批次状态。
 pub struct Workbench {
@@ -50,6 +121,8 @@ pub struct Workbench {
     /// 投喂串行锁：`refs-cache.json` 是「读-合并-写」，两次并发投喂会互相覆盖
     /// （`docs/plan/09` §1.5.4）。代价可接受 —— 投喂是人工动作。
     intake_lock: Mutex<()>,
+    /// 外部递送进来的草稿（**只在内存**：关 GUI 即消失，不写 `state.jsonl`）。
+    drafts: Mutex<DraftsStore>,
 }
 
 impl Workbench {
@@ -67,6 +140,7 @@ impl Workbench {
             single_instance: Mutex::new(None),
             scheduler: Mutex::new(None),
             intake_lock: Mutex::new(()),
+            drafts: Mutex::new(DraftsStore::default()),
         });
 
         // ⚠️ 启动就把 `.env` 载进来：设置里的「并发数 / 输出文件夹」也住在那里，
@@ -301,5 +375,125 @@ impl Workbench {
         self.env_lock
             .lock()
             .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// 收一批草稿（**唯一写入口**）。HTTP 的 `/drafts` 与将来的 CLI 都只能调它。
+    ///
+    /// 归一（stat / `data:` 落盘）在**锁外**做：磁盘 I/O 不占草稿锁，
+    /// 否则 HTTP 线程会堵住 GUI 的 `get_drafts`。
+    pub fn draft(&self, tasks: Vec<TaskInput>) {
+        let normalized: Vec<(TaskInput, RefsState)> = tasks
+            .into_iter()
+            .map(|mut task| {
+                let state = normalize_draft_refs(&mut task, &self.cwd);
+                (task, state)
+            })
+            .collect();
+        let mut store = self.drafts.lock().unwrap_or_else(|error| error.into_inner());
+        for (task, refs_state) in normalized {
+            store.seq += 1;
+            let id = format!("d-{}", store.seq);
+            store.items.push(Draft { id, task, refs_state });
+        }
+    }
+
+    /// 全部草稿（按收到顺序；前端按 `id` 去重）。
+    pub fn drafts(&self) -> Vec<Draft> {
+        self.drafts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .items
+            .clone()
+    }
+
+    /// 按 id 删草稿（删单条传 `[id]`；**不是全清**）。返回删掉的条数。
+    pub fn clear_drafts(&self, ids: &[String]) -> usize {
+        let mut store = self.drafts.lock().unwrap_or_else(|error| error.into_inner());
+        let before = store.items.len();
+        store.items.retain(|draft| !ids.contains(&draft.id));
+        before - store.items.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("lovart-drafts-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        dir
+    }
+
+    fn task(prompt: &str, refs: &[&str]) -> TaskInput {
+        TaskInput {
+            prompt: prompt.to_string(),
+            model: String::new(),
+            ratio: String::new(),
+            size: String::new(),
+            refs: refs.iter().map(|value| value.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn 两条草稿_id_唯一且按序() {
+        let dir = temp_dir("ids");
+        let wb = Workbench::new(dir);
+        wb.draft(vec![task("一", &[]), task("二", &[])]);
+        let drafts = wb.drafts();
+        assert_eq!(drafts.len(), 2);
+        assert_ne!(drafts[0].id, drafts[1].id);
+        assert_eq!(drafts[0].refs_state, RefsState::Ready);
+    }
+
+    #[test]
+    fn 相对路径变绝对路径() {
+        let dir = temp_dir("relative");
+        std::fs::write(dir.join("a.png"), b"x").expect("写垫图");
+        let wb = Workbench::new(dir.clone());
+        wb.draft(vec![task("p", &["a.png"])]);
+        let drafts = wb.drafts();
+        let path = Path::new(&drafts[0].task.refs[0]);
+        assert!(path.is_absolute(), "应归一成绝对路径：{}", path.display());
+        assert!(path.ends_with("a.png"));
+        assert_eq!(drafts[0].refs_state, RefsState::Ready);
+    }
+
+    #[test]
+    fn 路径不存在标_unavailable() {
+        let dir = temp_dir("missing");
+        let wb = Workbench::new(dir);
+        wb.draft(vec![task("p", &["没有这张.png"])]);
+        let drafts = wb.drafts();
+        assert!(matches!(drafts[0].refs_state, RefsState::Unavailable(_)));
+    }
+
+    #[test]
+    fn data_落盘成路径() {
+        let dir = temp_dir("data");
+        let wb = Workbench::new(dir.clone());
+        // 1x1 PNG（只验落盘与路径归一，不验像素）。
+        let png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        wb.draft(vec![task("p", &[png])]);
+        let drafts = wb.drafts();
+        let path = &drafts[0].task.refs[0];
+        assert!(!path.starts_with("data:"), "应落盘成路径：{path}");
+        assert!(Path::new(path).exists(), "落盘文件应存在：{path}");
+        assert_eq!(drafts[0].refs_state, RefsState::Ready);
+    }
+
+    #[test]
+    fn clear_drafts_只清给定_id() {
+        let dir = temp_dir("clear");
+        let wb = Workbench::new(dir);
+        wb.draft(vec![task("一", &[]), task("二", &[]), task("三", &[])]);
+        let first = wb.drafts()[0].id.clone();
+        assert_eq!(wb.clear_drafts(&[first.clone()]), 1);
+        let left = wb.drafts();
+        assert_eq!(left.len(), 2);
+        assert!(left.iter().all(|draft| draft.id != first));
+        // 删不存在的 id ⇒ 不动
+        assert_eq!(wb.clear_drafts(&["d-999".to_string()]), 0);
     }
 }

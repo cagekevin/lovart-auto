@@ -11,4 +11,4 @@ pub mod wiring;
 pub mod workbench;
 
 pub use snapshot::Snapshot;
-pub use workbench::Workbench;
+pub use workbench::{Draft, Workbench};

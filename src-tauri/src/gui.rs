@@ -31,7 +31,7 @@ use crate::lovart::connection::{
 use crate::lovart::prompt::{parse_prompts, ParseOptions, PromptDefaults, PromptTask};
 use crate::service::api::RunSource;
 use crate::service::snapshot::{is_retryable, unchanged_payload};
-use lovart_core::service::Workbench;
+use lovart_core::service::{Draft, Workbench};
 
 // ── 命令 ──────────────────────────────────────────────────────────────
 
@@ -430,6 +430,21 @@ async fn publish_queue(
     // 结构化入参：**不再**落 `queue.jsonl` 再读回来（那是同一份数据的第二次序列化）。
     // 校验 / id / 默认值全部由 `intake` 一处完成，与 CLI 解析文件共用同一批函数。
     state.publish(tasks).map(|_| ())
+}
+
+/// 全部草稿（外部递送进来、等人确认的）。`refs` 已是前端能显示的路径 / URL。
+#[tauri::command]
+async fn get_drafts(state: tauri::State<'_, Arc<Workbench>>) -> Result<Vec<Draft>, String> {
+    Ok(state.drafts())
+}
+
+/// 按 id 删草稿（删单条传 `[id]`；发布成功与「载入编辑区」取走都走它）。
+#[tauri::command]
+async fn clear_drafts(
+    state: tauri::State<'_, Arc<Workbench>>,
+    ids: Vec<String>,
+) -> Result<usize, String> {
+    Ok(state.clear_drafts(&ids))
 }
 
 /// 重跑 = **显式**把这条重置为待提交。
@@ -1195,6 +1210,8 @@ pub fn run() {
             validate_draft,
             export_draft,
             publish_queue,
+            get_drafts,
+            clear_drafts,
             retry_one,
             retry_abnormal,
             preview_confirm,

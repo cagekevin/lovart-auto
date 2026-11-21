@@ -57,7 +57,7 @@ impl Rejection {
 }
 
 /// GUI 的一条待投喂任务（`publish_queue` 的入参元素，字段名与前端一致）。
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct TaskInput {
     pub prompt: String,
     #[serde(default)]

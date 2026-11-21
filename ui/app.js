@@ -556,6 +556,10 @@ async function refreshBoardOnce() {
   }
   clearBoardError();
 
+  // 草稿：独立于看板指纹（不在 `get_state` 里），所以必须在 `unchanged` 早退**之前**拉。
+  // 不 await：草稿同步慢不该把看板一起拖住。
+  void syncDrafts();
+
   // 批次级告警：**必须显示**，所以放在「结构没变就早退」之前 ——
   // 告警的出现与任务列表的结构无关（跑批失败时列表往往一点没变）。
   await flushAlerts();
@@ -1396,7 +1400,19 @@ function renderQueue() {
     text.appendChild(el('div', 'task-prompt', item.prompt));
     // ⚠️ 「垫图 N 张」这几个字**已删**：图就在左边摆着，再写一遍是重复。
     text.appendChild(el('div', 'task-reason', [item.model, item.ratio, item.size].join(' · ')));
+    // 垫图读不到：**必须写出来**（图是白板，不写原因等于界面撒谎）。
+    if (item.refsError) text.appendChild(el('div', 'task-reason', `垫图读不到：${item.refsError}`));
     row.appendChild(text);
+
+    // 草稿行多一个「编辑」：载入编辑区改提示词 / 换垫图，改完再发。
+    if (item.draftId) {
+      const edit = el('button', 'queue-edit', '编辑');
+      edit.title = '载入编辑区，改完再发';
+      edit.addEventListener('click', () => {
+        void loadDraftIntoEditor(item);
+      });
+      row.appendChild(edit);
+    }
 
     // 查8：删除键**常显**（不做 hover 才出现）
     const remove = el('button', 'queue-remove', '×');
@@ -1404,10 +1420,101 @@ function renderQueue() {
     remove.addEventListener('click', () => {
       queue.splice(index, 1);
       renderQueue();
+      // 草稿还要从后端删：不删的话下一轮 `syncDrafts` 会把它加回来。
+      if (item.draftId) forgetDrafts([item.draftId]);
     });
     row.appendChild(remove);
     list.appendChild(row);
   });
+}
+
+// ── 草稿（外部递送进来、等人确认）──────────────────────────────────────
+
+/** 草稿同步进行中（防重入：看板 3 秒一轮，上一轮没回来就跳过）。 */
+let draftsSyncing = false;
+/** 草稿通道失败只提示一次（老后端没有 `get_drafts` 时不该每 3 秒弹一次）。 */
+let draftsSyncingErrorShown = false;
+/** 正在从后端删的草稿 id：删除与下一轮 `syncDrafts` 之间的窗口里别再把它加回来。 */
+const draftsRemoving = new Set();
+/** 上一次同步的草稿 id 列表：没变就**不重建队列 DOM**（每 3 秒重建会把滚动位置弹回顶部）。 */
+let draftsSignature = '';
+
+/**
+ * 从后端删草稿（删单条传 `[id]`；不是全清）。
+ *
+ * ⚠️ 先记进 `draftsRemoving` 再发请求：`clear_drafts` 是异步的，这期间
+ *    下一轮 `syncDrafts` 可能拿到旧列表、把刚删的加回队列（"删了又回来"）。
+ */
+function forgetDrafts(ids) {
+  for (const id of ids) draftsRemoving.add(id);
+  invoke('clear_drafts', { ids })
+    .catch((error) => notice(`删除草稿失败：${error}`))
+    .finally(() => {
+      for (const id of ids) draftsRemoving.delete(id);
+    });
+}
+
+/**
+ * 拉草稿并同步进待发队列。
+ *
+ * ⚠️ 草稿**不在** `get_state` 里（§2.3），所以跟着看板刷新一起拉 —— 每轮几百字节。
+ * ⚠️ 只有带 `draftId` 的队列项参与联动：人手动加的任务不受影响。
+ */
+async function syncDrafts() {
+  if (draftsSyncing) return;
+  draftsSyncing = true;
+  try {
+    const drafts = await invoke('get_drafts');
+    // 草稿只在「收到」时变（没有更新端点）⇒ id 列表没变就不重建队列 DOM。
+    const signature = drafts.map((draft) => draft.id).join(',');
+    if (signature === draftsSignature) return;
+    draftsSignature = signature;
+    // ① 后端已经没有的草稿：从队列移除（别人删了 / 已经发掉）。
+    for (let index = queue.length - 1; index >= 0; index -= 1) {
+      const id = queue[index].draftId;
+      if (id && !drafts.some((draft) => draft.id === id)) queue.splice(index, 1);
+    }
+    // ② 后端有、队列里没有的：走唯一入队入口 `enqueue`（每份独立 refs 数组）。
+    for (const draft of drafts) {
+      if (draftsRemoving.has(draft.id)) continue;
+      if (queue.some((item) => item.draftId === draft.id)) continue;
+      enqueue(
+        {
+          prompt: draft.prompt,
+          model: draft.model,
+          ratio: draft.ratio,
+          size: draft.size,
+          refs: draft.refs || [],
+          draftId: draft.id,
+          // `refsState` 是 `"ready"` 或 `{ unavailable: "原因" }`；原因要显示出来。
+          refsError: draft.refsState && draft.refsState.unavailable ? draft.refsState.unavailable : '',
+        },
+        1,
+      );
+    }
+    renderQueue();
+  } catch (error) {
+    if (!draftsSyncingErrorShown) {
+      draftsSyncingErrorShown = true;
+      notice(`草稿同步失败：${error}`);
+    }
+  } finally {
+    draftsSyncing = false;
+  }
+}
+
+/**
+ * 「载入编辑区」（草稿行）：回填提示词 / 参数 / 垫图，改完再发。
+ *
+ * ⚠️ 载入即**取走**：从队列移除 + 后端删 —— 不删的话改完发布后原草稿还在，
+ *    同一条内容会出现两次。
+ */
+async function loadDraftIntoEditor(item) {
+  if (!(await loadInputIntoEditor(item))) return;
+  const at = queue.indexOf(item);
+  if (at >= 0) queue.splice(at, 1);
+  renderQueue();
+  forgetDrafts([item.draftId]);
 }
 
 /**
@@ -1517,11 +1624,21 @@ function applyDraft(next) {
  * 「载入编辑区」：把一条任务当成**新输入**填回来，改一版再发。
  *
  * ⚠️ 只动前端草稿：不碰这条任务、不进待发队列、不花额度。
- * ⚠️ 编辑区非空时先问一句 —— 被替换掉的是人刚写的东西，没有后悔药。
  */
 async function loadTaskIntoEditor(task) {
-  if (!isComposerClean() && !(await askConfirm('载入编辑区', '编辑区当前内容会被这一条替换。'))) return;
-  applyDraft(recordToTaskInput(task));
+  await loadInputIntoEditor(recordToTaskInput(task));
+}
+
+/**
+ * 「任务契约 → 编辑区」的**唯一入口**（看板记录与草稿共用）。
+ *
+ * ⚠️ 编辑区非空时先问一句 —— 被替换掉的是人刚写的东西，没有后悔药。
+ * 返回有没有真的载入（用户取消 = false）。
+ */
+async function loadInputIntoEditor(input) {
+  if (!isComposerClean() && !(await askConfirm('载入编辑区', '编辑区当前内容会被这一条替换。'))) return false;
+  applyDraft(input);
+  return true;
 }
 
 // ── 提示词预设（界面侧）──────────────────────────────────────────────
@@ -2599,6 +2716,8 @@ async function publish() {
   try {
     // 队列条目**就是**契约形状（`intake::TaskInput`）⇒ 只做一份快照，不做字段映射。
     // 快照是必须的：`invoke` 之前要 `await` 落盘，这期间队列可能被追加。
+    // 草稿 id 也先拍快照：下面清空队列后就读不到了。
+    const draftIds = queue.filter((item) => item.draftId).map((item) => item.draftId);
     const payload = queue.map((item) => ({ ...item, refs: [...item.refs] }));
     // 垫图可能还在落盘：等它们，否则这一批会**静默少图**（见 `addRefs`）。
     if (pendingRefSaves.size) await Promise.allSettled([...pendingRefSaves]);
@@ -2607,6 +2726,8 @@ async function publish() {
     // 万一它慢（探针 / 上千条载荷），也不该让「发送」看起来还没发出去。
     busy = false;
     queue.length = 0;
+    // 草稿按本次的 id 清（**不全清**：发布期间新到的不受影响）。
+    if (draftIds.length) forgetDrafts(draftIds);
     // ⚠️ 编辑框的垫图**不清**：发送后仍留在那儿，等你决定删不删（需求 2）。
     renderRefs();
     closeMentions();

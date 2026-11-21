@@ -1524,6 +1524,20 @@ select:focus { border-color: var(--ink); }
 
 .queue-remove:hover { background: var(--bg-hover); color: var(--bad); }
 
+/* 草稿行的「编辑」：载入编辑区改完再发（只对带 `draftId` 的项出现）。 */
+.queue-edit {
+  flex: none;
+  height: var(--h-btn-sm);
+  padding: 0 var(--sp-2);
+  border: none;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--ink-2);
+  font-size: var(--fs-sm);
+}
+
+.queue-edit:hover { background: var(--bg-hover); color: var(--ink-2); }
+
 /* ══ 弹窗 ══════════════════════════════════════════════════════════ */
 
 .mask {

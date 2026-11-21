@@ -75,7 +75,11 @@ fn resolve_local(input: &str, cwd: &Path) -> PathBuf {
     }
 }
 
-fn local_file_entry(input: &str, cwd: &Path) -> Result<RefEntry, String> {
+/// 解析本机参考图输入 → 绝对路径；不存在 / 不是文件 / 过大 ⇒ `Err(原因)`。
+///
+/// 只做「定位 + 体检」，不读内容：草稿通道收到路径时用它确认"前端显示得出来"，
+/// 发布链（[`local_file_entry`]）再接着读盘。两处共用这一条判据。
+pub fn resolve_local_ref(input: &str, cwd: &Path) -> Result<PathBuf, String> {
     let abs_path = resolve_local(input, cwd);
     let metadata = std::fs::metadata(&abs_path)
         .map_err(|_| format!("参考图不存在或不是文件：{}", abs_path.display()))?;
@@ -90,6 +94,11 @@ fn local_file_entry(input: &str, cwd: &Path) -> Result<RefEntry, String> {
             abs_path.display()
         ));
     }
+    Ok(abs_path)
+}
+
+fn local_file_entry(input: &str, cwd: &Path) -> Result<RefEntry, String> {
+    let abs_path = resolve_local_ref(input, cwd)?;
     let bytes =
         std::fs::read(&abs_path).map_err(|error| format!("读参考图失败：{error}"))?;
     let ext = abs_path
@@ -112,9 +121,15 @@ fn local_file_entry(input: &str, cwd: &Path) -> Result<RefEntry, String> {
 /// **唯一实现**：GUI 的「粘贴/选择图片」与这里的 `data:` 输入都走它。
 /// 文件名 = 内容 sha1：同一张图重复调用不重复写盘。
 pub fn materialize_data_url(dir: &Path, data_url: &str) -> Result<String, String> {
-    let (meta, payload) = data_url
-        .strip_prefix("data:")
-        .and_then(|rest| rest.split_once(','))
+    // 前缀大小写不敏感（`DATA:` / `Data:` 都认）；base64 内容本身仍大小写敏感。
+    let has_prefix = data_url
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"));
+    if !has_prefix {
+        return Err("图片数据格式不对（缺少 data: 前缀或逗号）".to_string());
+    }
+    let (meta, payload) = data_url[5..]
+        .split_once(',')
         .ok_or_else(|| "图片数据格式不对（缺少 data: 前缀或逗号）".to_string())?;
     if !meta.contains("base64") {
         return Err("图片数据不是 base64 编码".to_string());
@@ -163,7 +178,7 @@ pub fn read_ref_inputs(inputs: &[String], cwd: &Path) -> Result<Vec<RefEntry>, S
             });
             continue;
         }
-        if input.starts_with("data:") {
+        if lower.starts_with("data:") {
             // `data:` 一律落成本机文件：记录里只存路径，发送时才上传。
             // 不落盘的话这条记录就没有"真相"，CDN 一过期就再也找不回来。
             let path = materialize_data_url(&cwd.join("var").join("refs"), input)?;
@@ -203,4 +218,29 @@ pub fn save_refs_cache(file: Option<&Path>, cache: &RefsCache) {
         return;
     };
     let _ = std::fs::write(file, format!("{text}\n"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("lovart-refs-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn data_前缀大小写不敏感() {
+        let dir = temp_dir("upper");
+        let path = materialize_data_url(&dir, "DATA:image/png;base64,AAAA").expect("大写前缀也认");
+        assert!(Path::new(&path).exists(), "落盘文件应存在：{path}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 缺_data_前缀时报错() {
+        let dir = temp_dir("bad");
+        assert!(materialize_data_url(&dir, "image/png;base64,AAAA").is_err());
+    }
 }

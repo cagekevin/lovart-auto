@@ -1,8 +1,9 @@
 //! 本机 HTTP 接口 —— 给「另一个前端」用的稳定入口。
 //!
-//! ── 只有三个端点，且路由是**穷尽 `match`** ──────────────────────────────
-//! `POST /tasks` · `GET /state` · `POST /stop`。没有 `settings` / `save_settings`
+//! ── 只有四个端点，且路由是**穷尽 `match`** ──────────────────────────────
+//! `POST /tasks` · `POST /drafts` · `GET /state` · `POST /stop`。没有 `settings` / `save_settings`
 //! 这类分支 —— 不是"文档里说别调"，是代码里根本没有可执行路径（`ADR-0009` 级 1）。
+//! `/drafts` 与 `/tasks` 的差别是语义：前者只递送、等人确认；后者直接开跑。
 //!
 //! ── 串行处理（不 spawn）──────────────────────────────────────────────
 //! 监听循环里一次只处理一个请求：`/state` 是 200ms 级全量，若并发就变成
@@ -60,7 +61,7 @@ pub fn spawn(core: Arc<Workbench>) {
     });
 }
 
-fn handle(core: &Arc<Workbench>, token: &str, request: Request) {
+pub(crate) fn handle(core: &Arc<Workbench>, token: &str, request: Request) {
     let method = request.method().clone();
     let path = request
         .url()
@@ -76,6 +77,7 @@ fn handle(core: &Arc<Workbench>, token: &str, request: Request) {
 
     match (method, path.as_str()) {
         (Method::Post, "/tasks") => handle_tasks(core, request),
+        (Method::Post, "/drafts") => handle_drafts(core, request),
         (Method::Get, "/state") => handle_state(core, request),
         (Method::Post, "/stop") => handle_stop(core, request),
         // 穷尽路由：其余全部 404（没有 settings 分支可写）。
@@ -83,19 +85,20 @@ fn handle(core: &Arc<Workbench>, token: &str, request: Request) {
     }
 }
 
+/// 解析 `{ "tasks": [ … ] }` —— `/tasks` 与 `/drafts` 共用同一份契约。
+fn parse_tasks_body(request: &mut Request) -> Result<Vec<TaskInput>, (u16, String)> {
+    let body = read_body(request)?;
+    let parsed: Result<TasksBody, _> = serde_json::from_slice(&body);
+    parsed
+        .map(|TasksBody { tasks }| tasks)
+        .map_err(|error| (400, format!("body 不是合法 JSON：{error}")))
+}
+
 fn handle_tasks(core: &Arc<Workbench>, mut request: Request) {
-    let body = match read_body(&mut request) {
-        Ok(body) => body,
+    let tasks = match parse_tasks_body(&mut request) {
+        Ok(tasks) => tasks,
         Err((status, message)) => {
             respond(request, status, json!({ "error": message }));
-            return;
-        }
-    };
-    let parsed: Result<TasksBody, _> = serde_json::from_slice(&body);
-    let TasksBody { tasks } = match parsed {
-        Ok(parsed) => parsed,
-        Err(error) => {
-            respond(request, 400, json!({ "error": format!("body 不是合法 JSON：{error}") }));
             return;
         }
     };
@@ -111,6 +114,21 @@ fn handle_tasks(core: &Arc<Workbench>, mut request: Request) {
         // `publish` 的错误都是"输入不合法 / 待发为空"，400。
         Err(message) => respond(request, 400, json!({ "error": message })),
     }
+}
+
+/// 只递送、不开跑：草稿落在编辑窗的「待发」里，等人点发布。
+///
+/// 成功 **204**（空 body）：受理即结束，不给调用方任何要解析的东西。
+fn handle_drafts(core: &Arc<Workbench>, mut request: Request) {
+    let tasks = match parse_tasks_body(&mut request) {
+        Ok(tasks) => tasks,
+        Err((status, message)) => {
+            respond(request, status, json!({ "error": message }));
+            return;
+        }
+    };
+    core.draft(tasks);
+    respond_empty(request, 204);
 }
 
 fn handle_state(core: &Arc<Workbench>, request: Request) {
@@ -170,6 +188,11 @@ fn respond(request: Request, status: u16, body: Value) {
     );
 }
 
+/// 空 body 的成功回执（`/drafts` 的 204）。
+fn respond_empty(request: Request, status: u16) {
+    let _ = request.respond(Response::empty(status));
+}
+
 /// 读 `var/http-token`；不存在才生成。删文件 = 轮换。
 fn load_or_create_token(dir: &Path) -> Result<String, String> {
     let path = dir.join("http-token");
@@ -210,6 +233,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("建临时目录");
         dir
+    }
+
+    /// 起一个随机端口的服务器，用**同一个 `handle`** 跑请求（不复制路由逻辑）。
+    fn start(core: Arc<Workbench>, token: &str) -> std::net::SocketAddr {
+        let server = tiny_http::Server::http(("127.0.0.1", 0)).expect("起测试服务器");
+        let addr = server.server_addr().to_ip().expect("拿到端口");
+        let core = Arc::clone(&core);
+        let token = token.to_string();
+        std::thread::spawn(move || {
+            for request in server.incoming_requests() {
+                handle(&core, &token, request);
+            }
+        });
+        addr
+    }
+
+    /// 手写一个 HTTP/1.1 请求，只返回状态码。
+    fn request(
+        addr: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        auth: Option<&str>,
+        body: &str,
+    ) -> u16 {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(addr).expect("连服务器");
+        let mut head = format!(
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: {}\r\n",
+            body.len()
+        );
+        if let Some(token) = auth {
+            head.push_str(&format!("Authorization: Bearer {token}\r\n"));
+        }
+        head.push_str("\r\n");
+        head.push_str(body);
+        stream.write_all(head.as_bytes()).expect("发请求");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("读响应");
+        response
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .expect("响应行里有状态码")
+    }
+
+    #[test]
+    fn drafts_端点三态_且受理后进草稿() {
+        let dir = temp_dir("drafts-http");
+        let core = Workbench::new(dir.clone());
+        let token = load_or_create_token(&dir).expect("token");
+        let addr = start(Arc::clone(&core), &token);
+
+        // 合法 ⇒ 204，且草稿真的进去了
+        assert_eq!(
+            request(addr, "POST", "/drafts", Some(&token), r#"{"tasks":[{"prompt":"p"}]}"#),
+            204
+        );
+        assert_eq!(core.drafts().len(), 1, "204 之后草稿必须真的在集合里");
+
+        // 无 token ⇒ 401
+        assert_eq!(request(addr, "POST", "/drafts", None, r#"{"tasks":[]}"#), 401);
+
+        // body 不合法 ⇒ 400
+        assert_eq!(request(addr, "POST", "/drafts", Some(&token), "not json"), 400);
     }
 
     #[test]
