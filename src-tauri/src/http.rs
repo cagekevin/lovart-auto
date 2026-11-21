@@ -79,7 +79,6 @@ pub(crate) fn handle(core: &Arc<Workbench>, token: &str, request: Request) {
         (Method::Post, "/tasks") => handle_tasks(core, request),
         (Method::Post, "/drafts") => handle_drafts(core, request),
         (Method::Get, "/state") => handle_state(core, request),
-        (Method::Post, "/stop") => handle_stop(core, request),
         // 穷尽路由：其余全部 404（没有 settings 分支可写）。
         _ => respond(request, 404, json!({ "error": "没有这个端点" })),
     }
@@ -139,14 +138,6 @@ fn handle_state(core: &Arc<Workbench>, request: Request) {
             None => respond(request, 500, json!({ "error": "看板没返回数据（内部 bug）" })),
         },
         Err(message) => respond(request, 500, json!({ "error": message })),
-    }
-}
-
-fn handle_stop(core: &Arc<Workbench>, request: Request) {
-    match core.stop() {
-        Ok(ack) => respond(request, 200, json!({ "stopping": true, "note": ack.note })),
-        // 无批次 ⇒ 409（语义是"现在没有可停的"，不是 200 假成功）。
-        Err(message) => respond(request, 409, json!({ "error": message })),
     }
 }
 
