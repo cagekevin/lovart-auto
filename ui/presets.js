@@ -6,7 +6,7 @@
  * 本模块是前端**唯一的命令调用点**（ADR-0005）：app.js 不直接 invoke 预设命令。
  * 名字兜底规则（首行前 16 字）也只在这里一份，界面不自己拼。
  *
- *   list()                -> async { ok:true, presets, fresh } | { ok:false, reason, detail }
+ *   list()                -> async { ok:true, presets } | { ok:false, reason, detail }
  *   create(name,text,images) / update(id,name,text,images) / remove(id) -> async Result
  *   importImages(inputs)  -> async { ok:true, images:[{file,path,label}] } | Result
  *   resolveImages(files)  -> async { ok:true, images:[{file,path,label,missing,reason}] }
@@ -18,7 +18,6 @@
   'use strict';
 
   const NAME_MAX = 16;
-  const KEY_LEGACY = 'lovart.promptPresets.v2'; // 只用于一次性迁移；不再是真相。
 
   function cleanName(name) {
     return String(name == null ? '' : name).replace(/\s+/g, ' ').trim();
@@ -55,31 +54,7 @@
   function importImages(inputs) { return invoke('import_preset_images', { inputs }); }
   function resolveImages(files) { return invoke('resolve_preset_images', { files }); }
 
-  /** 一次性迁移：老 localStorage 里的 {id,name,text} → 后端命令逐条写。不删老数据。 */
-  async function migrateLegacy() {
-    let raw = null;
-    try {
-      raw = window.localStorage.getItem(KEY_LEGACY);
-    } catch (error) {
-      return { ok: false, reason: 'storage', detail: String(error) };
-    }
-    if (!raw) return { ok: true };
-    let items;
-    try {
-      items = JSON.parse(raw);
-    } catch (error) {
-      return { ok: false, reason: 'storage', detail: String(error) };
-    }
-    if (!Array.isArray(items)) return { ok: true };
-    for (const item of items) {
-      if (!item || typeof item.text !== 'string' || !item.text.trim()) continue;
-      const result = await create(item.name || '', item.text, []);
-      if (!result.ok) return result;
-    }
-    return { ok: true };
-  }
-
   window.Presets = {
-    list, create, update, remove, importImages, resolveImages, migrateLegacy, displayName,
+    list, create, update, remove, importImages, resolveImages, displayName,
   };
 })();

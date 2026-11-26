@@ -394,18 +394,13 @@ fn preset_err(error: &crate::lovart::preset::PresetError) -> Value {
 }
 
 /// `{ ok:true, presets:[...] }` / `{ ok:false, reason, detail }`。
-/// `fresh` = 这个工作区还没建过 manifest ⇒ 前端可一次性从 localStorage 迁老预设。
+/// 真相只有 `data/presets/manifest.json` —— 一次性 localStorage 迁移已完成（用户裁定 2026-11-26），
+/// 不再回 `fresh` 位、不再读 localStorage。
 #[tauri::command]
 fn get_presets(state: tauri::State<'_, Arc<Workbench>>) -> Value {
-    let dir = state.presets_dir();
-    let fresh = !dir.join("manifest.json").exists();
-    match crate::lovart::preset::load(&dir) {
-        Ok(list) => json!({ "ok": true, "presets": list, "fresh": fresh }),
-        Err(error) => {
-            let mut value = preset_err(&error);
-            value["fresh"] = json!(fresh);
-            value
-        }
+    match crate::lovart::preset::load(&state.presets_dir()) {
+        Ok(list) => json!({ "ok": true, "presets": list }),
+        Err(error) => preset_err(&error),
     }
 }
 

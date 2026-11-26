@@ -1830,17 +1830,12 @@ async function addPresetImages(files) {
   renderPresetRefs();
 }
 
-/** 打开面板：回列表态；首次会一次性迁移老 localStorage 预设。 */
+/** 打开面板：回列表态（真相只有后端 manifest.json，无 localStorage 迁移）。 */
 async function openPresets() {
   closeMenu();
   closeMentions();
   closePresetEditor();
   openMask('maskPresets');
-  const first = await window.Presets.list();
-  if (first.ok && first.fresh) {
-    const migrated = await window.Presets.migrateLegacy();
-    if (!migrated.ok) notice(presetMessage(migrated));
-  }
   await renderPresetList();
   $('btnPresetNew').focus();
 }
