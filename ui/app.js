@@ -1579,7 +1579,7 @@ function recordToTaskInput(task) {
  * **"换一批内容"的唯一入口**，入参形状与 [`draftToTask`] 的输出完全一致。
  *
  * 谁在用：只有 `loadTaskIntoEditor`。人手动输入不走这里 —— 打字是浏览器自己管 DOM，
- * 加一张 / 删一张 / 换顺序各走 `addRefs` / 删除键 / `commitRefOrder`，四种语义各一个入口。
+ * 加一张 / 删一张 / 换顺序各走 `addRefs` / 删除键 / `RefStrip` 的排序回调，四种语义各一个入口。
  *
  * ⚠️ **不写回设置**（不调 `persistDraftDefaults`）：借一条任务的参数发一次，
  *    不等于把下次启动的默认值也改掉。写回设置的唯一入口是三个 `change` 监听。
@@ -1590,20 +1590,26 @@ function applyDraft(next) {
   const chips = window.PromptChips;
   const input = $('promptInput');
 
-  // ① 垫图：清空后仍旧走唯一入口 [`addRefs`]（名字 / 去重 / 重绘都在里面）。
-  // ⚠️ 之后必须再重画一次：文生图任务没有垫图 ⇒ `addRefs` 一条都不会 push，
-  //    条带还挂着上一条任务的缩略图（图在、`draft.refs` 却是空的，发出去是文生图）。
-  draft.refs = [];
-  addRefs(next.refs || []);
-  renderRefs();
-  renderMentions();
+  // ① 垫图：**传了 refs 键才替换**（plan 18：无图预设不动编辑区已有垫图）。
+  // 载入任务总是传全量 refs ⇒ 覆盖行为不变；预设无图时不传 ⇒ 保持现状。
+  if (Object.prototype.hasOwnProperty.call(next, 'refs')) {
+    draft.refs = [];
+    addRefs(next.refs || []);
+    renderRefs();
+    renderMentions();
+  }
 
   // ② 参数走唯一写入口；模型失效时 `setParams` 会保持当前值，这里只补一句说明
   //    （"模型没带上"和"它已改名/下架"是两件事，不说清就会被当成前者）。
   if (next.model && !hasModel(next.model)) {
     notice(`模型 ${next.model} 不在当前模型表里，沿用「${draft.model}」`);
   }
-  setParams({ model: next.model, ratio: next.ratio, size: next.size });
+  // 键缺失 = 不动（预设取用只换文本 + 垫图，不改模型/比例/尺寸）。
+  const params = {};
+  for (const key of ['model', 'ratio', 'size']) {
+    if (Object.prototype.hasOwnProperty.call(next, key)) params[key] = next[key];
+  }
+  if (Object.keys(params).length) setParams(params);
 
   // ③ 提示词：`[img=图片N]` 还原成芯片。逆操作在 `promptChips.js`，本文件不另写一份正则
   //    （格式契约只有那一个出处）。缩略图走 `refSrc`：垫图是本机路径，裸路径当图片地址是破图。
@@ -1641,62 +1647,68 @@ async function loadInputIntoEditor(input) {
 
 // ── 提示词预设（界面侧）──────────────────────────────────────────────
 /**
- * 预设的**形状 / 仓储 / 名字兜底**在 `ui/presets.js`（`window.Presets`，纯函数）。
- * 这里只做壳该做的事：翻译 `reason`、画两态、接线。
+ *形状 / 仓储在 Rust；`ui/presets.js` 是唯一命令调用点；这里只画两态 + 翻译 reason。
  *
  * ── 两态 ─────────────────────────────────────────────────────────────
- * 列表态（默认）= "挑一条来用"；编辑态 = 新建 / 修改共用「名字 + textarea」两个输入。
- * 状态只有**一个**对象：`presetEditor`
- *   null             ⇒ 列表态
- *   { id }           ⇒ 编辑态（`id === null` 表示新建）
- * ⚠️ 不能只用 `editingId`：列表态和新建态都为"没有 id"，会串态。
+ * presetEditor: null = 列表态；{ id, images } = 编辑态（id=null ⇒ 新建）。
+ * images = 面板本地垫图态（{id,url,label,file}），不写 draft.refs。
  *
  * ── 与编辑区的关系 ───────────────────────────────────────────────────
- * **只写不读**：唯一接触点是 `applyPreset` 里的 `window.PromptChips.writePrompt(..., null)`。
- * 存/改的名字与文本只来自面板的两个输入 —— 编辑区只负责"装提示词"。
+ * 存/改**只读面板自己的两个输入 + 本地图片**，不读编辑区（用户裁定）。
+ * 取用则**复用 applyDraft**（唯一"写编辑区"入口），有图才传 refs，无图不动已有垫图。
  */
 let presetEditor = null;
+let presetRefSeq = 0;
 
-/** `Presets` 的失败原因 → 给人看的一句话（**唯一的措辞出处**）。 */
+/** `Presets` 的失败原因 → 一句话（唯一措辞出处）。 */
 function presetMessage(result) {
   switch (result.reason) {
-    case 'empty':
-      return '内容不能为空';
-    case 'missing':
-      return '这条预设已经不在存储里了';
-    case 'storage':
-      return `预设读写失败（本地存储不可用）：${result.error}`;
-    default:
-      return '预设操作失败';
+    case 'empty': return '内容不能为空';
+    case 'missing': return '这条预设已经不在存储里了';
+    case 'storage': return `预设读写失败：${result.detail || result.error || ''}`;
+    default: return '预设操作失败';
   }
 }
 
-function renderPresetList() {
+function renderPresetRefs() {
+  const box = $('presetRefs');
+  if (!box || !presetEditor) return;
+  window.RefStrip.render(box, presetEditor.images, {
+    src: refSrc,
+    onRemove: (id) => {
+      const at = presetEditor.images.findIndex((item) => item.id === id);
+      if (at >= 0) presetEditor.images.splice(at, 1);
+      renderPresetRefs();
+    },
+    onReorder: (ids) => {
+      const byId = new Map(presetEditor.images.map((item) => [item.id, item]));
+      const next = ids.map((id) => byId.get(id)).filter(Boolean);
+      if (next.length !== ids.length) { notice('垫图顺序没对上，请重试'); return; }
+      presetEditor.images = next;
+      renderPresetRefs();
+    },
+  });
+  // 「+」由调用方放（不归组件）；它接预设面板自己的 input。
+  const add = el('button', 'ref-add', '+');
+  add.type = 'button';
+  add.title = '添加参考图（可多选）';
+  add.addEventListener('click', () => $('presetRefPicker').click());
+  box.appendChild(add);
+}
+
+async function renderPresetList() {
   const box = $('presetList');
   clear(box);
+  const stored = await window.Presets.list();
+  if (!stored.ok) { notice(presetMessage(stored)); return; }
+  if (!stored.presets.length) { box.appendChild(el('div', 'preset-empty', '还没有预设')); return; }
 
-  const stored = window.Presets.list();
-  // 读失败：**只报事实**，不画"还没有预设" —— 那等于把"读不到"说成"没有"。
-  // （失败形状里没有 `list`，所以这里必须提前返回，不能顺手读空表。）
-  if (!stored.ok) {
-    notice(presetMessage(stored));
-    return;
-  }
-  if (stored.list.length === 0) {
-    box.appendChild(el('div', 'preset-empty', '还没有预设'));
-    return;
-  }
-
-  for (const preset of stored.list) {
+  for (const preset of stored.presets) {
     const row = el('div', 'preset-item');
-
-    // 整行 = 取用（不是"选中"）：点它就是把它写进编辑区
     const pick = el('button', 'preset-pick');
     pick.type = 'button';
     pick.title = '取用这条预设';
-    // 名字是**存的**（用户起的），留空时由库拿正文首行兜底 —— 界面不自己派生
     pick.appendChild(el('span', 'preset-pick-name', window.Presets.displayName(preset)));
-    // 预览被省略号截断，全文挂 title（名字可能与正文无关，全文只能在这里看）
     const preview = el('span', 'preset-pick-text', preset.text);
     preview.title = preset.text;
     pick.appendChild(preview);
@@ -1716,36 +1728,45 @@ function renderPresetList() {
     del.appendChild(svgIcon('i-trash', ''));
     del.addEventListener('click', () => removePreset(preset));
 
-    row.appendChild(pick);
-    row.appendChild(edit);
-    row.appendChild(del);
+    row.appendChild(pick); row.appendChild(edit); row.appendChild(del);
     box.appendChild(row);
   }
 }
 
-/**
- * 取用：库 → 编辑区的**唯一通道**。
- *
- * ⚠️ 先 `get(id)` 重读：列表是快照，这条可能已被删/改。
- *    读不到 ⇒ 提示且**不关面板**（用户还能选别的）；写成功才关。
- * ⚠️ 不读编辑区、不确认：点一行就是要用它。
- */
-function applyPreset(preset) {
-  const fresh = window.Presets.get(preset.id);
-  if (!fresh.ok) {
-    notice(presetMessage(fresh));
-    return;
+/** 取用：重读 → 解析图 → 复用 applyDraft（有图才传 refs）。 */
+async function applyPreset(preset) {
+  const fresh = await window.Presets.list();
+  if (!fresh.ok) { notice(presetMessage(fresh)); return; }
+  const latest = fresh.presets.find((item) => item.id === preset.id);
+  if (!latest) { notice(presetMessage({ reason: 'missing' })); return; }
+
+  let paths = [];
+  if (latest.images.length) {
+    const resolved = await window.Presets.resolveImages(latest.images.map((i) => i.file));
+    if (!resolved.ok) { notice(presetMessage(resolved)); return; }
+    // ⚠️ 后端只拼路径、不判存在 ⇒ 文件被删了这里照样传，缩略图显示破图，用户自己处理。
+    paths = resolved.images.map((i) => i.path);
   }
-  // metaMap = null：预设里是纯文本，没有"有效引用"，token 一律按文字落地
-  window.PromptChips.writePrompt($('promptInput'), fresh.preset.text, null);
-  closeMentions();
-  syncComposerState(); // 占位符 +「发送」可用性同一个判据
-  $('promptInput').focus();
+  // 有图 ⇒ 整体替换（applyDraft 内部清空 refs）；无图 ⇒ 不传 refs 键，不动已有垫图。
+  const input = paths.length ? { prompt: latest.text, refs: paths } : { prompt: latest.text };
+  applyDraft(input);
   closeMask('maskPresets');
 }
 
-function openPresetEditor(preset) {
-  presetEditor = { id: preset ? preset.id : null };
+async function openPresetEditor(preset) {
+  let images = [];
+  if (preset && preset.images.length) {
+    const resolved = await window.Presets.resolveImages(preset.images.map((i) => i.file));
+    if (resolved.ok) {
+      images = resolved.images.map((item) => ({
+        id: `ref-${++presetRefSeq}`,
+        url: item.path,
+        label: item.label || item.file,
+        file: item.file,
+      }));
+    }
+  }
+  presetEditor = { id: preset ? preset.id : null, images };
   $('presetsTitle').textContent = preset ? '修改预设' : '新建预设';
   const name = $('presetName');
   const input = $('presetText');
@@ -1753,17 +1774,15 @@ function openPresetEditor(preset) {
   input.value = preset ? preset.text : '';
   show($('presetListView'), false);
   show($('presetFormView'), true);
+  renderPresetRefs();
   if (preset) {
     input.focus();
-    // 光标在末尾：改错字是常态，别全选（一敲就把整条替换掉）
     input.setSelectionRange(input.value.length, input.value.length);
   } else {
-    // 新建先起名字：列表里靠它区分，正文可能很长
     name.focus();
   }
 }
 
-/** 回列表态（也用于"取消"）：丢弃编辑中的内容，重新从存储画一遍。 */
 function closePresetEditor() {
   presetEditor = null;
   $('presetsTitle').textContent = '提示词预设';
@@ -1774,41 +1793,73 @@ function closePresetEditor() {
   renderPresetList();
 }
 
-function savePresetForm() {
+async function savePresetForm() {
+  if (!presetEditor) return;
   const name = $('presetName').value;
   const text = $('presetText').value;
-  const editingId = presetEditor ? presetEditor.id : null;
+  const files = presetEditor.images.filter((i) => i.file).map((i) => ({ file: i.file }));
+  const editingId = presetEditor.id;
   const result = editingId
-    ? window.Presets.update(editingId, name, text)
-    : window.Presets.create(name, text);
-  if (!result.ok) {
-    notice(presetMessage(result));
-    return;
-  }
+    ? await window.Presets.update(editingId, name, text, files)
+    : await window.Presets.create(name, text, files);
+  if (!result.ok) { notice(presetMessage(result)); return; }
   notice(editingId ? '已更新' : '已保存');
   closePresetEditor();
 }
 
-/** 删除：无确认（预设是一段文本，重写很快）；列表是快照，按 id 删。 */
-function removePreset(preset) {
-  const result = window.Presets.remove(preset.id);
-  if (!result.ok) {
-    notice(presetMessage(result));
-    return;
-  }
+async function removePreset(preset) {
+  const result = await window.Presets.remove(preset.id);
+  if (!result.ok) { notice(presetMessage(result)); return; }
   renderPresetList();
 }
 
-/** 打开面板：**一律回列表态**（上次残留的编辑态不能带进来）。 */
-function openPresets() {
+/** 面板「+」选图 → 落盘到 data/presets/ → 进本地态。 */
+async function addPresetImages(files) {
+  if (!presetEditor || !files.length) return;
+  const inputs = await readFilesAsDataUrls(files);
+  const result = await window.Presets.importImages(inputs);
+  if (!result.ok) { notice(presetMessage(result)); return; }
+  for (const img of result.images) {
+    presetEditor.images.push({
+      id: `ref-${++presetRefSeq}`,
+      url: img.path,
+      label: img.label,
+      file: img.file,
+    });
+  }
+  renderPresetRefs();
+}
+
+/** 打开面板：回列表态；首次会一次性迁移老 localStorage 预设。 */
+async function openPresets() {
   closeMenu();
   closeMentions();
   closePresetEditor();
   openMask('maskPresets');
+  const first = await window.Presets.list();
+  if (first.ok && first.fresh) {
+    const migrated = await window.Presets.migrateLegacy();
+    if (!migrated.ok) notice(presetMessage(migrated));
+  }
+  await renderPresetList();
   $('btnPresetNew').focus();
 }
 
 // ── 垫图 ─────────────────────────────────────────────────────────────
+
+/** 文件选择器 → `data:` 的**唯一读取点**（编辑区与预设面板共用）。 */
+async function readFilesAsDataUrls(files) {
+  const out = [];
+  for (const file of files) {
+    out.push(await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(file);
+    }));
+  }
+  return out;
+}
 
 /** 垫图的可读名字（芯片上显示、`@` 弹层里显示）。 */
 function refLabelOf(url, index) {
@@ -1916,57 +1967,35 @@ function pushRef(url, label) {
 }
 
 // ⚠️ 拖拽期间**不许调 `renderRefs()`**：节点会被整个换掉，手势当场断。
-//    进行中状态不存全局变量 —— [`startPointerDrag`] 用闭包持着，只此一份。
+//    进行中状态不存全局变量 —— `RefStrip.startPointerDrag` 用闭包持着，只此一份。
 
 function renderRefs() {
   const box = $('refs');
-  clear(box);
-  draft.refs.forEach((ref, index) => {
-    const node = el('div', 'ref');
-    node.dataset.refId = ref.id;
-    node.title = `第 ${index + 1} 张 · 拖动可调整顺序`;
-    // ⚠️ 走 [`refSrc`]：拖进来的垫图是**本机路径**，原来只认 `data:` ⇒ 一片空白。
-    const img = document.createElement('img');
-    img.src = refSrc(ref.url);
-    img.alt = ref.label;
-    img.loading = 'lazy';
-    // ⚠️ 必须关掉：浏览器原生的图片拖拽会抢走 pointer 手势，拖起来只剩一张半透明幽灵图。
-    img.draggable = false;
-    node.appendChild(img);
-
-    // 序号 = **提交位次**（文本里 `[img=图片N]` 的 N 就是它）。
-    // 没有它，拖完也核不出"文本里的图片2到底是哪张" —— 它是这条功能唯一的核对面。
-    node.appendChild(el('span', 'ref-num', index + 1));
-
-    // 查8：删除键**常显**
-    const remove = el('button', 'ref-remove', '×');
-    remove.title = '移除参考图';
-    remove.addEventListener('click', () => {
-      // ⚠️ 按 **id** 删，不是按下标：提示词里可能已经有指向它的芯片，
-      //    按下标删会让"删掉的那张"与"芯片指的那张"错开（静默指错图）。
-      const at = draft.refs.findIndex((item) => item.id === ref.id);
+  // ⚠️ 渲染 / 手势 / 序号角标全在 `RefStrip`（`plan 18` §4）；这里只给回调。
+  window.RefStrip.render(box, draft.refs, {
+    src: refSrc,
+    onRemove: (id) => {
+      // ⚠️ 按 **id** 删，不是按下标：提示词里可能已经有指向它的芯片。
+      const at = draft.refs.findIndex((item) => item.id === id);
       if (at >= 0) draft.refs.splice(at, 1);
-      removeChipsById(ref.id); // 引用它的芯片一并删（理由见 removeChipsById）
+      removeChipsById(id);
       renderRefs();
       renderMentions();
-    });
-    node.appendChild(remove);
-    node.addEventListener('pointerdown', (event) => {
-      if (event.target.closest('.ref-remove')) return; // 删除键上是点击，不是拖拽
-      node.classList.add('is-armed');
-      startPointerDrag(event, {
-        onStart: () => node.classList.add('is-dragging'),
-        onMove: (moveEvent) => placeRefNode(node, moveEvent),
-        onEnd: (_endEvent, moved) => {
-          node.classList.remove('is-armed', 'is-dragging');
-          if (moved) commitRefOrder();
-        },
+    },
+    onReorder: (ids) => {
+      const byId = new Map(draft.refs.map((ref) => [ref.id, ref]));
+      draft.refs = ids.map((id) => {
+        const hit = byId.get(id);
+        if (!hit) throw new Error(`拖拽排序后找不到垫图 ${id}`);
+        return hit;
       });
-    });
-    box.appendChild(node);
+      renderRefs();
+      renderMentions();
+    },
   });
 
   // 「+」和缩略图一起换行 —— 垫图可以有任意多张，它必须跟在最后而不是被挤出去。
+  // ⚠️ 「+」**不归组件**：它接的是编辑区自己的 `#refPicker`（预设面板有另一个）。
   const add = el('button', 'ref-add', '+');
   add.type = 'button';
   add.title = '添加参考图（可多选）';
@@ -1974,85 +2003,8 @@ function renderRefs() {
   box.appendChild(add);
 }
 
-/**
- * 指针拖拽骨架：阈值 / 事件源 / 收尾**只此一份**（编辑区排序与「从看板拖进垫图区」共用）。
- *
- * ⚠️ 不用 HTML5 `draggable`：窗口的 `dragDropEnabled` 默认开着（拖文件进窗口靠它，
- *    见 `src-tauri/capabilities/default.json`），webview 内部的 dragstart / drop 会被吃掉。
- * ⚠️ 监听挂 `window` 而**不是** `setPointerCapture`：源节点可能被看板轮询（每 3 秒重建卡片）
- *    整个换掉，捕获跟着丢、手势当场断；挂在 window 上与节点生死无关。
- * ⚠️ 4px 阈值是「点击」与「拖拽」的唯一分界 —— 源都是 `<button>`（点一下 = 看大图），
- *    没有它点一下也会被判成拖动。
- * ⚠️ 不用 `el.style.*`（文件头写死的零内联样式）：拖拽反馈只靠 class，不跟指针画 ghost。
- */
-function startPointerDrag(event, handlers) {
-  if (event.button !== 0) return;
-  const fromX = event.clientX;
-  const fromY = event.clientY;
-  let moved = false;
-  const onMove = (moveEvent) => {
-    if (!moved) {
-      if (Math.hypot(moveEvent.clientX - fromX, moveEvent.clientY - fromY) < 4) return;
-      moved = true;
-      handlers.onStart();
-    }
-    handlers.onMove(moveEvent);
-  };
-  const onEnd = (endEvent) => {
-    window.removeEventListener('pointermove', onMove);
-    window.removeEventListener('pointerup', onEnd);
-    window.removeEventListener('pointercancel', onEnd);
-    window.removeEventListener('blur', onEnd);
-    handlers.onEnd(endEvent, moved);
-  };
-  window.addEventListener('pointermove', onMove);
-  window.addEventListener('pointerup', onEnd);
-  window.addEventListener('pointercancel', onEnd);
-  // 拖到窗口外松手时收不到 `pointerup`，靠失焦收尾 —— 否则这轮手势永远挂着。
-  window.addEventListener('blur', onEnd);
-}
-
-/**
- * 把拖着的那一格挪到离指针**最近的兄弟**前/后（顺序的唯一来源仍是 DOM）。
- *
- * 比"逐格算下标"稳：`flex-wrap` 换行、缩略图尺寸变化都不用另算一遍。
- */
-function placeRefNode(node, event) {
-  const siblings = Array.from($('refs').querySelectorAll('.ref')).filter((item) => item !== node);
-  if (!siblings.length) return;
-  let nearest = siblings[0];
-  let best = Infinity;
-  for (const item of siblings) {
-    const rect = item.getBoundingClientRect();
-    const dx = event.clientX - (rect.left + rect.width / 2);
-    const dy = event.clientY - (rect.top + rect.height / 2);
-    const distance = dx * dx + dy * dy;
-    if (distance < best) {
-      best = distance;
-      nearest = item;
-    }
-  }
-  const rect = nearest.getBoundingClientRect();
-  if (event.clientX > rect.left + rect.width / 2) nearest.after(node);
-  else nearest.before(node);
-}
-
-/**
- * 松手后读 DOM 顺序回写 `draft.refs`。
- *
- * ⚠️ **id 不许变**：`@` 芯片按 id 引用，换 id 等于把芯片指到别的图上。
- */
-function commitRefOrder() {
-  const order = Array.from($('refs').querySelectorAll('.ref')).map((item) => item.dataset.refId);
-  const byId = new Map(draft.refs.map((ref) => [ref.id, ref]));
-  draft.refs = order.map((id) => {
-    const hit = byId.get(id);
-    if (!hit) throw new Error(`拖拽排序后找不到垫图 ${id}`);
-    return hit;
-  });
-  renderRefs();
-  renderMentions(); // `@` 候选的顺序跟着走
-}
+// 指针手势骨架 / 落点 / 排序回写已抽进 `ui/refStrip.js`（`plan 18` §4）：
+// 编辑区排序与「从看板拖进垫图区」共用同一份；这里只通过 window.RefStrip 调它。
 
 /**
  * 从看板卡片把一张图拖进垫图区（结果图、卡片上的垫图都能拖）。
@@ -2065,7 +2017,7 @@ function commitRefOrder() {
 function startRefPull(event, url) {
   if (!url) return;
   const zone = $('composerTop');
-  startPointerDrag(event, {
+  window.RefStrip.startPointerDrag(event, {
     onStart: () => document.body.classList.add('is-ref-pulling'),
     onMove: (moveEvent) => zone.classList.toggle('is-drop-target', hitsRect(zone, moveEvent)),
     onEnd: (endEvent, moved) => {
@@ -3419,18 +3371,19 @@ window.addEventListener('DOMContentLoaded', async () => {
 
   syncComposerState();
 
-  $('refPicker').addEventListener('change', (event) => {
+  // 两个 input（编辑区 / 预设面板）各自一个入口，但**读取逻辑只一份**（R4）。
+  $('refPicker').addEventListener('change', async (event) => {
     const files = Array.from(event.target.files || []);
-    let pending = files.length;
-    if (!pending) return;
-    for (const file of files) {
-      const reader = new FileReader();
-      reader.onload = () => {
-        addRefs([reader.result]);
-        if (--pending === 0) event.target.value = '';
-      };
-      reader.readAsDataURL(file);
-    }
+    if (!files.length) return;
+    const dataUrls = await readFilesAsDataUrls(files);
+    addRefs(dataUrls);
+    event.target.value = '';
+  });
+  $('presetRefPicker').addEventListener('change', async (event) => {
+    const files = Array.from(event.target.files || []);
+    if (!files.length) return;
+    await addPresetImages(files);
+    event.target.value = '';
   });
 
   $('btnImport').addEventListener('click', openImport);

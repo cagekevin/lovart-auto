@@ -373,6 +373,167 @@ async fn save_ref_image(state: tauri::State<'_, Arc<Workbench>>, data: String) -
         .map_err(|error| format!("保存垫图线程异常退出：{error}"))?
 }
 
+// ── 提示词预设（plan 18）──────────────────────────────────────────────
+//
+// 形状在 `lovart::preset`、目录由 `Workbench::presets_dir()` 决定；这里只做
+// 「取 State → 调核心 → 拼前端形状」。失败带 reason，措辞由前端 `presetMessage` 翻译。
+
+/// 预设图片的可读名：**派生规则的唯一处**，import 与 resolve 都调它。
+/// 文件名形如 `portrait-1a2b3c4d.png` ⇒ 显示名 `portrait`（去掉哈希尾巴）。
+fn preset_label_of(file: &str) -> String {
+    let stem = Path::new(file).file_stem().unwrap_or_default().to_string_lossy().to_string();
+    match stem.rsplit_once('-') {
+        Some((head, tail)) if tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_hexdigit()) => head.to_string(),
+        _ => stem,
+    }
+}
+
+/// 失败 → `{ok:false, reason, detail}`（判别位不折成值，ADR-0003）。
+fn preset_err(error: &crate::lovart::preset::PresetError) -> Value {
+    json!({ "ok": false, "reason": error.reason(), "detail": error.detail() })
+}
+
+/// `{ ok:true, presets:[...] }` / `{ ok:false, reason, detail }`。
+/// `fresh` = 这个工作区还没建过 manifest ⇒ 前端可一次性从 localStorage 迁老预设。
+#[tauri::command]
+fn get_presets(state: tauri::State<'_, Arc<Workbench>>) -> Value {
+    let dir = state.presets_dir();
+    let fresh = !dir.join("manifest.json").exists();
+    match crate::lovart::preset::load(&dir) {
+        Ok(list) => json!({ "ok": true, "presets": list, "fresh": fresh }),
+        Err(error) => {
+            let mut value = preset_err(&error);
+            value["fresh"] = json!(fresh);
+            value
+        }
+    }
+}
+
+#[tauri::command]
+fn create_preset(
+    state: tauri::State<'_, Arc<Workbench>>,
+    name: String,
+    text: String,
+    images: Vec<crate::lovart::preset::PresetImage>,
+) -> Value {
+    let dir = state.presets_dir();
+    let clean = text.trim().to_string();
+    if clean.is_empty() {
+        return preset_err(&crate::lovart::preset::PresetError::Empty);
+    }
+    let mut list = match crate::lovart::preset::load(&dir) {
+        Ok(list) => list,
+        Err(error) => return preset_err(&error),
+    };
+    let id = crate::lovart::preset::new_id(&list);
+    let item = crate::lovart::preset::Preset {
+        id,
+        name: name.trim().to_string(),
+        text: clean,
+        images,
+    };
+    list.insert(0, item);
+    match crate::lovart::preset::save(&dir, &list) {
+        Ok(()) => json!({ "ok": true }),
+        Err(error) => preset_err(&error),
+    }
+}
+
+#[tauri::command]
+fn update_preset(
+    state: tauri::State<'_, Arc<Workbench>>,
+    id: String,
+    name: String,
+    text: String,
+    images: Vec<crate::lovart::preset::PresetImage>,
+) -> Value {
+    let dir = state.presets_dir();
+    let clean = text.trim().to_string();
+    if clean.is_empty() {
+        return preset_err(&crate::lovart::preset::PresetError::Empty);
+    }
+    let mut list = match crate::lovart::preset::load(&dir) {
+        Ok(list) => list,
+        Err(error) => return preset_err(&error),
+    };
+    let Some(at) = list.iter().position(|item| item.id == id) else {
+        return preset_err(&crate::lovart::preset::PresetError::Missing);
+    };
+    list[at] = crate::lovart::preset::Preset {
+        id,
+        name: name.trim().to_string(),
+        text: clean,
+        images,
+    };
+    match crate::lovart::preset::save(&dir, &list) {
+        Ok(()) => json!({ "ok": true }),
+        Err(error) => preset_err(&error),
+    }
+}
+
+#[tauri::command]
+fn remove_preset(state: tauri::State<'_, Arc<Workbench>>, id: String) -> Value {
+    let dir = state.presets_dir();
+    let mut list = match crate::lovart::preset::load(&dir) {
+        Ok(list) => list,
+        Err(error) => return preset_err(&error),
+    };
+    let before = list.len();
+    list.retain(|item| item.id != id);
+    if list.len() == before {
+        return preset_err(&crate::lovart::preset::PresetError::Missing);
+    }
+    match crate::lovart::preset::save(&dir, &list) {
+        Ok(()) => json!({ "ok": true }),
+        Err(error) => preset_err(&error),
+    }
+}
+
+/// 前端拖入 / 选中的图 → 落进 `data/presets/`，返回 `{file,path,label}`（保序同长）。
+#[tauri::command]
+async fn import_preset_images(
+    state: tauri::State<'_, Arc<Workbench>>,
+    inputs: Vec<String>,
+) -> Result<Value, String> {
+    let dir = state.presets_dir();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut out = Vec::new();
+        for input in inputs {
+            let path = if input.to_lowercase().starts_with("data:") {
+                crate::engine::refs::materialize_data_url(&dir, &input)?
+            } else {
+                crate::engine::refs::materialize_named_file(&dir, Path::new(&input))?
+            };
+            let file = Path::new(&path).file_name().unwrap_or_default().to_string_lossy().to_string();
+            let label = preset_label_of(&file);
+            out.push(json!({ "file": file, "path": path, "label": label }));
+        }
+        Ok(json!({ "ok": true, "images": out }))
+    })
+    .await
+    .map_err(|error| format!("导入预设图片线程异常退出：{error}"))?
+}
+
+/// 取用时把 `file` 拼成绝对路径。**不做存在性检查**（用户裁定 2026-11-26）：
+/// 文件被删了就把路径照样给前端 ⇒ 缩略图显示破图，用户自己看得出来、自己处理。
+/// 这里多判一次 missing，前端就多一条分支要维护，收益为零。
+#[tauri::command]
+fn resolve_preset_images(state: tauri::State<'_, Arc<Workbench>>, files: Vec<String>) -> Value {
+    let dir = state.presets_dir();
+    let images: Vec<Value> = files
+        .into_iter()
+        .map(|file| {
+            let path = dir.join(&file);
+            json!({
+                "file": file,
+                "path": path.display().to_string(),
+                "label": preset_label_of(&file),
+            })
+        })
+        .collect();
+    json!({ "ok": true, "images": images })
+}
+
 /// 导入的**核心** —— 不依赖 Tauri，集成测试直接打这里。
 ///
 /// （`import_inbox` 只是把 `cwd` 从 `State` 里取出来。分开的理由与 `service::snapshot::build_status_json`
@@ -1066,86 +1227,51 @@ async fn stop_run(
 
 // ── 启动 ──────────────────────────────────────────────────────────────
 
-/// 「这个目录是工作区」判据。
+/// 工作区 = **程序所在目录**（`docs/plan/19` §3.4）。唯一判据。
 ///
-/// 不只看 `.env`：刚解压、还没填密钥的仓库**目录结构已经在了**，
-/// 它仍然该被认成工作区（否则会被判到兜底目录去，用户配的 `inbox/` 白放）。
-fn is_workspace(dir: &Path) -> bool {
-    dir.join(".env").is_file() || dir.join("inbox").is_dir() || dir.join("src-tauri").is_dir()
-}
-
-/// `.app` 包**所在的那个目录**（macOS 双击形态）。
+/// - Windows：`lovart-client.exe` 所在目录；
+/// - macOS：`.app` **同级**目录 —— exe 在包内 `Contents/MacOS/`，那不是用户放文件的地方
+///   （改包内容会破坏签名、升级会被覆盖），所以取 `.app` 这一层的父目录。
 ///
-/// `<…>/lovart.app/Contents/MacOS/lovart-client` → `<…>`。
-/// 判据是路径里真有 `.app` 这一层，否则（命令行/其它平台）返回 `None`，
-/// 不去猜「二进制所在目录的上两级是不是仓库根」。
-fn bundle_sibling_dir() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let app = exe.parent()?.parent()?.parent()?;
-    if app.extension().is_some_and(|ext| ext == "app") {
-        app.parent().map(Path::to_path_buf)
-    } else {
-        None
+/// ⚠️ 没有 `LOVART_HOME`、没有 cwd 候选、没有"看目录内容猜是不是工作区"。
+/// 用户原话：「软件在哪，工作区就在哪，跟着 exe 走的」。
+///
+/// 纯函数（不读环境、不碰磁盘）⇒ 可直接测。
+pub fn install_dir_from_exe(exe: &Path) -> Option<PathBuf> {
+    // macOS 的 .app 包：exe 在 <...>/X.app/Contents/MacOS/ 里 ⇒ 取 X.app 的同级。
+    for ancestor in exe.ancestors() {
+        if ancestor.extension().is_some_and(|ext| ext == "app") {
+            return ancestor.parent().map(Path::to_path_buf);
+        }
     }
+    // 其它平台（Windows / Linux）：exe 所在目录。
+    // ⚠️ 相对文件名的 parent() 是空路径 ⇒ 明确 None，不许拿空路径当工作区（那等于偷用 cwd）。
+    exe.parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(Path::to_path_buf)
 }
 
-/// 用户主目录（`HOME` / Windows 的 `USERPROFILE`）。
-fn user_home() -> Option<PathBuf> {
-    ["HOME", "USERPROFILE"]
-        .iter()
-        .find_map(|key| std::env::var_os(key))
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-}
-
-/// 从三个候选里挑工作区 —— **纯函数**（不读环境、不碰磁盘，所以能直接测）。
+/// GUI 的**工作区**（`data/` 所在的那一层）= [`install_dir_from_exe`] 的结果。
 ///
-/// 顺序即优先级，理由见 [`workspace_dir`]。返回 `None` ⇒ 三个都不是 ⇒
-/// 由 [`workspace_dir`] 落到用户目录兜底。
+/// ── 为什么不用当前目录 ──────────────────────────────────────────────
+/// macOS 从 Finder 双击 `.app`，进程当前目录是 **`/`** —— 既不是程序所在目录，
+/// 也不是放数据的地方（写不进去）。Windows 双击时 cwd 虽然通常是 exe 同级，
+/// 但那只是巧合 —— 从快捷方式 / 别处启动时就不成立。
+/// ⇒ **只认程序位置**，不看 cwd、不看环境变量、不看目录内容。
 ///
-/// ⚠️ `explicit` **不查** [`is_workspace`]：它是用户明说的，说错也该照着去
-/// （在那里建 `.env` 是他自己的选择），不该被代码悄悄改判到别处。
-pub fn pick_workspace(
-    explicit: Option<PathBuf>,
-    cwd: Option<PathBuf>,
-    bundle_sibling: Option<PathBuf>,
-) -> Option<PathBuf> {
-    if let Some(dir) = explicit.filter(|dir| !dir.as_os_str().is_empty()) {
-        return Some(dir);
-    }
-    cwd.filter(|dir| is_workspace(dir))
-        .or_else(|| bundle_sibling.filter(|dir| is_workspace(dir)))
-}
-
-/// GUI 的**工作区**（`.env` / `inbox/` / `var/` / `output/` 的根）。
-///
-/// ── 为什么不能直接用当前目录 ────────────────────────────────────────
-/// macOS 上从 Finder 双击 `.app`，进程的当前目录是 **`/`** —— 既不是 `.app`
-/// 所在目录，也不是用户目录。而本工具的运行时文件**全部按当前目录解析**
-/// ⇒ `.env` 读不到（设置界面全空）· `/var/state.jsonl` 建不出来（看板直接报错）·
-/// `/output` 写不进去（出图必失败）。**窗口开得起来，但每个动作都失败。**
-/// ⇒ 双击即用是本工具的唯一交付形态，所以工作区必须自己定，不能指望当前目录。
-///
-/// ── 判据（顺序固定，命中即停）─────────────────────────────────────
-/// 1. `LOVART_HOME` —— 用户显式指定，最高优先；
-/// 2. 当前目录**本身是工作区** ⇒ 终端里 `cd 仓库根 && ./lovart-client` 行为不变；
-/// 3. `.app` **同级目录**是工作区 ⇒ 双击装在仓库根里的 .app（本项目的交付形态）；
-/// 4. 都没有 ⇒ `~/Documents/lovart`（没有就建）—— 仍是**可写**的根，
-///    用户在设置里填一次密钥即可；比"启动就报错"或"悄悄写进 `/`"都好。
+/// ── 初始化 ≠ 兜底 ──────────────────────────────────────────────────
+/// 首次启动在程序所在目录建 `data/`：位置就是用户放程序的那一层，一眼能找到。
+/// 没密钥是正常状态（`load_dot_env` 对不存在的 `.env` 静默）⇒ 正常进界面让用户填。
+/// 建 `data/` 失败（例如装进只读目录）⇒ **报错退出**：那是真的错了，不兜底、不闪退伪装。
 pub fn workspace_dir() -> Result<PathBuf, String> {
-    let explicit = std::env::var_os("LOVART_HOME").map(PathBuf::from);
-    let cwd = std::env::current_dir().ok();
-    if let Some(dir) = pick_workspace(explicit, cwd, bundle_sibling_dir()) {
-        return Ok(dir);
-    }
-
-    let fallback = user_home()
-        .ok_or_else(|| "取不到用户主目录，无法确定工作区".to_string())?
-        .join("Documents")
-        .join("lovart");
-    std::fs::create_dir_all(&fallback)
-        .map_err(|error| format!("建不了工作区 {}：{error}", fallback.display()))?;
-    Ok(fallback)
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("取不到程序路径，无法确定工作区：{error}"))?;
+    let install = install_dir_from_exe(&exe)
+        .ok_or_else(|| format!("程序路径 {} 没有所在目录", exe.display()))?;
+    std::fs::create_dir_all(install.join("data"))
+        .map_err(|error| format!("在 {} 建 data/ 失败：{error}", install.display()))?;
+    eprintln!("工作区：{}（数据在其 data/ 下）", install.display());
+    Ok(install)
 }
 
 /// 开窗口。**只有 `main` 在无子命令时才会调到这里**。
@@ -1207,6 +1333,12 @@ pub fn run() {
             inspect_prompt_file,
             import_inbox,
             save_ref_image,
+            get_presets,
+            create_preset,
+            update_preset,
+            remove_preset,
+            import_preset_images,
+            resolve_preset_images,
             validate_draft,
             export_draft,
             publish_queue,

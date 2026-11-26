@@ -97,7 +97,12 @@ pub fn resolve_local_ref(input: &str, cwd: &Path) -> Result<PathBuf, String> {
     Ok(abs_path)
 }
 
-fn local_file_entry(input: &str, cwd: &Path) -> Result<RefEntry, String> {
+/// 本机文件 → `RefEntry`（读盘 + 内容哈希 + `data:` 编码 + 绝对路径）。
+///
+/// 与 [`read_ref_inputs`] 的区别：**只认本机文件**，不解析 `data:` / http(s)。
+/// 给"手里已经是本机路径"的调用方用（scheduler 的上传链），
+/// 不必为了一个路径去调通用入口、再塞两个假目录糊过去（ADR-0008）。
+pub fn local_file_entry(input: &str, cwd: &Path) -> Result<RefEntry, String> {
     let abs_path = resolve_local_ref(input, cwd)?;
     let bytes =
         std::fs::read(&abs_path).map_err(|error| format!("读参考图失败：{error}"))?;
@@ -152,17 +157,53 @@ pub fn materialize_data_url(dir: &Path, data_url: &str) -> Result<String, String
             MAX_REF_BYTES / 1024 / 1024
         ));
     }
-    std::fs::create_dir_all(dir).map_err(|error| format!("建垫图目录失败：{error}"))?;
     let hash = hex::encode(Sha1::digest(&bytes));
-    let path = dir.join(format!("{}.{ext}", &hash[..16]));
+    write_named_bytes(dir, &format!("{}.{ext}", &hash[..16]), &bytes)
+}
+
+/// 本机文件 → 预设目录里的**可读文件名**（原名主干-内容哈希前 8 位.扩展名）。
+///
+/// 与 [`materialize_data_url`] 共享「算哈希 / 限长 / 清洗 / 写盘」的内部实现，
+/// **命名策略各自**（`plan 18` §9.1）：refs 保持纯哈希（动它会让已落盘的文件重落一份），
+/// 预设用可读名（取用时编辑区显示的名字不能是 16 位哈希）。
+pub fn materialize_named_file(dir: &Path, path: &Path) -> Result<String, String> {
+    let abs = resolve_local_ref(&path.display().to_string(), dir)?;
+    let bytes = std::fs::read(&abs).map_err(|error| format!("读预设图片失败：{error}"))?;
+    if bytes.len() as u64 > MAX_REF_BYTES {
+        return Err(format!("预设图片过大（{:.1}MB > {}MB）", bytes.len() as f64 / 1048576.0, MAX_REF_BYTES / 1048576));
+    }
+    let ext = abs.extension().map(|v| v.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let ext = match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "webp" | "gif" => ext,
+        other => return Err(format!("不支持的预设图片类型：{other}")),
+    };
+    let stem = abs.file_stem().map(|v| v.to_string_lossy()).unwrap_or_default();
+    // Windows 非法字符 + 空白 ⇒ 压成 `-`，文件名可读且不落不了盘。
+    let clean: String = stem
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let clean = clean.trim_matches('-');
+    let clean = if clean.is_empty() { "图片" } else { clean };
+    let short = &hex::encode(Sha1::digest(&bytes))[..8];
+    write_named_bytes(dir, &format!("{clean}-{short}.{ext}"), &bytes)
+}
+
+/// 内部唯一写盘点：内容哈希命名 + 同内容不重写（上面两个 materialize 都调它）。
+fn write_named_bytes(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<String, String> {
+    std::fs::create_dir_all(dir).map_err(|error| format!("建目录失败：{error}"))?;
+    let path = dir.join(file_name);
     if !path.exists() {
-        std::fs::write(&path, &bytes).map_err(|error| format!("保存垫图失败：{error}"))?;
+        std::fs::write(&path, bytes).map_err(|error| format!("保存图片失败：{error}"))?;
     }
     Ok(path.display().to_string())
 }
 
 /// 把 `--ref` / 行内 `refs` 的输入归一成 `attachments` 可用的条目（含稳定 key）。
-pub fn read_ref_inputs(inputs: &[String], cwd: &Path) -> Result<Vec<RefEntry>, String> {
+///
+/// `refs_dir` = `data:` 的落盘目录，由**调用方**给（service 层按 `data/var/refs` 推导）
+/// —— `engine` 不知道"数据根"在哪（ADR-0002：调用方不出现生产方的结构知识）。
+pub fn read_ref_inputs(inputs: &[String], cwd: &Path, refs_dir: &Path) -> Result<Vec<RefEntry>, String> {
     let mut entries: Vec<RefEntry> = Vec::new();
     for raw in inputs {
         // 空项由 `intake::tasks_from_inputs` 挡在前面；这里不再跳过
@@ -181,7 +222,7 @@ pub fn read_ref_inputs(inputs: &[String], cwd: &Path) -> Result<Vec<RefEntry>, S
         if lower.starts_with("data:") {
             // `data:` 一律落成本机文件：记录里只存路径，发送时才上传。
             // 不落盘的话这条记录就没有"真相"，CDN 一过期就再也找不回来。
-            let path = materialize_data_url(&cwd.join("var").join("refs"), input)?;
+            let path = materialize_data_url(refs_dir, input)?;
             entries.push(RefEntry {
                 input: input.to_string(),
                 key: format!("data:{}", short_hash(input.as_bytes())),

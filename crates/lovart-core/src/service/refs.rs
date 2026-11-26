@@ -11,6 +11,7 @@ use std::path::Path;
 
 use crate::engine::refs::read_ref_inputs;
 use crate::lovart::prompt::PromptTask;
+use crate::service::workbench::data_dir;
 
 /// 参考图解析的核心。`log` 由调用方给（CLI = 终端 + run.log；GUI = run.log）。
 pub fn resolve_refs_core(
@@ -32,7 +33,8 @@ pub fn resolve_refs_core(
         return Ok(());
     }
 
-    let entries = read_ref_inputs(&needed, cwd)?;
+    // `data:` 的落盘目录 = `data/var/refs`（plan 19）；engine 不知道"数据根"这回事。
+    let entries = read_ref_inputs(&needed, cwd, &data_dir(cwd).join("var").join("refs"))?;
     let mut source_by_input: BTreeMap<String, String> = BTreeMap::new();
     for entry in &entries {
         // 公网 URL 上游能直接访问，原样留着；其余都在 `read_ref_inputs` 里落成了本机文件。

@@ -325,13 +325,21 @@
       </div>
     </div>
 
-    <!-- 态二：编辑器（新建 / 修改共用） -->
+    <!-- 态二：编辑器（新建 / 修改共用）
+         ⚠️ 顺序与编辑区**一致**：垫图在上、文本在下，外面同样套一层 .composer。
+         名字是预设唯一多出来的字段 ⇒ 放在卡片**上方**，不挤占正文高度。 -->
     <div id="presetFormView" hidden>
-      <div class="preset-editor">
-        <!-- 名字是给人看的标签：可留空，留空时列表用正文首行兜底 -->
-        <input class="preset-name" id="presetName" type="text" placeholder="名字（留空就用首行）" />
-        <textarea class="preset-text" id="presetText" placeholder="写一条提示词…"></textarea>
+      <!-- 名字可留空（留空时列表用正文首行兜底）⇒ 它只是标签，不是正文的一部分 -->
+      <input class="preset-name" id="presetName" type="text" placeholder="名字（留空就用首行）" />
+      <div class="composer preset-composer">
+        <div class="composer-top">
+          <!-- 与编辑区同一套 RefStrip（「+」由这里挂，接独立 input） -->
+          <div class="refs" id="presetRefs" role="group" aria-label="预设垫图"></div>
+          <textarea class="preset-text" id="presetText" placeholder="写一条提示词…"
+            aria-label="预设正文"></textarea>
+        </div>
       </div>
+      <input class="visually-hidden" id="presetRefPicker" type="file" accept="image/*" multiple />
       <div class="dialog-foot">
         <button class="btn btn-sm btn-quiet" id="btnPresetCancel">取消</button>
         <button class="btn btn-sm btn-primary" id="btnPresetSave">保存</button>
@@ -420,6 +428,7 @@
 <input class="visually-hidden" id="refPicker" type="file" accept="image/*" multiple />
 
 <script src="promptChips.js"></script>
+<script src="refStrip.js"></script>
 <script src="presets.js"></script>
 <script src="promptMention.js"></script>
 <script src="app.js"></script>

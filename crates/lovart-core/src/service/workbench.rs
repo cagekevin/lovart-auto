@@ -49,15 +49,51 @@ pub struct DraftsStore {
     seq: u32,
 }
 
+/// `<工作区>/data/`：唯一的运行数据根（`docs/plan/19`）。
+///
+/// ⚠️ `data/` 这个字面量只在这里出现一次 —— GUI 与 CLI 都必须通过本函数定位数据根，
+/// 不许各自 `cwd.join("data")`（ADR-0002：调用方不出现生产方的结构知识）。
+pub fn data_dir(cwd: &Path) -> PathBuf {
+    cwd.join("data")
+}
+
+/// 把旧布局**一次性移动**到 `data/` 下（幂等，`docs/plan/19` §3.2）。
+///
+/// - 只移动「源存在、目标不存在」的项；
+/// - 两处都在 ⇒ 不动 + 一条告警（不猜哪份新，不自动合并用户数据）；
+/// - 每项独立判断 ⇒ 中途失败后下次启动继续，不会重复搬、也不会丢。
+pub fn migrate_layout(cwd: &Path) -> Vec<String> {
+    let data = data_dir(cwd);
+    let mut notes = Vec::new();
+    if let Err(error) = std::fs::create_dir_all(&data) {
+        return vec![format!("建不了数据目录 {}：{error}", data.display())];
+    }
+    for name in [".env", "prompts.jsonl", "inbox", "output", "var"] {
+        let src = cwd.join(name);
+        let dst = data.join(name);
+        if !src.exists() {
+            continue;
+        }
+        if dst.exists() {
+            notes.push(format!("{name} 在新旧两处都存在，没有自动合并，请自己处理"));
+            continue;
+        }
+        match std::fs::rename(&src, &dst) {
+            Ok(()) => notes.push(format!("已迁移 {name} → data/{name}")),
+            Err(error) => notes.push(format!("迁移 {name} 失败：{error}（下次启动会重试）")),
+        }
+    }
+    notes
+}
+
 /// 把一条草稿的 refs 归一成"前端能显示的形式"，返回整体状态。
 ///
 /// - 本机路径 → 绝对路径 + stat（`resolve_local_ref`）；
-/// - `data:` → 落盘成 `var/refs/<哈希>` 路径（`materialize_data_url`）；
+/// - `data:` → 落盘成 `data/var/refs/<哈希>` 路径（`materialize_data_url`）；
 /// - `http(s):` → 原样（前端与发布链都认）。
 ///
 /// **不拒收任何合法输入**：只有读不到 / 解不开才标 `Unavailable`。
-fn normalize_draft_refs(task: &mut TaskInput, cwd: &Path) -> RefsState {
-    let refs_dir = cwd.join("var").join("refs");
+fn normalize_draft_refs(task: &mut TaskInput, refs_dir: &Path, cwd: &Path) -> RefsState {
     let mut problem: Option<String> = None;
     for raw in task.refs.iter_mut() {
         let input = raw.trim().to_string();
@@ -128,8 +164,12 @@ pub struct Workbench {
 impl Workbench {
     /// ⚠️ 返回 `Arc`：`ensure_scheduler` 要给回调 `Weak<Self>`（否则 Arc 环）。
     pub fn new(cwd: PathBuf) -> Arc<Self> {
+        // ⚠️ 布局迁移**必须在读 .env 之前**（plan 19 §3.2）：旧布局的 `.env` 还在根目录，
+        // 先搬再读，才不会读到"半个新布局"。
+        let migration = migrate_layout(&cwd);
         // 自动确认开关只认 `.env`（不读进程环境变量）。非法值 / 读失败 ⇒ 关 + 一条告警。
-        let (auto_confirm, auto_confirm_warning) = read_auto_confirm(&cwd.join(".env"));
+        let env_path = data_dir(&cwd).join(".env");
+        let (auto_confirm, auto_confirm_warning) = read_auto_confirm(&env_path);
         let state = Arc::new(Self {
             cwd,
             alerts: Mutex::new(Vec::new()),
@@ -148,8 +188,11 @@ impl Workbench {
         //
         // 失败**必须上报**：载入失败 ⇒ 后面所有读环境变量的地方都拿到默认值 ⇒
         // 设置界面显示的是**假配置**。原先是 `let _ =`，等于把这件事藏起来（DEBT TD-05-24）。
-        if let Err(error) = load_dot_env(&state.cwd.join(".env")) {
+        if let Err(error) = load_dot_env(&state.env_path()) {
             state.push_alert(&format!("配置载入失败，界面上的设置可能不是真实配置：{error}"));
+        }
+        for note in migration {
+            state.push_alert(&note);
         }
         if let Some(warning) = auto_confirm_warning {
             state.push_alert(&warning);
@@ -192,15 +235,15 @@ impl Workbench {
         }
 
         // 每次创建前重新载入 `.env`（覆盖语义）：手改后点提交仍要用新值。
-        reload_dot_env(&self.cwd.join(".env"))?;
-        let (settings, warnings) = Settings::from_file(&self.cwd.join(".env"))
+        reload_dot_env(&self.env_path())?;
+        let (settings, warnings) = Settings::from_file(&self.env_path())
             .map_err(|error| format!("读不了 .env：{error}"))?;
         for warning in &warnings {
             self.push_alert(&format!("⚠️ {warning}"));
         }
         let connection = resolve_connection()?;
         let deps = to_client_deps(&connection)?;
-        crate::engine::runlog::init(self.cwd.join("var/run.log"));
+        crate::engine::runlog::init(self.run_log_file());
 
         let weak = Arc::downgrade(self);
 
@@ -256,8 +299,8 @@ impl Workbench {
         let scheduler = Scheduler::start(SchedulerConfig {
             deps,
             state: store,
-            output_dir: self.cwd.join(&settings.output_dir),
-            report_file: Some(self.cwd.join("var/report.csv")),
+            output_dir: self.output_dir(),
+            report_file: Some(self.report_file()),
             tuning: SchedulerTuning::from_settings(&settings),
             retry_failed: false,
             auto_confirm,
@@ -280,15 +323,33 @@ impl Workbench {
             .clone()
     }
 
+    /// `data/`（`docs/plan/19`：唯一的运行数据根）。
+    pub fn data_dir(&self) -> PathBuf {
+        data_dir(&self.cwd)
+    }
+
     pub fn state_file(&self) -> PathBuf {
-        self.cwd.join("var/state.jsonl")
+        self.var_dir().join("state.jsonl")
+    }
+
+    pub fn report_file(&self) -> PathBuf {
+        self.var_dir().join("report.csv")
+    }
+
+    pub fn prompts_file(&self) -> PathBuf {
+        self.data_dir().join("prompts.jsonl")
+    }
+
+    pub fn presets_dir(&self) -> PathBuf {
+        self.data_dir().join("presets")
     }
 
     pub fn output_dir(&self) -> PathBuf {
         // 1Hz 的 `get_state` 会调它：读环境（微秒级），不读盘。
         // 手改 `.env` 的目录要等点「开始」才统一（N19）—— 这里刻意不跟文件，
         // 否则每秒做一次磁盘 I/O。
-        self.cwd.join(Settings::from_env().0.output_dir)
+        // ⚠️ `OUTPUT_DIR` 的相对路径按 `data/` 解析（plan 19 §3.3）；绝对路径原样用。
+        self.data_dir().join(Settings::from_env().0.output_dir)
     }
 
     /// 记一条**批次级**告警（用户必须看到的事）。
@@ -317,34 +378,39 @@ impl Workbench {
         &self.cwd
     }
 
-    /// `.env` 的绝对路径（读-改-写都走这里，调用方不拼）。
+    /// `data/.env` 的绝对路径（读-改-写都走这里，调用方不拼）。
     pub fn env_path(&self) -> PathBuf {
-        self.cwd.join(".env")
+        self.data_dir().join(".env")
     }
 
-    /// `inbox/`（导入与列表的根）。
+    /// `data/inbox/`（导入与列表的根）。
     pub fn inbox_dir(&self) -> PathBuf {
-        self.cwd.join("inbox")
+        self.data_dir().join("inbox")
     }
 
-    /// `var/`（运行产物根）。
+    /// `data/var/`（机器状态根）。
     pub fn var_dir(&self) -> PathBuf {
-        self.cwd.join("var")
+        self.data_dir().join("var")
     }
 
-    /// `var/refs/`（参考图落盘目录）。
+    /// `data/var/refs/`（参考图落盘目录）。
     pub fn refs_dir(&self) -> PathBuf {
-        self.cwd.join("var").join("refs")
+        self.var_dir().join("refs")
     }
 
-    /// `var/refs-cache.json`。
+    /// `data/var/refs-cache.json`。
     pub fn refs_cache_file(&self) -> PathBuf {
-        self.cwd.join("var/refs-cache.json")
+        self.var_dir().join("refs-cache.json")
     }
 
-    /// `var/.lock`（单实例锁）。
+    /// `data/var/.lock`（单实例锁）。
     pub fn lock_path(&self) -> PathBuf {
-        self.cwd.join("var/.lock")
+        self.var_dir().join(".lock")
+    }
+
+    /// `data/var/run.log`（运行日志；GUI 与 CLI 都只走这里）。
+    pub fn run_log_file(&self) -> PathBuf {
+        self.var_dir().join("run.log")
     }
 
     pub fn auto_confirm_on(&self) -> bool {
@@ -385,7 +451,7 @@ impl Workbench {
         let normalized: Vec<(TaskInput, RefsState)> = tasks
             .into_iter()
             .map(|mut task| {
-                let state = normalize_draft_refs(&mut task, &self.cwd);
+                let state = normalize_draft_refs(&mut task, &self.refs_dir(), &self.cwd);
                 (task, state)
             })
             .collect();
@@ -434,6 +500,34 @@ mod tests {
             size: String::new(),
             refs: refs.iter().map(|value| value.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn 迁移幂等且同存不合并() {
+        let dir = temp_dir("migrate");
+        std::fs::write(dir.join(".env"), b"K=V\n").expect("写旧 .env");
+        std::fs::create_dir_all(dir.join("inbox")).expect("建旧 inbox");
+        std::fs::write(dir.join("inbox/a.jsonl"), b"a").expect("写旧提示词");
+
+        let first = migrate_layout(&dir);
+        assert!(first.iter().any(|n| n.contains(".env")));
+        assert!(!dir.join(".env").exists(), "旧 .env 应被移走");
+        assert!(data_dir(&dir).join(".env").exists(), "新 .env 应在 data/");
+        assert!(data_dir(&dir).join("inbox/a.jsonl").exists());
+
+        let second = migrate_layout(&dir);
+        assert!(second.is_empty(), "第二次应什么都不搬：{second:?}");
+
+        // 两处都在 ⇒ 不动 + 告警（不猜哪份新）
+        std::fs::write(dir.join("prompts.jsonl"), b"old").expect("写旧 prompts");
+        std::fs::write(data_dir(&dir).join("prompts.jsonl"), b"new").expect("写新 prompts");
+        let third = migrate_layout(&dir);
+        assert!(third.iter().any(|n| n.contains("prompts.jsonl") && n.contains("都存在")));
+        assert_eq!(std::fs::read_to_string(dir.join("prompts.jsonl")).unwrap(), "old");
+        assert_eq!(
+            std::fs::read_to_string(data_dir(&dir).join("prompts.jsonl")).unwrap(),
+            "new"
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@ pub mod contract;
 pub mod errors;
 pub mod media_type;
 pub mod models;
+pub mod preset;
 pub mod project;
 pub mod prompt;
 pub mod task;

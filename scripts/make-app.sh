@@ -19,7 +19,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP="$ROOT/lovart.app"
-ICON_SRC="$ROOT/assets/icon.png"
+ICON_SRC="$ROOT/packaging/icon.png"
 PLIST_SRC="$ROOT/packaging/macos/Info.plist"
 
 # ── 1. 编译 ─────────────────────────────────────────────────────────

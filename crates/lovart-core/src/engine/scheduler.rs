@@ -861,18 +861,10 @@ impl Shared {
             let url = if source.starts_with("http://") || source.starts_with("https://") {
                 source.clone()
             } else {
-                // 本机路径 → data: → 上传。`read_ref_inputs` 是这条链的唯一实现。
-                let entries = crate::engine::refs::read_ref_inputs(
-                    std::slice::from_ref(source),
-                    Path::new("."),
-                )
-                .map_err(|message| LovartError::internal(message, ErrType::UploadFailed))?;
-                let Some(entry) = entries.into_iter().next() else {
-                    return Err(LovartError::internal(
-                        format!("参考图解析为空（内部 bug）：{source}"),
-                        ErrType::UploadFailed,
-                    ));
-                };
+                // 本机路径 → data: → 上传。`source` 已是本机路径 ⇒ 直接走窄接口
+                // `local_file_entry`（不借 `read_ref_inputs` 的通用签名塞假目录）。
+                let entry = crate::engine::refs::local_file_entry(source, Path::new("."))
+                    .map_err(|message| LovartError::internal(message, ErrType::UploadFailed))?;
                 let uploaded =
                     crate::lovart::attachments::resolve_attachments(deps, std::slice::from_ref(&entry.url))?;
                 uploaded

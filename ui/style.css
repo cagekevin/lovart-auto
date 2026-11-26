@@ -1311,7 +1311,7 @@ button.task-thumb { cursor: grab; }
   margin-bottom: var(--sp-3);
 }
 
-/* 顺序 = 提交顺序（见 `app.js` 的 `placeRefNode` / `commitRefOrder`）⇒ 抓手光标 + 关掉触摸滚动/文字选择。
+/* 顺序 = 提交顺序（见 `refStrip.js` 的排序回调）⇒ 抓手光标 + 关掉触摸滚动/文字选择。
  * 拖拽反馈不用 `style.transform`（零内联样式）：节点被直接挪进 DOM，靠 `.is-dragging` 变淡。 */
 .ref {
   position: relative;
@@ -1565,8 +1565,9 @@ select:focus { border-color: var(--ink); }
 
 .dialog-wide { width: 520px; }
 
-/* 预设面板：比 `.dialog`（388）宽、比 `.dialog-wide`（520）窄 —— 列表两行文本刚好够 */
-.dialog-mid { width: 460px; }
+/* 预设面板：跟编辑区同一档宽度（460 太窄 ⇒ 垫图换行挤成 2 行、正文一眼看不全）。
+   `min(720px, 92vw)`：大屏给足，小屏不溢出。 */
+.dialog-mid { width: min(720px, 92vw); }
 
 /* 带关闭键的标题栏（`.dialog-title` 原本自带 padding，在栏里要收掉） */
 .dialog-head {
@@ -1710,15 +1711,17 @@ select:focus { border-color: var(--ink); }
   text-align: center;
 }
 
-/* 编辑态：**整块换掉**列表（不是把空 textarea 摆在列表上面） */
-.preset-editor { padding: 0 var(--sp-4); }
+/* 编辑态：**整块换掉**列表（不是把空 textarea 摆在列表上面）。
+   ⚠️ 结构与编辑区一致（垫图在上、文本在下、共用一个 .composer），
+   所以这里只留"预设独有"的两处：名字框 + 正文容器；其余样式全部继承。 */
 
-/* 名字：单行标签，与 textarea 同一套外观；可留空（留空时列表用正文首行兜底） */
+/* 名字：预设唯一多出来的字段，放在 .composer **外面** ⇒ 不占正文高度、不破坏同一套布局 */
 .preset-name {
   display: block;
-  width: 100%;
+  box-sizing: border-box;
+  width: calc(100% - var(--sp-4) - var(--sp-4));
   height: var(--h-ctl);
-  margin-bottom: var(--sp-2);
+  margin: var(--sp-3) var(--sp-4) 0;
   padding: 0 10px;
   border: 1px solid var(--line);
   border-radius: var(--r-md);
@@ -1730,22 +1733,28 @@ select:focus { border-color: var(--ink); }
 
 .preset-name:focus { border-color: var(--ink); background: var(--bg); }
 
+/* 正文：与 `.prompt-input` 同一套形态（字号 / 行高 / 上下限 / 无框）⇒
+   差异只剩 textarea 与 contentEditable 的容器本身（预设存纯文本，不存芯片）。
+   ⚠️ 放在 `.composer-top` 里 ⇒ 天然继承它的 padding，不再自己写一遍。 */
+.preset-composer { margin: var(--sp-2) var(--sp-4) 0; }
+
 .preset-text {
   display: block;
   width: 100%;
-  height: 148px;
-  padding: var(--sp-2) 10px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-md);
-  background: var(--bg-sub);
+  /* 比编辑区高 1.4 倍：预设正文常是一整段，别一上来就得滚动。 */
+  min-height: 134px;
+  max-height: 504px;
+  overflow-y: auto;
+  padding: 0;
+  border: none;
+  background: transparent;
   color: var(--ink);
-  font-size: var(--fs-md);
-  line-height: 1.6;
+  font-size: var(--fs-lg);
+  line-height: 1.7;
   outline: none;
   resize: vertical;
+  font-family: inherit;
 }
-
-.preset-text:focus { border-color: var(--ink); background: var(--bg); }
 
 /* 列表态的 footer 只有一个「新建」，靠左；编辑态的「取消 / 保存」用默认的靠右 */
 #presetListView .dialog-foot { justify-content: flex-start; }

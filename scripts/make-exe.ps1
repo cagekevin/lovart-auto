@@ -37,7 +37,7 @@ $ErrorActionPreference = 'Stop'
 
 $Root     = Split-Path -Parent $PSScriptRoot          # 仓库根（scripts/ 的上一级）
 $SrcTauri = Join-Path $Root 'src-tauri'
-$IconPng  = Join-Path $Root 'assets\icon.png'
+$IconPng  = Join-Path $Root 'packaging\icon.png'
 $IconIco  = Join-Path $SrcTauri 'icons\icon.ico'
 # 拆出 `crates/lovart-core` 后是 workspace：产物落在**仓库根**的 target/，
 # 不在 `src-tauri/target/`（那是拆分前的旧路径）。
@@ -94,7 +94,7 @@ function Import-VcEnv {
 }
 
 # ── .ico 生成 ───────────────────────────────────────────────────────
-# 从 `assets/icon.png`（1024）切出多档尺寸，装进标准 ICO 容器。
+# 从 `packaging/icon.png`（1024）切出多档尺寸，装进标准 ICO 容器。
 # 容器里的每一档都是 PNG 数据（Vista+ 支持），`tauri-winres` 原样嵌入资源。
 function New-Ico {
     param([string]$Png, [string]$Ico)
@@ -197,6 +197,6 @@ Write-Host ''
 Write-Host "✅ 完成：$Out"
 Write-Host '   双击 = 图形界面；命令行 = .\lovart-client.exe --help'
 Write-Host ''
-Write-Host '⚠️ 工作区（.env / inbox / var / output 的根）由程序自己判定，顺序见'
-Write-Host '   src-tauri/src/gui.rs 的 workspace_dir()：当前目录是工作区 ⇒ 就用它。'
-Write-Host '   把 exe 放在仓库根（与 .env / inbox / var / output 同层）即可直接跑。'
+Write-Host '⚠️ 工作区 = 程序所在目录（唯一判据，见 gui.rs::install_dir_from_exe）：'
+Write-Host '   Windows 取 exe 同目录；macOS 取 .app 同级。首次启动会在那里建 data/。'
+Write-Host '   所有运行数据都在 data/ 下（.env / inbox / presets / output / var）。'

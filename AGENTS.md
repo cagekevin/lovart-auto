@@ -48,16 +48,18 @@
 | `src-tauri/` | 只留入口与适配：`run.rs`（CLI）、`gui.rs`（GUI）、`http.rs`（本机 HTTP）、`cli.rs`（参数）、`main.rs`、`lib.rs`。GUI 与 CLI 是**同一个二进制** |
 | `ui/` | 无框架前端：`index.html` · `app.js` · `presets.js` · `promptChips.js` · `promptMention.js` · `style.css`。编译期嵌入二进制 |
 | `fixtures/` | 黄金用例（JSONL）：回放断言用，改行为要同步 |
-| `inbox/` | AI 写提示词的落点：`<日期>-<主题>.jsonl` |
-| `prompt-library/` | 提示词库与配图（数据，不是代码） |
+| `data/` | **唯一的运行数据根**（`docs/plan/19`）：`.env` · `prompts.jsonl` · `inbox/` · `presets/` · `library/`（将来）· `output/` · `var/`（state / report / run.log / refs / cache / lock）。启动幂等迁移旧根目录布局（`service::workbench::migrate_layout`）；`git clean -xdf` 会删 `data/` ⇒ 动之前先备份 |
+| `prompt-library/` | 提示词库与配图（数据，不是代码）；代码 0 引用，留在仓库根 |
 | `scripts/` | 账本与判据：`adr.mjs` · `debt.mjs` · `arch-index.mjs` · `probe.mjs`；事实：`scan.mjs`（复杂度 × 覆盖率 + 结构重复，零依赖，扫 Rust 与 `ui/`）· `typegen.ts`（`prompts.jsonl` 字段对账）；发布：`deploy.ts`（产物落位，不构建）；打包：`make-app.sh` · `make-exe.ps1` · `build-win.bat`。全部 `node scripts/<名字>` 直接跑 —— Node 24 原生跑 `.ts`，不吃 `tsx`/`ts-node` |
 | `docs/adr/` | 判据真源；`README.md` 是 `adr.mjs index --write` 生成的索引 |
 | `docs/plan/` | 一次性的施工图：落地即结案（见 `15-…-结案记录`），结论并进 ADR 或 `详细说明` |
 | `docs/接入指南-本机HTTP-其他前端-*.md` | 其他前端的 HTTP 接入契约：token / 三端点 / 状态表 / 限制 |
 | `daily/架构日志/` | 轮次日志 = 探债明细真源；`债务.md` = 一行摘要；`index.md` = 生成物。三者不互相复述 |
-| `packaging/` · `assets/` | `packaging/macos/Info.plist`、`assets/icon.png`：打包输入 |
+| `packaging/` | `icon.png`（图标源）· `macos/Info.plist`：打包输入（唯一根，原 `assets/` 已并入） |
 
-数据流概要：`inbox/*.jsonl` →（`--check` 校验字段 / 模型别名 / ratio / size）→ `engine::scheduler` 提交 Lovart → `var/state.jsonl`（`FileLock` 独占，**单写者**）→ `output/` + `var/report.csv` + `var/run.log`。没有 `docs/architecture.md`；要补数据流就到本文这张表下补，别再开第三个文档。
+数据流概要：`data/inbox/*.jsonl` →（`--check` 校验字段 / 模型别名 / ratio / size）→ `engine::scheduler` 提交 Lovart → `data/var/state.jsonl`（`FileLock` 独占，**单写者**）→ `data/output/` + `data/var/report.csv` + `data/var/run.log`。没有 `docs/architecture.md`；要补数据流就到本文这张表下补，别再开第三个文档。
+
+**目录归属判据（唯一一处，`docs/plan/19`）**：运行数据全部在 `data/` 下按用途分子目录；源码与打包输入不进 `data/`；新增目录先改本节 Map + `.gitignore`，再让 `Workbench` 加具名访问器（`src-tauri/` 里不许裸用 `cwd()` 拼业务目录）。
 
 ## 3. 分层与冲突裁决
 

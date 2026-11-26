@@ -7,17 +7,10 @@ src-tauri/target/
 # `tauri-build` 生成的权限清单与 schema（每次构建重算，不入库）
 src-tauri/gen/schemas/
 
-# 凭据
-.env
-
-# ── 运行产物：全部收在 var/ 下 ──────────────────────────────────────
-# 原先 state.jsonl / report.csv / refs-cache.json / run.log 散在**仓库根**，
-# 和源码、文档混在一起 ⇒ 根目录看起来"乱"，而且 .gitignore 还漏了几个。
-# 现在一个目录覆盖全部：`var/`。
-var/
-
-# 出图（体积大，不入库）
-output/
+# ── 全部运行数据（凭据 / 提示词 / 预设 / 素材 / 出图 / 状态 / 日志）──
+# 唯一根 `data/`，按用途分子目录（docs/plan/19）；源码与打包输入不进 data/。
+# ⚠️ `git clean -xdf` 会删掉 data/ ⇒ 动它之前先备份（见 AGENTS.md §2）。
+data/
 
 # macOS 应用包（`make app` 的产物：13MB 二进制 + 图标，可复现 ⇒ 不入库）
 *.app/

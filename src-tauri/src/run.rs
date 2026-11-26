@@ -3,13 +3,13 @@
 //! ```text
 //! lovart-client [选项]
 //!
-//!   --prompts <file>         提示词文件，JSONL（默认 prompts.jsonl）
-//!   --output <dir>           图片输出目录（默认 output）
-//!   --state <file>           断点续跑状态（默认 var/state.jsonl）
-//!   --report <file>          结果报告 CSV（默认 var/report.csv）
+//!   --prompts <file>         提示词文件，JSONL（默认 data/prompts.jsonl）
+//!   --output <dir>           图片输出目录（默认 data/output）
+//!   --state <file>           断点续跑状态（默认 data/var/state.jsonl）
+//!   --report <file>          结果报告 CSV（默认 data/var/report.csv）
 //!   --no-report              不写报告文件
 //!   --ref <路径|URL|data:>   参考图（图生图），可重复或用逗号分隔
-//!   --refs-cache <file>      参考图 CDN 缓存（默认 var/refs-cache.json）
+//!   --refs-cache <file>      参考图 CDN 缓存（默认 data/var/refs-cache.json）
 //!   --no-refs-cache          不读写参考图缓存
 //!   --model <alias>          默认模型（默认 nano-bn-2）
 //!   --ratio <w:h>            默认比例（默认 3:4）
@@ -52,6 +52,7 @@ use crate::engine::state::{
 };
 use crate::service::meta::{image_models_json, image_models_text};
 use crate::service::refs::resolve_refs_core;
+use crate::service::workbench::{data_dir, migrate_layout};
 use crate::service::snapshot::{
     board_order, build_status_json, elapsed_text, files_present, format_clock, status_counts,
     status_label,
@@ -439,14 +440,21 @@ pub fn main_with_args(argv: &[String]) -> Result<(), String> {
     }
 
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    let prompts_file = cwd.join(arg_string(&args, "prompts", "prompts.jsonl"));
-    // ⚠️ 运行产物一律落 `var/`，**不落仓库根** —— 根目录只放源码 / 文档 / 配置。
-    let output_dir = cwd.join(arg_string(&args, "output", "output"));
-    let state_file = cwd.join(arg_string(&args, "state", "var/state.jsonl"));
+    // ⚠️ CLI 不构造 `Workbench`，但**必须和 GUI 一样先做布局迁移**（plan 19 §3.2）：
+    // 否则 GUI 已把数据搬进 `data/` 后，CLI 还去根目录找 `var/state.jsonl`。
+    // 迁移是幂等的、一次性改名，不联网、不读凭据；只读命令也会跑这一步（只改名，无业务副作用）。
+    for note in migrate_layout(&cwd) {
+        eprintln!("ℹ️ {note}");
+    }
+    // 相对路径仍按**工作区**解析（显式传旧路径 `var/state.jsonl` 照样有效）；
+    // 只是默认值换到 `data/` 下（plan 19 §3.3）。
+    let prompts_file = cwd.join(arg_string(&args, "prompts", "data/prompts.jsonl"));
+    let output_dir = cwd.join(arg_string(&args, "output", "data/output"));
+    let state_file = cwd.join(arg_string(&args, "state", "data/var/state.jsonl"));
     let report_file = if has_arg(&args, "no-report") {
         None
     } else {
-        Some(cwd.join(arg_string(&args, "report", "var/report.csv")))
+        Some(cwd.join(arg_string(&args, "report", "data/var/report.csv")))
     };
 
     // 任务看板：不联网、不需要凭据，直接读状态文件渲染后退出
@@ -463,7 +471,7 @@ pub fn main_with_args(argv: &[String]) -> Result<(), String> {
     // 只读命令（`--help` / `--list-models` / `--status-table` / `--status`）在上面已返回，
     // 因此它们**仍然不需要** `.env`；`--check` / `--dry-run` 会读，因为它们要报告
     // "真正会用的默认值" —— 报告内置值而实际跑 `.env` 值，等于让自检结果说谎。
-    load_dot_env(&cwd.join(".env"))?;
+    load_dot_env(&data_dir(&cwd).join(".env"))?;
     // **唯一读取点**：数值设置与兜底参数一次读完（`.env` 已在本函数前半段载入）。
     let (current, settings_warnings) = Settings::from_env();
     for warning in &settings_warnings {
@@ -570,15 +578,15 @@ pub fn main_with_args(argv: &[String]) -> Result<(), String> {
     // 2. 单实例写锁：`state.jsonl` 只有一个写者（理由见 `engine::lockfile` 文件头）。
     //    ⚠️ 必须在所有只读命令之后 —— `--status` / `--check` / `--dry-run` 上面已返回，
     //    它们不写状态文件；给它们加锁会让「GUI 跑批时查状态」变成报错。
-    //    锁固定 `var/.lock`，不跟随 `--state`：不同状态文件仍共享 `var/report.csv`
-    //    与 `var/refs-cache.json`，拆开锁等于允许它们互相覆盖。
-    let _lock = crate::engine::lockfile::FileLock::acquire(&cwd.join("var/.lock"))?;
+    //    锁固定 `data/var/.lock`，不跟随 `--state`：不同状态文件仍共享 `data/var/report.csv`
+    //    与 `data/var/refs-cache.json`，拆开锁等于允许它们互相覆盖。
+    let _lock = crate::engine::lockfile::FileLock::acquire(&data_dir(&cwd).join("var/.lock"))?;
 
     // 3. 日志：**从这里开始落盘**。
     //    只读命令（`--check` / `--dry-run` / `--status` / `--list-models`）在上面已返回，
     //    不会往挂机日志里插噪音。
-    //    路径固定在 `var/run.log`：与 `--state` 无关 —— 换状态文件不该让日志换个地方找不到。
-    let log_file = cwd.join("var/run.log");
+    //    路径固定在 `data/var/run.log`：与 `--state` 无关 —— 换状态文件不该让日志换个地方找不到。
+    let log_file = data_dir(&cwd).join("var/run.log");
     crate::engine::runlog::init(&log_file);
     // 与 GUI **同一句**批次标记：`grep "批次开始" / "批次结束"` 两边通用。
     log(&format!(
@@ -599,7 +607,7 @@ pub fn main_with_args(argv: &[String]) -> Result<(), String> {
     // 4. 凭据（`.env` 已在本函数前半段载入：兜底参数要在解析提示词之前就位）
     // 自动确认：命令行 > `.env` > 默认关。**不读进程环境变量**（见 docs/plan/01 §6）。
     let auto_confirm_override = auto_confirm_flag(&args)?;
-    let (file_auto_confirm, auto_confirm_warning) = read_auto_confirm(&cwd.join(".env"));
+    let (file_auto_confirm, auto_confirm_warning) = read_auto_confirm(&data_dir(&cwd).join(".env"));
     if let Some(warning) = auto_confirm_warning {
         eprintln!("⚠️ {warning}");
     }
