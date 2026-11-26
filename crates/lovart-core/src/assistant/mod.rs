@@ -20,7 +20,7 @@
 //! 生产实现是 [`lovart_chat::LovartCompletion`]，测试给桩。
 //! 因此"组装 / 判失败 / 落盘"三条业务分支全部可以离线测。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
@@ -477,16 +477,51 @@ fn lock(store: &Mutex<ChatStore>) -> MutexGuard<'_, ChatStore> {
 /// 上游只吃「一段字符串 + 一组附件 URL」，所以 system / 历史 / 本轮必须拼成一段文字
 /// （`docs/plan/23` §4）。图片**不进正文**，走附件；缺图按 I-6 分两种：
 /// **历史**读不到 ⇒ 该条正文追加 `[图片缺失]` 并继续；**本轮**读不到 ⇒ `BadImage`。
+///
+/// ⚠️ **「图N」锚点（docs/plan/24）**：本轮新图先入附件并**按序编号**写进清单，
+/// 历史图随后入附件但**不参与编号**。于是「图N」= 附件第 N 张 = 清单第 N 条，
+/// 三者同一真相；用户裸写「图1 / 第二张」也能对上，不必写任何 `@` 语法。
 pub fn flatten_prompt(
     prompt: &str,
     conversation: &Conversation,
     text: &str,
     current_images: &[String],
 ) -> Result<(String, Vec<String>), ChatError> {
-    let mut blocks: Vec<String> = Vec::with_capacity(conversation.messages.len() + 2);
+    let mut blocks: Vec<String> = Vec::with_capacity(conversation.messages.len() + 3);
     blocks.push(prompt.trim_end().to_string());
 
     let mut attachments: Vec<String> = Vec::new();
+
+    // ① 本轮图先入附件：先校验（坏图 ⇒ BadImage，不许降级成历史缺图那种标记），
+    //    再按「最终附件位置」编号写清单 —— 清单的生成必须在去重之后。
+    if !current_images.is_empty() {
+        let mut listed: Vec<String> = Vec::new();
+        for path in current_images {
+            if let Err(error) = std::fs::metadata(path) {
+                return Err(ChatError::BadImage {
+                    path: path.clone(),
+                    why: format!("读不了：{error}"),
+                });
+            }
+            push_unique(&mut attachments, path);
+            if listed.iter().any(|existing| existing == path) {
+                continue; // 本轮内重复：只编号一次
+            }
+            listed.push(path.clone());
+        }
+        if !listed.is_empty() {
+            let mut manifest = String::from("[本轮图片]（说「图N」或「第N张」即指此处；按收到顺序）");
+            for (index, path) in listed.iter().enumerate() {
+                let name = Path::new(path)
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or(path.as_str());
+                manifest.push_str(&format!("\n图{}：{name}", index + 1));
+            }
+            manifest.push_str("\n其余为历史参考图，不参与「图N」编号");
+            blocks.push(manifest);
+        }
+    }
 
     for message in &conversation.messages {
         let who = match message.role {
@@ -496,7 +531,8 @@ pub fn flatten_prompt(
         let mut line = format!("{who}：{}", message.text);
         for path in &message.image_paths {
             if std::path::Path::new(path).is_file() {
-                // 同一张图在多条消息里出现只传一次（否则一次发送会把同一文件上传 N 遍）
+                // 同一张图在多条消息里出现只传一次（否则一次发送会把同一文件上传 N 遍）；
+                // 本轮已经传过的图也不会再占一个位置 ⇒ 「图N」编号不漂移。
                 push_unique(&mut attachments, path);
             } else {
                 line.push(' ');
@@ -506,15 +542,6 @@ pub fn flatten_prompt(
         blocks.push(line);
     }
 
-    for path in current_images {
-        if let Err(error) = std::fs::metadata(path) {
-            return Err(ChatError::BadImage {
-                path: path.clone(),
-                why: format!("读不了：{error}"),
-            });
-        }
-        push_unique(&mut attachments, path);
-    }
     blocks.push(format!("用户：{text}"));
 
     Ok((blocks.join("\n\n"), attachments))
@@ -645,15 +672,17 @@ mod tests {
     }
 
     #[test]
-    fn 组装_本轮图片进附件而不进正文() {
+    fn 组装_本轮图片进附件且正文只有编号清单() {
         let png = temp_png("turn");
         let conversation = conversation_with(vec![]);
 
         let (body, attachments) =
             flatten_prompt("p", &conversation, "看图", &[png.clone()]).expect("组装");
 
-        assert_eq!(body, "p\n\n用户：看图");
-        assert_eq!(attachments, vec![png], "图片走附件（CDN 上传），不进正文");
+        // 图片本体走附件（CDN 上传），正文里只有编号清单，没有裸路径。
+        assert!(body.contains("[本轮图片]") && body.contains("图1"), "正文只有清单：{body}");
+        assert!(!body.contains(&png), "裸路径不许进正文：{body}");
+        assert_eq!(attachments, vec![png], "图片走附件（CDN 上传）");
     }
 
     #[test]
@@ -686,6 +715,73 @@ mod tests {
 
         let (_, attachments) = flatten_prompt("p", &conversation, "再看", &[]).expect("组装");
         assert_eq!(attachments, vec![png], "历史图照传（与参照实现一致）");
+    }
+
+    #[test]
+    fn 组装_本轮图编号清单且本轮图排在历史前() {
+        let current = temp_png("current");
+        let old = temp_png("old");
+        let history = vec![message(Role::User, "当时的图", &[old.as_str()])];
+        let conversation = conversation_with(history);
+
+        let (body, attachments) =
+            flatten_prompt("p", &conversation, "看图改", &[current.clone()]).expect("组装");
+
+        // 清单只编号本轮图；历史图不进编号。
+        assert!(body.contains("[本轮图片]"), "正文要有清单：{body}");
+        assert!(body.contains("图1"), "本轮图要编号：{body}");
+        assert!(!body.contains("图2"), "只有一张本轮图，不该有图2：{body}");
+        // 附件顺序 = 清单顺序（本轮置顶，历史在后）。
+        assert_eq!(attachments, vec![current.clone(), old.clone()], "本轮图必须在历史图前");
+    }
+
+    #[test]
+    fn 组装_两张本轮图编号与收到顺序一致() {
+        let first = temp_png("first");
+        let second = temp_png("second");
+        let conversation = conversation_with(vec![]);
+
+        let (body, attachments) =
+            flatten_prompt("p", &conversation, "看图", &[first.clone(), second.clone()])
+                .expect("组装");
+
+        assert_eq!(attachments, vec![first.clone(), second.clone()]);
+        let at1 = body.find("图1：").expect("图1 在清单里");
+        let at2 = body.find("图2：").expect("图2 在清单里");
+        assert!(at1 < at2, "图1 必须排在图2 前面：{body}");
+        let name1 = Path::new(&first).file_name().unwrap().to_str().unwrap();
+        let name2 = Path::new(&second).file_name().unwrap().to_str().unwrap();
+        let line1 = body.lines().find(|line| line.starts_with("图1：")).expect("图1 行");
+        assert!(line1.contains(name1), "图1 应指向第一张：{line1}");
+        let line2 = body.lines().find(|line| line.starts_with("图2：")).expect("图2 行");
+        assert!(line2.contains(name2), "图2 应指向第二张：{line2}");
+    }
+
+    #[test]
+    fn 组装_同一张图跨轮去重后编号不漂移() {
+        let png = temp_png("dedup");
+        let history = vec![
+            message(Role::User, "第一次", &[png.as_str()]),
+            message(Role::Assistant, "好的", &[]),
+            message(Role::User, "第二次还是它", &[png.as_str()]),
+        ];
+        let conversation = conversation_with(history);
+
+        let (body, attachments) =
+            flatten_prompt("p", &conversation, "再说", &[png.clone()]).expect("组装");
+
+        // 同一张图只传一次，永远是图1（不因出现三轮变成图3）。
+        assert_eq!(attachments, vec![png], "跨轮同一张图只传一次");
+        assert!(body.contains("图1"), "编号仍是图1：{body}");
+        assert!(!body.contains("图2"), "不该有图2：{body}");
+    }
+
+    #[test]
+    fn 组装_无本轮图时不生成清单() {
+        let conversation = conversation_with(vec![]);
+        let (body, attachments) = flatten_prompt("p", &conversation, "纯文字", &[]).expect("组装");
+        assert!(!body.contains("[本轮图片]"), "没发图就不该有清单：{body}");
+        assert!(attachments.is_empty());
     }
 
     #[test]
