@@ -1,0 +1,493 @@
+<!doctype html>
+<!--
+  预设 / 素材库 · 弹窗 Mockup v3（2026-11-26）
+
+  ⚠️ 这是**设计稿**，浏览器直接打开看；不在 ui/ 里、不参与打包、不改任何生产代码。
+     落地需另写施工契约（本文件只定"长什么样"）。
+
+  本次只改视觉，能力边界沿用：
+    · docs/plan/13-提示词预设库-形状与契约  —— 列表态 / 编辑态两态，点一条即取用，
+      不做搜索 / 标签 / 分类 / 排序；
+    · docs/plan/20-素材库-侧栏形态已否-弹窗版 —— 目录即真相，网格 + 点图取用 +
+      右上角加号添加 + 右上角删除，不做搜索 / 分页 / 滑杆。
+
+  统一外壳：两个弹窗**同一套尺寸与头部/底部规格**（min(1080px,94vw) × min(720px,...)），
+  比现有 .dialog-mid（720px × 56vh）明显更宽更高。
+  令牌全部照抄 ui/style.css；渐变色只用于 mockup 里的图片占位，不是产品令牌。
+-->
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>预设 / 素材库 · 弹窗 Mockup v3</title>
+<style>
+/* ══ 令牌：照抄 ui/style.css ═══════════════════════════════════════ */
+:root {
+  --r-sm: 6px; --r-md: 8px; --r-lg: 12px; --r-pill: 999px;
+  --fs-xs: 11px; --fs-sm: 12px; --fs-md: 13px; --fs-lg: 14px; --fs-xl: 20px;
+  --h-ctl: 32px; --h-btn: 30px; --h-btn-sm: 26px;
+  --sp-1: 6px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 22px;
+
+  --bg: #ffffff;
+  --bg-sunken: #fafafa;
+  --bg-sub: #f4f4f5;
+  --bg-hover: #ececee;
+  --line: #e7e7e9;
+  --line-soft: #f1f1f3;
+  --ink: #18181b;
+  --ink-2: #6f6f78;
+  --ink-3: #a6a6ae;
+  --run: #2563eb;
+  --run-bg: #eff4ff;
+  --bad: #b91c1c;
+  --bad-bg: #fdeeed;
+  --shadow: 0 1px 2px rgb(0 0 0 / 5%);
+  --shadow-dialog: 0 14px 44px rgb(0 0 0 / 24%);
+  --mask: rgb(12 12 14 / 40%);
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  color: var(--ink);
+  background: var(--bg-sunken);
+  font: var(--fs-md) / 1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+button, input, textarea { font-family: inherit; }
+button { cursor: pointer; color: inherit; }
+.svg-defs { display: none; }
+.icon svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+
+/* ══ Mockup 控制条（只在设计稿里有）════════════════════════════════ */
+.mock-bar {
+  position: fixed; inset: 0 0 auto; z-index: 100;
+  height: 52px; display: flex; align-items: center; gap: var(--sp-4);
+  padding: 0 var(--sp-4);
+  border-bottom: 1px solid var(--line);
+  background: var(--bg);
+}
+.mock-bar b { font-size: var(--fs-md); font-weight: 600; white-space: nowrap; }
+.mock-tabs { display: flex; gap: var(--sp-1); padding: 3px; border-radius: var(--r-md); background: var(--bg-sub); }
+.mock-tabs button {
+  height: var(--h-btn-sm); padding: 0 12px;
+  border: none; border-radius: var(--r-sm);
+  background: transparent; color: var(--ink-2); font-size: var(--fs-sm); white-space: nowrap;
+}
+.mock-tabs button:hover { color: var(--ink); }
+.mock-tabs button.is-on { background: var(--bg); color: var(--ink); font-weight: 600; box-shadow: var(--shadow); }
+.mock-spec { margin-left: auto; color: var(--ink-3); font-size: var(--fs-xs); white-space: nowrap; }
+.mock-spec code { font-family: ui-monospace, "SF Mono", Menlo, monospace; color: var(--ink-2); }
+
+/* ══ 背景：主界面示意（让弹窗落在真实上下文里）════════════════════ */
+.stage { position: fixed; inset: 52px 0 0; overflow: hidden; }
+.app-sim { position: absolute; inset: 0; display: flex; flex-direction: column; }
+.app-top {
+  flex: none; height: 46px; display: flex; align-items: center; gap: var(--sp-2);
+  padding: 0 var(--sp-4); border-bottom: 1px solid var(--line); background: var(--bg);
+}
+.app-top .dot { width: 20px; height: 20px; border-radius: var(--r-sm); background: var(--ink); }
+.app-top .name { font-weight: 600; }
+.app-split { flex: 1; display: grid; grid-template-columns: 396px 1fr; min-height: 0; }
+.app-board { border-right: 1px solid var(--line); padding: var(--sp-4); background: var(--bg); }
+.app-editor { padding: var(--sp-4); background: var(--bg-sunken); }
+.sim-line { height: 10px; border-radius: var(--r-sm); background: var(--line-soft); margin-bottom: var(--sp-3); }
+.sim-line.w70 { width: 70%; } .sim-line.w50 { width: 50%; } .sim-line.w90 { width: 90%; }
+.sim-block { height: 88px; border-radius: var(--r-md); border: 1px solid var(--line); background: var(--bg); margin-bottom: var(--sp-3); }
+
+/* ══ 遮罩 + 统一大弹窗 ══════════════════════════════════════════════ */
+.mask {
+  position: absolute; inset: 0; z-index: 50;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--mask);
+}
+.dialog-xl {
+  width: min(1080px, 94vw);
+  height: min(720px, calc(100vh - 112px));
+  display: flex; flex-direction: column;
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--bg);
+  box-shadow: var(--shadow-dialog);
+  overflow: hidden;
+}
+
+/* 统一头部：标题 + 关闭。两个弹窗共用这一个规格。 */
+.dlg-head {
+  flex: none; display: flex; align-items: center; gap: var(--sp-2);
+  padding: 10px var(--sp-4);
+  border-bottom: 1px solid var(--line); /* 分隔「弹窗身份」与「内容」 */
+}
+.dlg-heading { min-width: 0; margin-right: auto; }
+.dlg-title { margin: 0; font-size: var(--fs-lg); font-weight: 600; line-height: 1.2; }
+/* 标题栏的加号与叉：同一套图标按钮规格，两个图标才对得齐 */
+.dlg-add, .dlg-close {
+  flex: none; width: var(--h-btn-sm); height: var(--h-btn-sm); padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  border: none; border-radius: var(--r-sm); background: transparent;
+  color: var(--ink-3);
+}
+.dlg-add:hover, .dlg-close:hover { background: var(--bg-hover); color: var(--ink); }
+.dlg-add svg, .dlg-close svg {
+  width: 15px; height: 15px; fill: none; stroke: currentColor;
+  stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round;
+}
+
+/* 统一底部：左侧说明 / 右侧动作 */
+.dlg-foot {
+  flex: none; display: flex; align-items: center; justify-content: flex-end; gap: var(--sp-2);
+  min-height: 56px; padding: var(--sp-3) var(--sp-4);
+  border-top: 1px solid var(--line); /* 分隔「浏览内容」与「做动作」 */
+}
+.dlg-foot .hint { margin-right: auto; font-size: var(--fs-xs); color: var(--ink-3); }
+.btn {
+  height: var(--h-btn); padding: 0 14px;
+  border: 1px solid var(--line); border-radius: var(--r-md);
+  background: var(--bg); font-size: var(--fs-md); white-space: nowrap;
+}
+.btn:hover { background: var(--bg-sub); }
+.btn-primary { border-color: var(--ink); background: var(--ink); color: var(--bg); }
+.btn-primary:hover { background: var(--ink-2); border-color: var(--ink-2); }
+.icon-btn {
+  flex: none; width: var(--h-btn-sm); height: var(--h-btn-sm); padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  border: none; border-radius: var(--r-sm); background: transparent; color: var(--ink-3);
+}
+.icon-btn:hover { background: var(--bg-hover); color: var(--ink); }
+.icon-btn.is-danger:hover { background: var(--bad-bg); color: var(--bad); }
+
+/* ══ 预设 · 列表态 ══════════════════════════════════════════════════ */
+.presets-scroll { flex: 1; min-height: 0; overflow: auto; padding: var(--sp-4); }
+.preset-grid {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--sp-3); align-content: start;
+}
+.preset-card {
+  display: flex; flex-direction: column;
+  min-height: 142px; padding: 14px;
+  border: 1px solid var(--line); border-radius: var(--r-md); background: var(--bg);
+  cursor: pointer; transition: border-color .15s, box-shadow .15s;
+}
+.preset-card:hover { border-color: var(--ink-3); box-shadow: var(--shadow); }
+.card-top { display: flex; align-items: center; gap: var(--sp-1); }
+.card-name {
+  flex: 1; min-width: 0; font-size: var(--fs-md); font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.card-text {
+  margin: var(--sp-2) 0 0; font-size: var(--fs-sm); color: var(--ink-2); line-height: 1.65;
+  display: -webkit-box; -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden;
+}
+.card-meta {
+  margin-top: auto; padding-top: var(--sp-3);
+  border-top: 1px solid var(--line-soft); /* 分隔「正文」与「随这条保存的垫图」 */
+  display: flex; align-items: center; gap: var(--sp-1);
+  min-height: 28px; /* 无垫图的卡片也留同一高度，卡片不错位 */
+}
+.card-ref {
+  display: block; position: relative; width: 28px; height: 28px; flex: none;
+  border: 1px solid var(--line); border-radius: var(--r-sm); overflow: hidden;
+}
+
+/* ══ 预设 · 编辑态：照抄**已上线编辑区**的 composer 形态 ═══════════
+   垫图在上、正文在下、同一张卡片 —— 与 ui/index.html 的 .composer /
+   .composer-top / .refs / .prompt-input 同构；唯一的差异是多出来的名字框。 */
+.editor-scroll { flex: 1; min-height: 0; overflow: auto; padding: var(--sp-4); }
+.editor-name {
+  display: block; width: 100%; height: var(--h-ctl); padding: 0 10px;
+  margin-bottom: var(--sp-3);
+  border: 1px solid var(--line); border-radius: var(--r-md);
+  background: var(--bg-sub); font-size: var(--fs-md); outline: none;
+}
+.editor-name:focus { border-color: var(--ink); background: var(--bg); }
+.mock-composer {
+  border: 1px solid var(--line); border-radius: var(--r-lg);
+  background: var(--bg); overflow: hidden;
+}
+.mock-composer-top { padding: var(--sp-3) var(--sp-4); }
+.mock-refs {
+  display: flex; flex-wrap: wrap; gap: var(--sp-2);
+  margin-bottom: var(--sp-3);
+}
+.mock-ref {
+  position: relative; width: 56px; height: 56px; flex: none;
+  border: 1px solid var(--line); border-radius: var(--r-sm);
+  background: var(--bg); overflow: hidden;
+}
+.mock-ref-add {
+  width: 56px; height: 56px; flex: none;
+  display: flex; align-items: center; justify-content: center;
+  border: 1px dashed var(--line); border-radius: var(--r-sm);
+  background: var(--bg); color: var(--ink-3); font-size: var(--fs-xl);
+}
+.mock-prompt {
+  display: block; width: 100%; min-height: 220px; resize: none;
+  padding: 0; border: none; background: transparent;
+  color: var(--ink); font-size: var(--fs-lg); line-height: 1.7; outline: none;
+}
+
+/* ══ 素材库 ═════════════════════════════════════════════════════════ */
+.lib-scroll { flex: 1; min-height: 0; overflow: auto; padding: var(--sp-4); }
+.lib-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(184px, 1fr));
+  gap: var(--sp-3); align-content: start;
+}
+.lib-tile {
+  position: relative; aspect-ratio: 4 / 3;
+  border: 1px solid var(--line); border-radius: var(--r-md); overflow: hidden; background: var(--bg-sub);
+  cursor: pointer;
+}
+.lib-tile:hover { border-color: var(--ink); }
+.lib-ph { position: absolute; inset: 0; }
+/* 以下渐变只是**图片占位**，不是产品配色令牌 */
+.ph-1 { background: linear-gradient(150deg, #e6e9f2 0%, #9aa7c4 48%, #2c3654 100%); }
+.ph-2 { background: linear-gradient(140deg, #f7e9d4 0%, #dcae7a 52%, #6f3f2a 100%); }
+.ph-3 { background: linear-gradient(170deg, #dceee6 0%, #85b7a1 55%, #28564a 100%); }
+.ph-4 { background: linear-gradient(135deg, #f0dfe8 0%, #bf86a4 50%, #5a2b45 100%); }
+.ph-5 { background: linear-gradient(160deg, #dfe8f5 0%, #7f9dc4 50%, #24385b 100%); }
+.ph-6 { background: linear-gradient(145deg, #efe8d6 0%, #bfa878 55%, #5d4c2b 100%); }
+.ph-7 { background: linear-gradient(155deg, #e4eef0 0%, #8fb2b8 55%, #2a5057 100%); }
+.ph-8 { background: linear-gradient(140deg, #e9dfe9 0%, #a68bb0 55%, #4c3455 100%); }
+.lib-name {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  padding: 5px var(--sp-2); background: rgb(255 255 255 / 88%);
+  font-size: var(--fs-xs); color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.lib-del {
+  position: absolute; top: var(--sp-2); right: var(--sp-2);
+  width: 22px; height: 22px; padding: 0; display: flex; align-items: center; justify-content: center;
+  border: none; border-radius: var(--r-sm); background: rgb(255 255 255 / 92%); color: var(--ink-2);
+}
+.lib-del:hover { background: var(--bad); color: #fff; }
+
+/* 空态 */
+.empty {
+  flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: var(--sp-3);
+  color: var(--ink-3); text-align: center;
+}
+.empty-mark {
+  width: 56px; height: 56px; display: flex; align-items: center; justify-content: center;
+  border: 1px dashed var(--line); border-radius: var(--r-lg); background: var(--bg-sub);
+}
+.empty-mark svg { width: 26px; height: 26px; fill: none; stroke: var(--ink-3); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.empty b { color: var(--ink); font-size: var(--fs-lg); font-weight: 600; }
+.empty p { margin: 0; font-size: var(--fs-sm); }
+</style>
+</head>
+<body>
+
+<svg class="svg-defs" aria-hidden="true">
+  <symbol id="i-edit" viewBox="0 0 24 24"><path d="M4 20h4L20 8l-4-4L4 16v4z"/><path d="M14 6l4 4"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13"/><path d="M10 11v6M14 11v6"/></symbol>
+  <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8.6" cy="10" r="1.6"/><path d="M4.2 17.2l5-4.8 3.9 3.9 2.7-2.7 4 4"/></symbol>
+  <!-- 标题栏两个图标：同一尺寸、同一 stroke，保证视觉对齐 -->
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+</svg>
+
+<div class="mock-bar">
+  <b>预设 / 素材库 · 弹窗 Mockup v3</b>
+  <div class="mock-tabs" role="tablist" aria-label="切换预览">
+    <button type="button" data-view="p-list" class="is-on">预设 · 列表</button>
+    <button type="button" data-view="p-edit">预设 · 编辑</button>
+    <button type="button" data-view="lib">素材库 · 有图</button>
+    <button type="button" data-view="lib-empty">素材库 · 空</button>
+  </div>
+  <span class="mock-spec">统一外壳 <code>min(1080px,94vw) × min(720px,100vh−112px)</code> · 现为 <code>720px × 56vh</code></span>
+</div>
+
+<div class="stage">
+  <!-- 背景主界面（纯示意，不可点） -->
+  <div class="app-sim" aria-hidden="true">
+    <div class="app-top"><span class="dot"></span><span class="name">lovart</span></div>
+    <div class="app-split">
+      <div class="app-board">
+        <div class="sim-line w70"></div><div class="sim-block"></div>
+        <div class="sim-line w50"></div><div class="sim-block"></div><div class="sim-block"></div>
+      </div>
+      <div class="app-editor">
+        <div class="sim-line w90"></div><div class="sim-block"></div>
+        <div class="sim-line w70"></div><div class="sim-block"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ 预设 · 列表态 ═══════════════════════════════════════════ -->
+  <div class="mask" id="view-p-list">
+    <section class="dialog-xl" role="dialog" aria-modal="true" aria-label="提示词预设">
+      <header class="dlg-head">
+        <div class="dlg-heading">
+          <h2 class="dlg-title">提示词预设</h2>
+        </div>
+        <button class="dlg-add" type="button" title="新建预设" aria-label="新建预设"><svg><use href="#i-plus"/></svg></button>
+        <button class="dlg-close" type="button" title="关闭（Esc）" aria-label="关闭"><svg><use href="#i-close"/></svg></button>
+      </header>
+
+      <div class="presets-scroll">
+        <div class="preset-grid">
+          <article class="preset-card">
+            <div class="card-top"><span class="card-name">人像胶片 · 85mm</span>
+              <button class="icon-btn" type="button" title="修改"><svg class="icon"><use href="#i-edit"/></svg></button>
+              <button class="icon-btn is-danger" type="button" title="删除"><svg class="icon"><use href="#i-trash"/></svg></button>
+            </div>
+            <p class="card-text">85mm 定焦，柔和侧逆光，肤质保留颗粒感。浅景深，背景虚化成色块，色调偏暖。</p>
+            <div class="card-meta"><span class="card-ref ph-1"></span><span class="card-ref ph-2"></span></div>
+          </article>
+          <article class="preset-card">
+            <div class="card-top"><span class="card-name">产品静物 · 白底</span>
+              <button class="icon-btn" type="button" title="修改"><svg class="icon"><use href="#i-edit"/></svg></button>
+              <button class="icon-btn is-danger" type="button" title="删除"><svg class="icon"><use href="#i-trash"/></svg></button>
+            </div>
+            <p class="card-text">纯白无缝背景，顶部柔光箱 + 左侧反光板，产品边缘干净，轻微接触阴影。</p>
+            <div class="card-meta"></div>
+          </article>
+          <article class="preset-card">
+            <div class="card-top"><span class="card-name">城市夜景 · 霓虹</span>
+              <button class="icon-btn" type="button" title="修改"><svg class="icon"><use href="#i-edit"/></svg></button>
+              <button class="icon-btn is-danger" type="button" title="删除"><svg class="icon"><use href="#i-trash"/></svg></button>
+            </div>
+            <p class="card-text">雨后街道，地面反射霓虹，长曝光车流光轨，冷暖对比，画面保持通透。</p>
+            <div class="card-meta"></div>
+          </article>
+          <article class="preset-card">
+            <div class="card-top"><span class="card-name">插画 · 扁平叙事</span>
+              <button class="icon-btn" type="button" title="修改"><svg class="icon"><use href="#i-edit"/></svg></button>
+              <button class="icon-btn is-danger" type="button" title="删除"><svg class="icon"><use href="#i-trash"/></svg></button>
+            </div>
+            <p class="card-text">扁平矢量风格，有限色板 5 色，粗描边，几何化人物，留白充足，海报构图。</p>
+            <div class="card-meta"><span class="card-ref ph-3"></span></div>
+          </article>
+          <article class="preset-card">
+            <div class="card-top"><span class="card-name">服装平铺 · 自然光</span>
+              <button class="icon-btn" type="button" title="修改"><svg class="icon"><use href="#i-edit"/></svg></button>
+              <button class="icon-btn is-danger" type="button" title="删除"><svg class="icon"><use href="#i-trash"/></svg></button>
+            </div>
+            <p class="card-text">俯拍平铺，米色亚麻底布，上午侧窗光，褶皱自然，无强烈投影。</p>
+            <div class="card-meta"></div>
+          </article>
+          <article class="preset-card">
+            <div class="card-top"><span class="card-name">建筑 · 极简几何</span>
+              <button class="icon-btn" type="button" title="修改"><svg class="icon"><use href="#i-edit"/></svg></button>
+              <button class="icon-btn is-danger" type="button" title="删除"><svg class="icon"><use href="#i-trash"/></svg></button>
+            </div>
+            <p class="card-text">正面视角，混凝土与玻璃，强烈几何分割，天空留白，低饱和。</p>
+            <div class="card-meta"></div>
+          </article>
+        </div>
+      </div>
+
+      <footer class="dlg-foot">
+        <span class="hint">名字可留空，留空取正文首行 · 无搜索 / 无分类</span>
+      </footer>
+    </section>
+  </div>
+
+  <!-- ══ 预设 · 编辑态 ═══════════════════════════════════════════ -->
+  <div class="mask" id="view-p-edit" hidden>
+    <section class="dialog-xl" role="dialog" aria-modal="true" aria-label="修改预设">
+      <header class="dlg-head">
+        <div class="dlg-heading">
+          <h2 class="dlg-title">修改预设</h2>
+        </div>
+        <button class="dlg-close" type="button" title="关闭" aria-label="关闭"><svg><use href="#i-close"/></svg></button>
+      </header>
+
+      <div class="editor-scroll">
+        <input class="editor-name" id="mockPresetName" value="人像胶片 · 85mm" aria-label="预设名字" />
+        <div class="mock-composer">
+          <div class="mock-composer-top">
+            <div class="mock-refs">
+              <span class="mock-ref ph-1"></span>
+              <span class="mock-ref ph-2"></span>
+              <button class="mock-ref-add" type="button" aria-label="添加垫图">＋</button>
+            </div>
+            <textarea class="mock-prompt" id="mockPresetText" aria-label="预设正文">85mm 定焦，柔和侧逆光，肤质保留颗粒感。浅景深，背景虚化成色块，色调偏暖。
+肤色不过度磨皮，保留真实纹理；眼神光克制。</textarea>
+          </div>
+        </div>
+      </div>
+
+      <footer class="dlg-foot">
+        <span class="hint">Esc 回列表（不保存）</span>
+        <button class="btn" type="button">取消</button>
+        <button class="btn btn-primary" type="button">保存</button>
+      </footer>
+    </section>
+  </div>
+
+  <!-- ══ 素材库 · 有图 ═══════════════════════════════════════════ -->
+  <div class="mask" id="view-lib" hidden>
+    <section class="dialog-xl" role="dialog" aria-modal="true" aria-label="素材库">
+      <header class="dlg-head">
+        <div class="dlg-heading">
+          <h2 class="dlg-title">素材库</h2>
+        </div>
+        <button class="dlg-add" type="button" title="添加到素材库" aria-label="添加到素材库"><svg><use href="#i-plus"/></svg></button>
+        <button class="dlg-close" type="button" title="关闭（Esc）" aria-label="关闭"><svg><use href="#i-close"/></svg></button>
+      </header>
+
+      <div class="lib-scroll">
+        <div class="lib-grid">
+          <div class="lib-tile"><div class="lib-ph ph-1"></div><span class="lib-name">人像参考_01.webp</span><button class="lib-del" type="button" title="删除"><svg class="icon"><use href="#i-trash"/></svg></button></div>
+          <div class="lib-tile"><div class="lib-ph ph-2"></div><span class="lib-name">暖调静物.webp</span><button class="lib-del" type="button" title="删除"><svg class="icon"><use href="#i-trash"/></svg></button></div>
+          <div class="lib-tile"><div class="lib-ph ph-3"></div><span class="lib-name">绿系背景.jpg</span><button class="lib-del" type="button" title="删除"><svg class="icon"><use href="#i-trash"/></svg></button></div>
+          <div class="lib-tile"><div class="lib-ph ph-4"></div><span class="lib-name">色卡参考.png</span><button class="lib-del" type="button" title="删除"><svg class="icon"><use href="#i-trash"/></svg></button></div>
+          <div class="lib-tile"><div class="lib-ph ph-5"></div><span class="lib-name">侧光人像_03.webp</span><button class="lib-del" type="button" title="删除"><svg class="icon"><use href="#i-trash"/></svg></button></div>
+          <div class="lib-tile"><div class="lib-ph ph-6"></div><span class="lib-name">布料质感.jpg</span><button class="lib-del" type="button" title="删除"><svg class="icon"><use href="#i-trash"/></svg></button></div>
+          <div class="lib-tile"><div class="lib-ph ph-7"></div><span class="lib-name">建筑线条.webp</span><button class="lib-del" type="button" title="删除"><svg class="icon"><use href="#i-trash"/></svg></button></div>
+          <div class="lib-tile"><div class="lib-ph ph-8"></div><span class="lib-name">紫调氛围.png</span><button class="lib-del" type="button" title="删除"><svg class="icon"><use href="#i-trash"/></svg></button></div>
+          <div class="lib-tile"><div class="lib-ph ph-3"></div><span class="lib-name">植物阴影.jpg</span><button class="lib-del" type="button" title="删除"><svg class="icon"><use href="#i-trash"/></svg></button></div>
+          <div class="lib-tile"><div class="lib-ph ph-1"></div><span class="lib-name">胶片颗粒.webp</span><button class="lib-del" type="button" title="删除"><svg class="icon"><use href="#i-trash"/></svg></button></div>
+          <div class="lib-tile"><div class="lib-ph ph-2"></div><span class="lib-name">暖光窗边.jpg</span><button class="lib-del" type="button" title="删除"><svg class="icon"><use href="#i-trash"/></svg></button></div>
+          <div class="lib-tile"><div class="lib-ph ph-5"></div><span class="lib-name">冷调城市.webp</span><button class="lib-del" type="button" title="删除"><svg class="icon"><use href="#i-trash"/></svg></button></div>
+        </div>
+      </div>
+
+      <footer class="dlg-foot">
+        <span class="hint">也可以直接把图片放进 data/library/ · 下次打开自动出现</span>
+      </footer>
+    </section>
+  </div>
+
+  <!-- ══ 素材库 · 空态 ═══════════════════════════════════════════ -->
+  <div class="mask" id="view-lib-empty" hidden>
+    <section class="dialog-xl" role="dialog" aria-modal="true" aria-label="素材库（空）">
+      <header class="dlg-head">
+        <div class="dlg-heading">
+          <h2 class="dlg-title">素材库</h2>
+        </div>
+        <button class="dlg-add" type="button" title="添加到素材库" aria-label="添加到素材库"><svg><use href="#i-plus"/></svg></button>
+        <button class="dlg-close" type="button" title="关闭（Esc）" aria-label="关闭"><svg><use href="#i-close"/></svg></button>
+      </header>
+
+      <div class="empty">
+        <span class="empty-mark"><svg><use href="#i-image"/></svg></span>
+        <b>还没有素材</b>
+        <p>把图片拷进 data/library/，或点下面的按钮发送一张进来</p>
+      </div>
+
+      <footer class="dlg-foot">
+        <span class="hint">删除用右上角图标；正在编辑区引用的图删掉后会破图</span>
+      </footer>
+    </section>
+  </div>
+</div>
+
+<script>
+  const views = ["p-list", "p-edit", "lib", "lib-empty"];
+  const buttons = [...document.querySelectorAll("[data-view]")];
+  buttons.forEach((button) => {
+    button.addEventListener("click", () => {
+      views.forEach((view) => {
+        document.getElementById("view-" + view).hidden = view !== button.dataset.view;
+      });
+      buttons.forEach((b) => b.classList.toggle("is-on", b === button));
+    });
+  });
+</script>
+</body>
+</html>

@@ -1289,7 +1289,7 @@ function openViewerSrc(src, file, prompt) {
   $('viewerActual').classList.remove('is-on');
   // ⚠️ 没有本地文件时必须**禁用**这个按钮：点了只会报错，比没有按钮更糟。
   $('viewerReveal').disabled = !file;
-  // 「发送到素材库」= 把这张**复制**进 `data/library/`：来源只有 `file`（本机图）
+  // 「添加到素材库」= 把这张**复制**进 `data/library/`：来源只有 `file`（本机图）
   // 或 `data:`（粘贴进来还没落盘）。URL 图没有"复制"语义 ⇒ 禁用，不到后端。
   $('viewerSendToLibrary').disabled = !file && !/^data:/.test(src);
   show($('viewer'), true);
@@ -1699,41 +1699,87 @@ function renderPresetRefs() {
   box.appendChild(add);
 }
 
+/** 列表渲染的**唯一写者令牌**：旧的那次发现 token 变了就直接放弃，不 append。
+ *  否则两个 `await Presets.list()` 重叠 ⇒ 两次 clear + 两次 append ⇒ 卡片翻倍（实测过）。 */
+let presetListToken = 0;
+
 async function renderPresetList() {
+  const token = ++presetListToken;
+  const stored = await window.Presets.list();
+  if (token !== presetListToken) return; // 已有更新的渲染在飞，丢弃这次结果
   const box = $('presetList');
   clear(box);
-  const stored = await window.Presets.list();
   if (!stored.ok) { notice(presetMessage(stored)); return; }
   if (!stored.presets.length) { box.appendChild(el('div', 'preset-empty', '还没有预设')); return; }
 
-  for (const preset of stored.presets) {
-    const row = el('div', 'preset-item');
-    const pick = el('button', 'preset-pick');
-    pick.type = 'button';
-    pick.title = '取用这条预设';
-    pick.appendChild(el('span', 'preset-pick-name', window.Presets.displayName(preset)));
-    const preview = el('span', 'preset-pick-text', preset.text);
-    preview.title = preset.text;
-    pick.appendChild(preview);
-    pick.addEventListener('click', () => applyPreset(preset));
+  // 一次解析全部卡片的垫图（plan 26 §3.3）：N 张卡只发一次命令。
+  // 失败只影响缩略图，列表照常渲染（ADR-0010：不弹解释层）。
+  const files = stored.presets.flatMap((p) => p.images.map((i) => i.file));
+  const pathByFile = new Map();
+  if (files.length) {
+    const resolved = await window.Presets.resolveImages(files);
+    if (token !== presetListToken) return; // 第二次 await 之后也要复查
+    if (resolved.ok) {
+      for (const item of resolved.images) pathByFile.set(item.file, item.path);
+    }
+  }
 
-    const edit = el('button', 'preset-act');
+  const grid = el('div', 'preset-grid');
+  for (const preset of stored.presets) {
+    const card = el('article', 'preset-card');
+    card.title = '取用这条预设';
+
+    const top = el('div', 'card-top');
+    top.appendChild(el('span', 'card-name', window.Presets.displayName(preset)));
+
+    const edit = el('button', 'icon-btn');
     edit.type = 'button';
     edit.title = '修改';
     edit.setAttribute('aria-label', '修改');
     edit.appendChild(svgIcon('i-edit', ''));
-    edit.addEventListener('click', () => openPresetEditor(preset));
+    edit.addEventListener('click', (event) => {
+      event.stopPropagation(); // 整卡是「取用」，图标不能连带触发
+      openPresetEditor(preset);
+    });
 
-    const del = el('button', 'preset-act is-danger');
+    const del = el('button', 'icon-btn is-danger');
     del.type = 'button';
     del.title = '删除';
     del.setAttribute('aria-label', '删除');
     del.appendChild(svgIcon('i-trash', ''));
-    del.addEventListener('click', () => removePreset(preset));
+    del.addEventListener('click', (event) => {
+      event.stopPropagation();
+      removePreset(preset);
+    });
 
-    row.appendChild(pick); row.appendChild(edit); row.appendChild(del);
-    box.appendChild(row);
+    top.appendChild(edit); top.appendChild(del);
+    card.appendChild(top);
+
+    const preview = el('p', 'card-text', preset.text);
+    preview.title = preset.text;
+    card.appendChild(preview);
+
+    // 左下角垫图缩略图：用 resolveImages 的 path（与素材库同一 toFileUrl 入口）；
+    // 解析失败 / 图被删 ⇒ 不渲染 img，只留固定高度的空位，卡片不错位。
+    const meta = el('div', 'card-meta');
+    for (const image of preset.images) {
+      const path = pathByFile.get(image.file);
+      if (!path) continue;
+      const thumb = el('span', 'card-ref');
+      const img = el('img');
+      img.src = toFileUrl(path);
+      img.alt = image.file;
+      img.loading = 'lazy';
+      img.decoding = 'async';
+      thumb.appendChild(img);
+      meta.appendChild(thumb);
+    }
+    card.appendChild(meta);
+
+    card.addEventListener('click', () => applyPreset(preset));
+    grid.appendChild(card);
   }
+  box.appendChild(grid);
 }
 
 /** 取用：重读 → 解析图 → 复用 applyDraft（有图才传 refs）。 */
@@ -1744,6 +1790,8 @@ async function applyPreset(preset) {
   if (!latest) { notice(presetMessage({ reason: 'missing' })); return; }
 
   let paths = [];
+  // 不写 `latest.images || []`：Rust 侧 `#[serde(default)]` 保证该字段一定在（契约），
+  // 兜底只会把"清单被外部改坏"说成"没有垫图"，悄悄丢掉用户数据（ADR-0003）。
   if (latest.images.length) {
     const resolved = await window.Presets.resolveImages(latest.images.map((i) => i.file));
     if (!resolved.ok) { notice(presetMessage(resolved)); return; }
@@ -1786,14 +1834,15 @@ async function openPresetEditor(preset) {
   }
 }
 
-function closePresetEditor() {
+/** 回列表态 = **唯一重绘入口**（plan 26 收口：openPresets 曾另画一遍 ⇒ 两次 append 出 6 张卡）。 */
+async function closePresetEditor() {
   presetEditor = null;
   $('presetsTitle').textContent = '提示词预设';
   $('presetName').value = '';
   $('presetText').value = '';
   show($('presetFormView'), false);
   show($('presetListView'), true);
-  renderPresetList();
+  await renderPresetList();
 }
 
 async function savePresetForm() {
@@ -1807,13 +1856,13 @@ async function savePresetForm() {
     : await window.Presets.create(name, text, files);
   if (!result.ok) { notice(presetMessage(result)); return; }
   notice(editingId ? '已更新' : '已保存');
-  closePresetEditor();
+  await closePresetEditor();
 }
 
 async function removePreset(preset) {
   const result = await window.Presets.remove(preset.id);
   if (!result.ok) { notice(presetMessage(result)); return; }
-  renderPresetList();
+  await renderPresetList();
 }
 
 /** 面板「+」选图 → 落盘到 data/presets/ → 进本地态。 */
@@ -1837,9 +1886,9 @@ async function addPresetImages(files) {
 async function openPresets() {
   closeMenu();
   closeMentions();
-  closePresetEditor();
   openMask('maskPresets');
-  await renderPresetList();
+  // 回列表态的唯一实现仍是 closePresetEditor；令牌保证重叠的渲染只留最后一份。
+  await closePresetEditor();
   $('btnPresetNew').focus();
 }
 
@@ -1848,7 +1897,7 @@ async function openPresets() {
  * 库 = 后端 `data/library/` **目录本身**（不建索引）：这里只做「列 → 画格 → 点图走 pushRef」。
  * 命令调用点在 `ui/library.js`（唯一 invoke 点）；形状不在前端定义。
  *
- * 「发送到素材库」有**两个触发点、一条路径**（ADR-0005：实现线唯一，不限制按钮个数）：
+ * 「添加到素材库」有**两个触发点、一条路径**（ADR-0005：实现线唯一，不限制按钮个数）：
  * viewer 底部（看本机图时顺手存）· 弹窗「＋」（主动加图）—— 都调 `sendToLibrary(source)`。
  */
 function libraryMessage(result) {
@@ -1868,15 +1917,20 @@ async function openLibrary() {
   await renderLibrary();
 }
 
+/** 网格渲染的唯一写者令牌（与预设列表同理：两次 await 重叠会 append 两份）。 */
+let libraryToken = 0;
+
 /** 重扫目录并重画网格（加/删之后都走它 —— 目录是唯一真相，没有本地缓存要同步）。 */
 async function renderLibrary() {
+  const token = ++libraryToken;
+  const listed = await window.Library.list();
+  if (token !== libraryToken) return;
   const box = $('libraryGrid');
   clear(box);
-  const listed = await window.Library.list();
   // 读不到 ≠ 没有：不画空网格（那会把"读不了"说成"库是空的"）。
   if (!listed.ok) { box.appendChild(el('div', 'empty', libraryMessage(listed))); return; }
   if (!listed.images.length) {
-    box.appendChild(el('div', 'empty', '素材库还是空的：看大图时点「发送到素材库」'));
+    box.appendChild(el('div', 'empty', '素材库还是空的：看大图时点「添加到素材库」'));
     return;
   }
 
@@ -1945,7 +1999,7 @@ async function sendViewerToLibrary() {
     ? { kind: 'path', value: viewerFile }
     : { kind: 'data', value: $('viewerImg').src };
   const name = await sendToLibrary(source);
-  if (name) notice(`已发送到素材库：${name}`);
+  if (name) notice(`已添加到素材库：${name}`);
 }
 
 // ── AI 对话（宿主侧接线，业务全在插件与 `gui.rs`）────────────────────
@@ -2535,7 +2589,7 @@ async function listenEvent(name, handler) {
  *
  * 主窗口的那套（`closeViewer` + 6 个工具按钮）在 `DOMContentLoaded` 的后半段，
  * 而独立窗口在开头就 `return` 了 —— 不补这一段，图片打开后 ESC / 空白 / × 全无效。
- * 其余按钮（打开所在位置 / 复制提示词 / 发送到素材库 / 发送到 AI 对话）在独立窗口里
+ * 其余按钮（打开所在位置 / 复制提示词 / 添加到素材库 / 发送到 AI 对话）在独立窗口里
  * 没有意义，由 CSS 隐藏，不接死按钮。
  */
 function wireViewerLite() {
@@ -3849,7 +3903,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     invoke('reveal_path', { path: viewerFile }).catch((error) => notice(`打开所在位置失败：${error}`)),
   );
   $('viewerCopy').addEventListener('click', () => copyPrompt(viewerPrompt));
-  // 发送到素材库：来源由 `sendViewerToLibrary` 从 `viewerFile` / `data:` 取，不另存第三份。
+  // 添加到素材库：来源由 `sendViewerToLibrary` 从 `viewerFile` / `data:` 取，不另存第三份。
   $('viewerSendToLibrary').addEventListener('click', sendViewerToLibrary);
   // 点图进对话：素材库 / 看板大图 / 垫图都会走到 viewer，这里只认**本机路径**
   // （`http(s)` 的图不是本机文件，模型要的是文件字节，不是网址 ⇒ 说清楚，不静默失败）。

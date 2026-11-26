@@ -49,6 +49,13 @@
     <path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13" />
     <path d="M10 11v6M14 11v6" />
   </symbol>
+  <!-- 大弹窗标题栏的加号 / 叉（plan 26）：两者同一个 viewBox、同一套 stroke ⇒ 对得齐 -->
+  <symbol id="i-plus" viewBox="0 0 24 24">
+    <path d="M12 5v14M5 12h14" />
+  </symbol>
+  <symbol id="i-close" viewBox="0 0 24 24">
+    <path d="M6 6l12 12M18 6L6 18" />
+  </symbol>
 </svg>
 
 <header class="topbar">
@@ -276,9 +283,9 @@
     <span class="viewer-sep"></span>
     <button class="viewer-btn" id="viewerReveal">打开所在位置</button>
     <button class="viewer-btn" id="viewerCopy">复制提示词</button>
-    <!-- 「发送到素材库」= **复制**进 `data/library/`。来源只从 viewer 已有的两个变量取
+    <!-- 「添加到素材库」= **复制**进 `data/library/`。来源只从 viewer 已有的两个变量取
          （`viewerFile` / `data:` 图）；URL 图没有"复制"语义 ⇒ 由 app.js 禁用。 -->
-    <button class="viewer-btn" id="viewerSendToLibrary">发送到素材库</button>
+    <button class="viewer-btn" id="viewerSendToLibrary">添加到素材库</button>
     <!-- 「发送到 AI 对话」= 点图进对话框的入口（素材库 / 看板大图 / 垫图都从这里过）。
          只认本机路径：`http(s)` 的图不是本机文件，发给模型要重新下载 ⇒ 由 app.js 说明。 -->
     <button class="viewer-btn" id="viewerSendToChat">发送到 AI 对话</button>
@@ -322,22 +329,22 @@
 </div>
 
 <!-- ══ 提示词预设 ══
-     两态互斥：默认是**列表**（点一行 = 取用），新建 / 修改换到编辑器。
+     两态互斥：默认是**列表**（点一张卡片 = 取用），新建 / 修改换到编辑器。
      ⚠️ 面板**不读**编辑区（`#promptInput`）：存/改的名字与文本一律来自这里的
     `#presetName` / `#presetText`。 -->
 <div class="mask" id="maskPresets" hidden>
   <div class="dialog dialog-mid" role="dialog" aria-modal="true" aria-labelledby="presetsTitle">
     <div class="dialog-head">
       <h2 class="dialog-title" id="presetsTitle">提示词预设</h2>
-      <button class="dialog-close" id="btnPresetClose" title="关闭（Esc）" aria-label="关闭">×</button>
+      <!-- 新建入口从底部移到标题栏（plan 26）：id 不变 ⇒ app.js 接线不动。
+           加号与叉同款 SVG、紧挨着（`.dialog-add, .dialog-close` 一条规则） -->
+      <button class="dialog-add" id="btnPresetNew" type="button" title="新建预设" aria-label="新建预设"><svg><use href="#i-plus"/></svg></button>
+      <button class="dialog-close" id="btnPresetClose" type="button" title="关闭（Esc）" aria-label="关闭"><svg><use href="#i-close"/></svg></button>
     </div>
 
-    <!-- 态一：列表 -->
+    <!-- 态一：列表（4 列卡片，整卡可点 = 取用） -->
     <div id="presetListView">
       <div class="preset-list" id="presetList"></div>
-      <div class="dialog-foot">
-        <button class="btn btn-sm btn-quiet" id="btnPresetNew">＋ 新建预设</button>
-      </div>
     </div>
 
     <!-- 态二：编辑器（新建 / 修改共用）
@@ -372,14 +379,13 @@
   <div class="dialog dialog-mid" role="dialog" aria-modal="true" aria-labelledby="libraryTitle">
     <div class="dialog-head">
       <h2 class="dialog-title" id="libraryTitle">素材库</h2>
-      <button class="dialog-close" id="btnLibraryClose" title="关闭（Esc）" aria-label="关闭">×</button>
+      <!-- 加图入口从底部移到标题栏（plan 26）：id 不变 ⇒ app.js 接线不动。
+           **面板不关**（人可能连加几张），与标题栏的关闭键是两个动作 -->
+      <button class="dialog-add" id="btnLibraryAdd" type="button" title="添加到素材库" aria-label="添加到素材库"><svg><use href="#i-plus"/></svg></button>
+      <button class="dialog-close" id="btnLibraryClose" type="button" title="关闭（Esc）" aria-label="关闭"><svg><use href="#i-close"/></svg></button>
     </div>
     <div class="dialog-body">
       <div class="library-grid" id="libraryGrid"></div>
-    </div>
-    <div class="dialog-foot">
-      <!-- 与编辑区「+」同款动作；**面板不关**（人可能连加几张） -->
-      <button class="btn btn-sm btn-quiet" id="btnLibraryAdd">＋ 发送到素材库</button>
     </div>
   </div>
 </div>

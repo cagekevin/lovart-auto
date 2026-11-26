@@ -1046,7 +1046,7 @@ button { cursor: pointer; color: inherit; }
 
 .viewer-btn.is-on { background: rgb(255 255 255 / 22%); }
 
-/* 不可用的动作**看得出不可用**（「打开所在位置」没有本地文件时、「发送到素材库」遇到 URL 图时）：
+/* 不可用的动作**看得出不可用**（「打开所在位置」没有本地文件时、「添加到素材库」遇到 URL 图时）：
    可点但点了报错，比灰掉的按钮更糟。 */
 .viewer-btn:disabled { opacity: 0.35; cursor: not-allowed; }
 .viewer-btn:disabled:hover { background: transparent; }
@@ -1570,9 +1570,16 @@ select:focus { border-color: var(--ink); }
 
 .dialog-wide { width: 520px; }
 
-/* 预设面板：跟编辑区同一档宽度（460 太窄 ⇒ 垫图换行挤成 2 行、正文一眼看不全）。
-   `min(720px, 92vw)`：大屏给足，小屏不溢出。 */
-.dialog-mid { width: min(720px, 92vw); }
+/* 预设 / 素材库共用这一档**大弹窗**（plan 26；mockup v3 已定稿）：
+   两个面板初始尺寸必须一样、且明显比旧 720px 更宽更高。
+   `min(1080px, 94vw)` + `min(720px, 100vh-112px)`：大屏给足，小屏不溢出。
+   ⚠️ 只改这一类；`.dialog`（发布 / 清空 / 导入 / 设置）仍是小框。 */
+.dialog-mid {
+  width: min(1080px, 94vw);
+  height: min(720px, calc(100vh - 112px));
+  display: flex;
+  flex-direction: column;
+}
 
 /* AI 对话：**右侧吸附浮层**，不是模态（形态照 maomao 的 `AgentPanel`：
    `absolute top-0 right-0 bottom-0 z-30` + 左缘拖宽，没有遮罩）。
@@ -1617,7 +1624,7 @@ select:focus { border-color: var(--ink); }
 }
 
 /* 独立窗口里的看大图：必须**盖住**顶栏（浮层 z-index 40），且只留「适应/实际大小」——
-   其余工具（打开所在位置、复制提示词、发送到素材库/对话）属于主窗口，这里没接线，
+   其余工具（打开所在位置、复制提示词、添加到素材库/对话）属于主窗口，这里没接线，
    留着就是死按钮。 */
 .is-assistant-window .viewer {
   z-index: 200;
@@ -1628,30 +1635,42 @@ select:focus { border-color: var(--ink); }
   display: none;
 }
 
-/* 带关闭键的标题栏（`.dialog-title` 原本自带 padding，在栏里要收掉） */
+/* 带关闭键的标题栏（plan 26 / mockup v3）：标题 + 右上角「加号 / 叉」。
+   ⚠️ 加号与叉**同一套规格**、紧挨在一起 —— 标题把它们推到右边，不用各自的边距。 */
 .dialog-head {
   display: flex;
   align-items: center;
   gap: var(--sp-2);
-  padding: var(--sp-4) var(--sp-4) var(--sp-3);
+  padding: var(--sp-3) var(--sp-4); /* 查3：间距只走档位（原 10px 不在 6/8/12/16/22 里） */
+  border-bottom: 1px solid var(--line); /* 分隔「弹窗身份」与「内容」 */
 }
 
-.dialog-head .dialog-title { padding: 0; }
+.dialog-head .dialog-title { padding: 0; margin-right: auto; }
 
-.dialog-close {
-  margin-left: auto;
+/* 加号与叉合并成一条规则（查6：同一个控件全页只有一套规格） */
+.dialog-add, .dialog-close {
+  flex: none;
   width: var(--h-btn-sm);
   height: var(--h-btn-sm);
   padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   border: none;
   border-radius: var(--r-sm);
   background: transparent;
   color: var(--ink-3);
-  font-size: var(--fs-lg);
-  line-height: 1;
 }
-
-.dialog-close:hover { background: var(--bg-hover); color: var(--ink); }
+.dialog-add svg, .dialog-close svg {
+  width: 13px; /* 与 .icon-btn svg 同一档（查6：图标只有一套规格） */
+  height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.dialog-add:hover, .dialog-close:hover { background: var(--bg-hover); color: var(--ink); }
 
 .dialog-title {
   margin: 0;
@@ -1681,93 +1700,122 @@ select:focus { border-color: var(--ink); }
   border-top: 1px solid var(--line);
 }
 
+/* 编辑态的取消/保存条不需要上边线：正文区已经是一个带框的 .composer，
+   再画一条就是把「内容」切成三段（查2：一条线只分隔同两样东西）。
+   只覆盖这一处，发布/清空/导入/设置的小弹窗仍保留自己的按钮条上边线。 */
+#presetFormView .dialog-foot { border-top: 0; }
+
 /* ══ 提示词预设面板 ══════════════════════════════════════════════════ */
 
-/* 列表：一行 = 两行文本（名字 / 内容预览）+ 两个图标动作；**整行可点** = 取用 */
+/* 两态都要撑满 `.dialog-mid` 的剩余高度（外壳改成 flex column 后必须显式给） */
+#presetListView, #presetFormView {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+/* TD-04-5：编辑态左右留白只由容器给一处，子项不再 calc + margin 各写一遍 */
+#presetFormView { overflow: auto; padding: var(--sp-3) var(--sp-4) 0; }
+
+/* 列表 → 4 列卡片（plan 26；mockup v3 已定稿）：整卡可点 = 取用。
+   `flex:1` 撑满大弹窗的剩余高度，不再用 56vh 截断。 */
 .preset-list {
-  max-height: 56vh;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
   overflow: auto;
-  padding: 0 var(--sp-2);
-  border-top: 1px solid var(--line);
+  padding: var(--sp-4);
+  /* 不再写 border-top：`.dialog-head` 已有 border-bottom，两处叠加会变成 2px。
+     两个大弹窗共用那唯一一根线（查2：一条线只分隔同两样东西）。 */
 }
 
-.preset-item {
+.preset-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--sp-3);
+  align-content: start;
+}
+
+.preset-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2); /* 查1：子项间距由容器给，正文不再自己写 margin-top */
+  min-height: 142px;
+  padding: var(--sp-4); /* 卡片四周由容器给 padding，不留 14px 这种中间值 */
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  cursor: pointer;
+  transition: border-color .15s, box-shadow .15s;
+}
+
+.preset-card:hover { border-color: var(--ink-3); box-shadow: var(--shadow); }
+
+.card-top { display: flex; align-items: center; gap: var(--sp-1); }
+
+.card-name {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--fs-md);
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.card-text {
+  margin: 0;
+  font-size: var(--fs-sm);
+  color: var(--ink-2);
+  line-height: 1.65;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+}
+
+/* 垫图缩略图：占位高度固定（28px），无垫图的卡也不塌高度 */
+.card-meta {
+  margin-top: auto;
+  padding-top: var(--sp-3);
+  border-top: 1px solid var(--line-soft); /* 分隔「正文」与「随预设保存的垫图」 */
   display: flex;
   align-items: center;
   gap: var(--sp-1);
-  border-bottom: 1px solid var(--line-soft);
+  min-height: 28px;
 }
 
-.preset-item:last-child { border-bottom: 0; }
-
-.preset-item:hover { background: var(--bg-sub); }
-
-.preset-item:hover .preset-act { color: var(--ink-2); }
-
-.preset-pick {
-  flex: 1;
-  min-width: 0;
+.card-ref {
   display: block;
-  padding: 10px var(--sp-2);
-  border: none;
-  background: transparent;
-  text-align: left;
-}
-
-.preset-pick-name {
-  display: block;
-  font-size: var(--fs-md);
-  font-weight: 500;
-  color: var(--ink);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.preset-pick-text {
-  display: block;
-  margin-top: 2px;
-  font-size: var(--fs-sm);
-  color: var(--ink-3);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-/* 行内动作：常显（查8），默认很淡，hover 整行时才提亮；图标不会有"关闭"的歧义 */
-.preset-act {
+  position: relative;
+  width: 28px;
+  height: 28px;
   flex: none;
-  width: var(--h-btn-sm);
-  height: var(--h-btn-sm);
-  padding: 0;
-  border: none;
+  border: 1px solid var(--line);
   border-radius: var(--r-sm);
-  background: transparent;
-  color: var(--ink-3);
+  overflow: hidden;
+}
+
+.card-ref img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+/* 行内动作：常显（查8）；与 `.icon-btn` 同规格，只是不再随行 hover 才提亮 */
+.icon-btn { color: var(--ink-3); }
+.icon-btn.is-danger:hover { color: var(--bad); }
+
+.preset-empty {
+  flex: 1;
   display: flex;
   align-items: center;
   justify-content: center;
-}
-
-.preset-act svg {
-  width: 13px;
-  height: 13px;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.7;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
-
-.preset-act:hover { background: var(--bg); color: var(--ink); }
-
-.preset-act.is-danger:hover { color: var(--bad); }
-
-.preset-empty {
-  padding: var(--sp-5) var(--sp-3);
   color: var(--ink-3);
   font-size: var(--fs-sm);
-  text-align: center;
 }
 
 /* 编辑态：**整块换掉**列表（不是把空 textarea 摆在列表上面）。
@@ -1778,9 +1826,9 @@ select:focus { border-color: var(--ink); }
 .preset-name {
   display: block;
   box-sizing: border-box;
-  width: calc(100% - var(--sp-4) - var(--sp-4));
+  width: 100%;
   height: var(--h-ctl);
-  margin: var(--sp-3) var(--sp-4) 0;
+  margin: 0;
   padding: 0 10px;
   border: 1px solid var(--line);
   border-radius: var(--r-md);
@@ -1792,17 +1840,32 @@ select:focus { border-color: var(--ink); }
 
 .preset-name:focus { border-color: var(--ink); background: var(--bg); }
 
-/* 正文：与 `.prompt-input` 同一套形态（字号 / 行高 / 上下限 / 无框）⇒
+/* 编辑态的输入区要撑满弹窗剩余高度（plan 26 大弹窗后必须这样，否则下方一大片空白）。
+   三层 flex 传递高度：`#presetFormView → .preset-composer → .composer-top → textarea`。 */
+#presetFormView .preset-composer {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+#presetFormView .preset-composer .composer-top {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* 正文：与 `.prompt-input` 同一套形态（字号 / 行高 / 无框）⇒
    差异只剩 textarea 与 contentEditable 的容器本身（预设存纯文本，不存芯片）。
    ⚠️ 放在 `.composer-top` 里 ⇒ 天然继承它的 padding，不再自己写一遍。 */
-.preset-composer { margin: var(--sp-2) var(--sp-4) 0; }
+.preset-composer { margin: var(--sp-2) 0 0; }
 
 .preset-text {
   display: block;
+  flex: 1;
   width: 100%;
-  /* 比编辑区高 1.4 倍：预设正文常是一整段，别一上来就得滚动。 */
-  min-height: 134px;
-  max-height: 504px;
+  min-height: 134px; /* 只留最小高度，剩余空间随弹窗长满；不再写 max-height 截断 */
   overflow-y: auto;
   padding: 0;
   border: none;
@@ -1815,19 +1878,26 @@ select:focus { border-color: var(--ink); }
   font-family: inherit;
 }
 
-/* 列表态的 footer 只有一个「新建」，靠左；编辑态的「取消 / 保存」用默认的靠右 */
-#presetListView .dialog-foot { justify-content: flex-start; }
-
 /* ══ 素材库面板 ══════════════════════════════════════════════════════ */
+
+/* `.dialog-body` 在弹窗里也要撑满剩余高度，网格才跟着长。
+   查1：**间距由容器给** —— padding 写在 `.dialog-body`，网格自己不留边距。 */
+#maskLibrary .dialog-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: var(--sp-3) var(--sp-5);
+}
 
 /* 网格尺寸**只由这一行决定**（用户裁定：不要滑杆、不为显示偏好加 localStorage 键）：
    窗口多宽就几列，每格不小于 160px。要调大小改这一个数字，没有第二处。 */
 .library-grid {
+  flex: 1;
+  min-height: 0;
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
   gap: var(--sp-2);
-  padding: var(--sp-3) 0;
-  max-height: 56vh;
   overflow: auto;
 }
 
@@ -1884,8 +1954,6 @@ select:focus { border-color: var(--ink); }
 
 .library-del:hover:not(:disabled) { background: var(--bad); }
 .library-del:disabled { opacity: 0.4; cursor: not-allowed; }
-
-#maskLibrary .dialog-foot { justify-content: flex-start; }
 
 .form {
   display: grid;
