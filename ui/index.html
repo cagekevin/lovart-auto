@@ -208,6 +208,10 @@
                不是下拉，所以 `aria-haspopup` 是 `dialog`，也没有 `aria-expanded`。 -->
           <button class="select-btn" id="btnPresets" aria-haspopup="dialog"
             title="提示词预设">预设</button>
+          <!-- 素材库：库 = `data/library/` 目录本身（不建索引）⇒ 打开即重扫目录，
+               文件管理器里加/删的图下次打开就出现/消失。不常用 ⇒ 弹窗，不是侧栏。 -->
+          <button class="select-btn" id="btnLibrary" aria-haspopup="dialog"
+            title="素材库">素材库</button>
           <!-- 右端：数量 + 发送。
                ⚠️ 两者都只是「加入待发」，真正花钱的是下面的「发布任务」——
                   所以这里不写「提交 / 发布」，否则用户会以为点一下就扣积分。
@@ -267,6 +271,9 @@
     <span class="viewer-sep"></span>
     <button class="viewer-btn" id="viewerReveal">打开所在位置</button>
     <button class="viewer-btn" id="viewerCopy">复制提示词</button>
+    <!-- 「发送到素材库」= **复制**进 `data/library/`。来源只从 viewer 已有的两个变量取
+         （`viewerFile` / `data:` 图）；URL 图没有"复制"语义 ⇒ 由 app.js 禁用。 -->
+    <button class="viewer-btn" id="viewerSendToLibrary">发送到素材库</button>
   </div>
 </div>
 
@@ -344,6 +351,27 @@
         <button class="btn btn-sm btn-quiet" id="btnPresetCancel">取消</button>
         <button class="btn btn-sm btn-primary" id="btnPresetSave">保存</button>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══ 素材库 ══
+     库 = `data/library/` **目录本身**（不建索引文件）：每次打开都重扫目录，
+     所以文件管理器里加/删的图，下一次打开就出现/消失 —— 不弹"检测到新文件/已删除"。
+     ⚠️ 网格尺寸**不存状态**（用户裁定：不要滑杆、不为显示偏好加 localStorage 键）：
+        `repeat(auto-fill, minmax(160px,1fr))` 在 `style.css` 的 `.library-grid` 一处。 -->
+<div class="mask" id="maskLibrary" hidden>
+  <div class="dialog dialog-mid" role="dialog" aria-modal="true" aria-labelledby="libraryTitle">
+    <div class="dialog-head">
+      <h2 class="dialog-title" id="libraryTitle">素材库</h2>
+      <button class="dialog-close" id="btnLibraryClose" title="关闭（Esc）" aria-label="关闭">×</button>
+    </div>
+    <div class="dialog-body">
+      <div class="library-grid" id="libraryGrid"></div>
+    </div>
+    <div class="dialog-foot">
+      <!-- 与编辑区「+」同款动作；**面板不关**（人可能连加几张） -->
+      <button class="btn btn-sm btn-quiet" id="btnLibraryAdd">＋ 发送到素材库</button>
     </div>
   </div>
 </div>
@@ -426,10 +454,14 @@
 </div>
 
 <input class="visually-hidden" id="refPicker" type="file" accept="image/*" multiple />
+<input class="visually-hidden" id="libraryPicker" type="file" accept="image/*" multiple />
 
+<!-- `tauri.js` 必须最先：`presets.js` / `library.js` 的命令代理都用它的 `invoke` -->
+<script src="tauri.js"></script>
 <script src="promptChips.js"></script>
 <script src="refStrip.js"></script>
 <script src="presets.js"></script>
+<script src="library.js"></script>
 <script src="promptMention.js"></script>
 <script src="app.js"></script>
 </body>

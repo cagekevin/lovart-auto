@@ -1046,6 +1046,11 @@ button { cursor: pointer; color: inherit; }
 
 .viewer-btn.is-on { background: rgb(255 255 255 / 22%); }
 
+/* 不可用的动作**看得出不可用**（「打开所在位置」没有本地文件时、「发送到素材库」遇到 URL 图时）：
+   可点但点了报错，比灰掉的按钮更糟。 */
+.viewer-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+.viewer-btn:disabled:hover { background: transparent; }
+
 .viewer-sep { width: 1px; height: 16px; background: rgb(255 255 255 / 25%); }
 
 /* 旧的 .tag / .tag-warn / .tag-bad 已删 —— 异常改用带底色的 `.task-error` 说明块，
@@ -1758,6 +1763,75 @@ select:focus { border-color: var(--ink); }
 
 /* 列表态的 footer 只有一个「新建」，靠左；编辑态的「取消 / 保存」用默认的靠右 */
 #presetListView .dialog-foot { justify-content: flex-start; }
+
+/* ══ 素材库面板 ══════════════════════════════════════════════════════ */
+
+/* 网格尺寸**只由这一行决定**（用户裁定：不要滑杆、不为显示偏好加 localStorage 键）：
+   窗口多宽就几列，每格不小于 160px。要调大小改这一个数字，没有第二处。 */
+.library-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: var(--sp-2);
+  padding: var(--sp-3) 0;
+  max-height: 56vh;
+  overflow: auto;
+}
+
+.library-tile { position: relative; }
+
+/* 整格可点 = 取用（进编辑区垫图）⇒ 它是按钮，不是 `<img>` */
+.library-pick {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--bg-sub);
+  overflow: hidden;
+  aspect-ratio: 1;
+}
+
+.library-pick img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.library-pick:hover { border-color: var(--ink); }
+
+/* 删除键：常显（查8），与垫图 / 预设同款垃圾桶图标；
+   只删文件，不查引用（编辑区里那张变破图就是可见反馈）。 */
+.library-del {
+  position: absolute;
+  top: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 0 var(--r-sm) 0 var(--r-sm);
+  background: var(--ink);
+  color: var(--bg);
+}
+
+.library-del svg {
+  width: 11px;
+  height: 11px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.library-del:hover:not(:disabled) { background: var(--bad); }
+.library-del:disabled { opacity: 0.4; cursor: not-allowed; }
+
+#maskLibrary .dialog-foot { justify-content: flex-start; }
 
 .form {
   display: grid;

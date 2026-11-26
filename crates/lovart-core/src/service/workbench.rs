@@ -57,6 +57,21 @@ pub fn data_dir(cwd: &Path) -> PathBuf {
     cwd.join("data")
 }
 
+/// `data/var/`（**不持 `Workbench` 的调用方**用它，例如 `service::refs` 的整批解析）。
+///
+/// 与 [`Workbench::var_dir`] 同一个实现：两处各拼一次 `join("var")`，改目录时就会漏一处。
+pub fn var_dir_of(cwd: &Path) -> PathBuf {
+    data_dir(cwd).join("var")
+}
+
+/// `data/var/refs/`（参考图落盘目录）。
+///
+/// ⚠️ 目录名 `refs` 同时是**命名判据**（`engine::refs::naming_for` 按它决定纯哈希还是
+/// 可读名）⇒ 这个名字只允许出现在 `engine::refs::CONTENT_DIR_NAME`，不许在这里再写一个字面量。
+pub fn refs_dir_of(cwd: &Path) -> PathBuf {
+    var_dir_of(cwd).join(crate::engine::refs::CONTENT_DIR_NAME)
+}
+
 /// 把旧布局**一次性移动**到 `data/` 下（幂等，`docs/plan/19` §3.2）。
 ///
 /// - 只移动「源存在、目标不存在」的项；
@@ -89,7 +104,7 @@ pub fn migrate_layout(cwd: &Path) -> Vec<String> {
 /// 把一条草稿的 refs 归一成"前端能显示的形式"，返回整体状态。
 ///
 /// - 本机路径 → 绝对路径 + stat（`resolve_local_ref`）；
-/// - `data:` → 落盘成 `data/var/refs/<哈希>` 路径（`materialize_data_url`）；
+/// - `data:` → 落盘成 `data/var/refs/<哈希>` 路径（`materialize_image`）；
 /// - `http(s):` → 原样（前端与发布链都认）。
 ///
 /// **不拒收任何合法输入**：只有读不到 / 解不开才标 `Unavailable`。
@@ -104,7 +119,8 @@ fn normalize_draft_refs(task: &mut TaskInput, refs_dir: &Path, cwd: &Path) -> Re
         // 与 `read_ref_inputs` 同一口径：协议前缀大小写不敏感。
         let lower = input.to_lowercase();
         if lower.starts_with("data:") {
-            match crate::engine::refs::materialize_data_url(&refs_dir, &input) {
+            let source = crate::engine::refs::ImageSource::Data { value: input.clone() };
+            match crate::engine::refs::materialize_image(refs_dir, &source) {
                 Ok(path) => *raw = path,
                 Err(reason) => {
                     problem.get_or_insert(reason);
@@ -344,6 +360,12 @@ impl Workbench {
         self.data_dir().join("presets")
     }
 
+    /// `data/library/`（素材库；`docs/plan/20`）。目录**不预建**：第一次「发送到素材库」
+    /// 时由落盘那一步建，空目录不是它存在的证据。
+    pub fn library_dir(&self) -> PathBuf {
+        self.data_dir().join("library")
+    }
+
     pub fn output_dir(&self) -> PathBuf {
         // 1Hz 的 `get_state` 会调它：读环境（微秒级），不读盘。
         // 手改 `.env` 的目录要等点「开始」才统一（N19）—— 这里刻意不跟文件，
@@ -390,12 +412,12 @@ impl Workbench {
 
     /// `data/var/`（机器状态根）。
     pub fn var_dir(&self) -> PathBuf {
-        self.data_dir().join("var")
+        var_dir_of(&self.cwd)
     }
 
     /// `data/var/refs/`（参考图落盘目录）。
     pub fn refs_dir(&self) -> PathBuf {
-        self.var_dir().join("refs")
+        refs_dir_of(&self.cwd)
     }
 
     /// `data/var/refs-cache.json`。

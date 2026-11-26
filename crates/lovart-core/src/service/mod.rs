@@ -4,6 +4,8 @@
 //! 这里不出现 tauri：GUI 只是它的一个消费者（另一个是 `src-tauri/src/http`）。
 
 pub mod api;
+pub mod files;
+pub mod library;
 pub mod meta;
 pub mod refs;
 pub mod snapshot;

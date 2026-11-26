@@ -34,14 +34,8 @@
     return preset.name || nameFrom(preset.text);
   }
 
-  async function invoke(name, args) {
-    const { invoke: tauriInvoke } = window.__TAURI__.core;
-    try {
-      return await tauriInvoke(name, args || undefined);
-    } catch (error) {
-      return { ok: false, reason: 'storage', detail: String(error) };
-    }
-  }
+  // 包装只有一份（`ui/tauri.js`）：失败形状是它的契约，不在每个代理里各写一遍。
+  function invoke(name, args) { return window.Tauri.invoke(name, args); }
 
   function list() { return invoke('get_presets'); }
   function create(name, text, images) {

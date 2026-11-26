@@ -1289,6 +1289,9 @@ function openViewerSrc(src, file, prompt) {
   $('viewerActual').classList.remove('is-on');
   // ⚠️ 没有本地文件时必须**禁用**这个按钮：点了只会报错，比没有按钮更糟。
   $('viewerReveal').disabled = !file;
+  // 「发送到素材库」= 把这张**复制**进 `data/library/`：来源只有 `file`（本机图）
+  // 或 `data:`（粘贴进来还没落盘）。URL 图没有"复制"语义 ⇒ 禁用，不到后端。
+  $('viewerSendToLibrary').disabled = !file && !/^data:/.test(src);
   show($('viewer'), true);
 }
 
@@ -1840,6 +1843,129 @@ async function openPresets() {
   $('btnPresetNew').focus();
 }
 
+// ── 素材库（界面侧）──────────────────────────────────────────────────
+/**
+ * 库 = 后端 `data/library/` **目录本身**（不建索引）：这里只做「列 → 画格 → 点图走 pushRef」。
+ * 命令调用点在 `ui/library.js`（唯一 invoke 点）；形状不在前端定义。
+ *
+ * 「发送到素材库」有**两个触发点、一条路径**（ADR-0005：实现线唯一，不限制按钮个数）：
+ * viewer 底部（看本机图时顺手存）· 弹窗「＋」（主动加图）—— 都调 `sendToLibrary(source)`。
+ */
+function libraryMessage(result) {
+  switch (result.reason) {
+    case 'missing': return '这张图已经不在了（可能刚被删掉）';
+    // ⚠️ 不写 `result.detail || ''`：后端的 `library_err` 与 `library.js` 的 catch
+    //    都必带 `detail` ⇒ 补默认只会把"少字段"这种 bug 说成一句空话（ADR-0003）。
+    case 'storage': return `素材库读写失败：${result.detail}`;
+    default: return '素材库操作失败';
+  }
+}
+
+async function openLibrary() {
+  closeMenu();
+  closeMentions();
+  openMask('maskLibrary');
+  await renderLibrary();
+}
+
+/** 重扫目录并重画网格（加/删之后都走它 —— 目录是唯一真相，没有本地缓存要同步）。 */
+async function renderLibrary() {
+  const box = $('libraryGrid');
+  clear(box);
+  const listed = await window.Library.list();
+  // 读不到 ≠ 没有：不画空网格（那会把"读不了"说成"库是空的"）。
+  if (!listed.ok) { box.appendChild(el('div', 'empty', libraryMessage(listed))); return; }
+  if (!listed.images.length) {
+    box.appendChild(el('div', 'empty', '素材库还是空的：看大图时点「发送到素材库」'));
+    return;
+  }
+
+  for (const image of listed.images) {
+    const tile = el('div', 'library-tile');
+
+    // 整格可点 = 取用：**引用路径**进编辑区（不复制文件），面板用完即关。
+    const pick = el('button', 'library-pick');
+    pick.type = 'button';
+    pick.title = image.name;
+    const thumb = el('img');
+    thumb.src = toFileUrl(image.path);
+    thumb.alt = image.name;
+    thumb.loading = 'lazy';
+    thumb.decoding = 'async';
+    pick.appendChild(thumb);
+    pick.addEventListener('click', () => {
+      if (pushRef(image.path, refLabelOf(image.path, draft.refs.length + 1))) {
+        closeMask('maskLibrary');
+      } else {
+        notice('这张已经在垫图里了');
+      }
+    });
+
+    // 删除只删文件：编辑区里正用着的那张会变破图（可见反馈，不提示、不查引用）。
+    const del = el('button', 'library-del');
+    del.type = 'button';
+    del.title = '删除';
+    del.setAttribute('aria-label', '删除');
+    del.appendChild(svgIcon('i-trash', ''));
+    del.addEventListener('click', () => removeLibraryImage(image, del));
+
+    tile.appendChild(pick);
+    tile.appendChild(del);
+    box.appendChild(tile);
+  }
+}
+
+async function removeLibraryImage(image, button) {
+  button.disabled = true;
+  const result = await window.Library.remove(image.name);
+  if (!result.ok) {
+    button.disabled = false;
+    notice(libraryMessage(result));
+    return;
+  }
+  await renderLibrary(); // 面板不关：还能继续删/加
+}
+
+/**
+ * 发送的**唯一实现**：只管"发 + 失败怎么说"（`libraryMessage` 是唯一措辞处）。
+ *
+ * 成功**不播报**、只回文件名 —— 播报归调用点：单张（viewer）说名字，
+ * 批量（弹窗「＋」）说汇总，否则一次选 5 张会刷 5 条提示。
+ * 返回文件名 / `null`（失败，原因已经报过）。
+ */
+async function sendToLibrary(source) {
+  const result = await window.Library.send(source);
+  if (!result.ok) { notice(libraryMessage(result)); return null; }
+  return result.name;
+}
+
+/** viewer 按钮：来源只从已有两个变量取，不另存第三份（plan 20 §3.3 入口 A）。 */
+async function sendViewerToLibrary() {
+  const source = viewerFile
+    ? { kind: 'path', value: viewerFile }
+    : { kind: 'data', value: $('viewerImg').src };
+  const name = await sendToLibrary(source);
+  if (name) notice(`已发送到素材库：${name}`);
+}
+
+/** 弹窗「＋」选图 → `data:` → 复制进库；**面板不关**（人可能连加几张），网格重列。 */
+async function addLibraryImages(files) {
+  let dataUrls;
+  try {
+    dataUrls = await readFilesAsDataUrls(files);
+  } catch (error) {
+    // 读盘失败（权限 / 文件被移走）必须说一句：否则点了「＋」选完图，面板毫无反应。
+    notice(`读不了这些图片：${error}`);
+    return;
+  }
+  for (const data of dataUrls) {
+    // 一张失败不拦其余（选 5 张不该因为第 2 张坏掉就静默只发 1 张）。
+    // 失败原因由 `sendToLibrary` 逐条报；**不再补汇总条** —— 同一个失败只说一次（ADR-0003）。
+    await sendToLibrary({ kind: 'data', value: data });
+  }
+  await renderLibrary();
+}
+
 // ── 垫图 ─────────────────────────────────────────────────────────────
 
 /** 文件选择器 → `data:` 的**唯一读取点**（编辑区与预设面板共用）。 */
@@ -1865,10 +1991,16 @@ function refLabelOf(url, index) {
   if (/^data:/.test(url)) return `图片${index}`;
   // ⚠️ 两种分隔符都要认：Windows 的本机路径是 `\`，只按 `/` 切会得到**整条路径**当名字。
   const name = url.split(/[/\\]/).pop() || '';
-  // ⚠️ `var/refs` 里的文件名是内容哈希（`engine/refs.rs::materialize_data_url`），
+  // ⚠️ `var/refs` 里的文件名是纯内容哈希（`engine/refs.rs::materialize_image` 按目录定命名），
   //    拿它当芯片名等于让人对着一串十六进制认图。
   if (/^[0-9a-f]{16}(\.[a-z]+)?$/i.test(name)) return `图片${index}`;
-  return name.replace(/\.[^.]+$/, '') || `图片${index}`;
+  const stem = name.replace(/\.[^.]+$/, '');
+  // `data/presets` / `data/library` 的文件名是「原名-8 位内容哈希」⇒ 尾巴要剥掉。
+  // ⚠️ 这条规则的**真身**是 `engine::refs::label_of`（Rust）：这里是与它逐字一致的镜像，
+  //    两处必须同时改（两个运行时共用不了一份），样例由两边的用例各锁一遍。
+  const named = /^(.*)-([0-9a-f]{8})$/i.exec(stem);
+  if (named && named[1]) return named[1];
+  return stem || `图片${index}`;
 }
 
 /** `data:` 垫图 → 本机路径的缓存（同一张图只落盘一次）。 */
@@ -3366,6 +3498,24 @@ window.addEventListener('DOMContentLoaded', async () => {
 
   syncComposerState();
 
+  // 素材库：一个按钮开弹窗（打开即重扫目录）；「＋」把选中的图**复制**进库。
+  // 点遮罩空白 / Esc 关 —— 与预设面板同口径（不常用 ⇒ 用完即关）。
+  $('btnLibrary').addEventListener('click', openLibrary);
+  $('btnLibraryClose').addEventListener('click', () => closeMask('maskLibrary'));
+  $('btnLibraryAdd').addEventListener('click', () => $('libraryPicker').click());
+  $('libraryPicker').addEventListener('change', async (event) => {
+    const files = Array.from(event.target.files || []);
+    event.target.value = '';
+    if (files.length) await addLibraryImages(files);
+  });
+  $('maskLibrary').addEventListener('click', (event) => {
+    if (event.target === $('maskLibrary')) closeMask('maskLibrary');
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape' || $('maskLibrary').hidden) return;
+    closeMask('maskLibrary');
+  });
+
   // 两个 input（编辑区 / 预设面板）各自一个入口，但**读取逻辑只一份**（R4）。
   $('refPicker').addEventListener('change', async (event) => {
     const files = Array.from(event.target.files || []);
@@ -3479,6 +3629,8 @@ window.addEventListener('DOMContentLoaded', async () => {
     invoke('reveal_path', { path: viewerFile }).catch((error) => notice(`打开所在位置失败：${error}`)),
   );
   $('viewerCopy').addEventListener('click', () => copyPrompt(viewerPrompt));
+  // 发送到素材库：来源由 `sendViewerToLibrary` 从 `viewerFile` / `data:` 取，不另存第三份。
+  $('viewerSendToLibrary').addEventListener('click', sendViewerToLibrary);
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape' && !$('viewer').hidden) closeViewer();
   });

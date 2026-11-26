@@ -130,7 +130,7 @@ lovart 自动/
     ├── prompts.jsonl     提示词文件（CLI 默认）
     ├── inbox/            AI 写提示词的落点
     ├── presets/          预设：清单 + 图（plan 18）
-    ├── library/          素材库（plan 20，将来）
+    ├── library/          素材库（plan 20：工具条「素材库」）
     ├── output/           出图
     └── var/              状态 / 报告 / refs / 缓存 / log / lock
 ```

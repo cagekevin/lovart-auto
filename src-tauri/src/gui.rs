@@ -128,39 +128,21 @@ fn take_alerts(state: tauri::State<'_, Arc<Workbench>>) -> Vec<String> {
 /// 几百条一起跑就是整批跑错。宁可在这里就报出来。
 #[tauri::command]
 fn list_inbox(state: tauri::State<'_, Arc<Workbench>>) -> Result<Value, String> {
-    let dir = state.inbox_dir();
+    list_inbox_core(&state.inbox_dir())
+}
+
+/// 列 inbox 的**核心** —— 不依赖 Tauri（理由与 [`import_inbox_core`] 相同：
+/// 能力要有一个不绑框架的入口，否则只能靠真跑 GUI 才能验证）。
+pub fn list_inbox_core(dir: &Path) -> Result<Value, String> {
     // 与真正开跑**同一份**兜底参数（`.env` 的 LOVART_DEFAULT_*）：导入前的校验/预览
     // 若用内置默认值，用户会看到"检查通过"而跑出来的是另一组参数。
     let (defaults, _) = PromptDefaults::from_env();
     let mut files: Vec<Value> = Vec::new();
 
-    // 目录不存在 = **正常**（还没让 AI 写过东西）⇒ 空列表。
-    // 其余读目录失败**照抛** —— 否则界面显示「inbox 里没有文件」，
-    // 用户会以为目录是空的，而实际是读不了（DEBT TD-05-19 同母体）。
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(entries) => Some(entries),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(format!(
-                "读不了 inbox 目录（{}）：{error}",
-                dir.display()
-            ))
-        }
-    };
-
-    if let Some(entries) = entries {
-        let mut paths: Vec<PathBuf> = entries
-            // 单个目录项取不出来（多因权限）不影响其余项 —— 这里跳过是**有意的**，
-            // 而目录本身打不开已经在上面抛掉了（那才是「整个列表不可信」的那一档）。
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
-            .collect();
-        paths.sort();
-
-        for path in paths {
-            files.push(inspect_jsonl(&path, &defaults, true)?);
-        }
+    // 扫目录（不存在⇒空 / 读不了⇒报错 / 过滤 / 排序）只有 `list_files_in` 一处实现：
+    // 素材库列图片走同一条，校验与组形状各留各的（plan 20 §2.5 S2）。
+    for path in crate::service::files::list_files_in(dir, &["jsonl"])? {
+        files.push(inspect_jsonl(&path, &defaults, true)?);
     }
 
     Ok(json!({ "dir": dir.display().to_string(), "files": files }))
@@ -357,20 +339,18 @@ fn import_inbox(state: tauri::State<'_, Arc<Workbench>>, file: String) -> Result
 /// 落成文件后参数里只有短路径；`refs.rs` 读盘并按内容哈希去重，同一张图仍只上传一次。
 ///
 /// 文件名 = 内容 sha1：同一张图重复调用直接复用，不重复写盘。
-fn save_ref_image_core(dir: &Path, data: &str) -> Result<String, String> {
-    // **唯一实现**在 `engine::refs`：命令行与 GUI 的 `data:` 输入都走它。
-    crate::engine::refs::materialize_data_url(dir, data)
-}
-
-/// 见 [`save_ref_image_core`]。
 ///
 /// **async**：解码 10MB base64 是几百毫秒级的活，不能压在主线程上。
 #[tauri::command]
 async fn save_ref_image(state: tauri::State<'_, Arc<Workbench>>, data: String) -> Result<String, String> {
     let dir = state.refs_dir();
-    tauri::async_runtime::spawn_blocking(move || save_ref_image_core(&dir, &data))
-        .await
-        .map_err(|error| format!("保存垫图线程异常退出：{error}"))?
+    // **唯一实现**在 `engine::refs`：命令行、GUI、预设、素材库都走它（命名按目录定）。
+    tauri::async_runtime::spawn_blocking(move || {
+        let source = crate::engine::refs::ImageSource::Data { value: data };
+        crate::engine::refs::materialize_image(&dir, &source)
+    })
+    .await
+    .map_err(|error| format!("保存垫图线程异常退出：{error}"))?
 }
 
 // ── 提示词预设（plan 18）──────────────────────────────────────────────
@@ -378,15 +358,8 @@ async fn save_ref_image(state: tauri::State<'_, Arc<Workbench>>, data: String) -
 // 形状在 `lovart::preset`、目录由 `Workbench::presets_dir()` 决定；这里只做
 // 「取 State → 调核心 → 拼前端形状」。失败带 reason，措辞由前端 `presetMessage` 翻译。
 
-/// 预设图片的可读名：**派生规则的唯一处**，import 与 resolve 都调它。
-/// 文件名形如 `portrait-1a2b3c4d.png` ⇒ 显示名 `portrait`（去掉哈希尾巴）。
-fn preset_label_of(file: &str) -> String {
-    let stem = Path::new(file).file_stem().unwrap_or_default().to_string_lossy().to_string();
-    match stem.rsplit_once('-') {
-        Some((head, tail)) if tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_hexdigit()) => head.to_string(),
-        _ => stem,
-    }
-}
+// 预设图片的可读名（`portrait-1a2b3c4d.png` ⇒ `portrait`）不再是本文件的规则：
+// 文件名是 `engine::refs::materialize_image` 造的，派生名跟着它走（`engine::refs::label_of`）。
 
 /// 失败 → `{ok:false, reason, detail}`（判别位不折成值，ADR-0003）。
 fn preset_err(error: &crate::lovart::preset::PresetError) -> Value {
@@ -494,13 +467,15 @@ async fn import_preset_images(
     tauri::async_runtime::spawn_blocking(move || {
         let mut out = Vec::new();
         for input in inputs {
-            let path = if input.to_lowercase().starts_with("data:") {
-                crate::engine::refs::materialize_data_url(&dir, &input)?
+            // 两个入口（路径 / `data:`）只是"前端从哪拿到这张图"，落盘实现与命名只一条。
+            let source = if input.to_lowercase().starts_with("data:") {
+                crate::engine::refs::ImageSource::Data { value: input }
             } else {
-                crate::engine::refs::materialize_named_file(&dir, Path::new(&input))?
+                crate::engine::refs::ImageSource::Path { value: input }
             };
+            let path = crate::engine::refs::materialize_image(&dir, &source)?;
             let file = Path::new(&path).file_name().unwrap_or_default().to_string_lossy().to_string();
-            let label = preset_label_of(&file);
+            let label = crate::engine::refs::label_of(&file);
             out.push(json!({ "file": file, "path": path, "label": label }));
         }
         Ok(json!({ "ok": true, "images": out }))
@@ -522,11 +497,68 @@ fn resolve_preset_images(state: tauri::State<'_, Arc<Workbench>>, files: Vec<Str
             json!({
                 "file": file,
                 "path": path.display().to_string(),
-                "label": preset_label_of(&file),
+                "label": crate::engine::refs::label_of(&file),
             })
         })
         .collect();
     json!({ "ok": true, "images": images })
+}
+
+// ── 素材库（plan 20）────────────────────────────────────────────────────
+//
+// **库 = `data/library/` 目录本身**：不建索引、不查引用、不弹「检测到新文件」。
+// 形状与三个动作在 `service::library`；这里只做「取 State → 调核心 → 拼前端形状」。
+
+/// 失败 → `{ok:false, reason, detail}`（判别位不折成值，ADR-0003）。
+fn library_err(error: &crate::service::library::LibraryError) -> Value {
+    json!({ "ok": false, "reason": error.reason(), "detail": error.detail() })
+}
+
+/// 列库里的图片 —— **每次都重扫目录**（目录是唯一真相，没有索引可对不上）。
+#[tauri::command]
+fn list_library_images(state: tauri::State<'_, Arc<Workbench>>) -> Value {
+    match crate::service::library::list_images(&state.library_dir()) {
+        Ok(images) => json!({ "ok": true, "images": images }),
+        Err(error) => library_err(&error),
+    }
+}
+
+/// 把一张图**复制**进素材库（viewer 按钮与弹窗「＋」共用这一条命令）。
+///
+/// `source` = `{kind:'path'|'data', value}`：一个入参形状、两种来源（ADR-0003）。
+/// URL 图在前端就禁用入口，到不了这里。
+///
+/// ⚠️ 失败一律装在 `{ok:false, reason, detail}` 的**返回值**里（`Ok` 包着），
+///    不抛 `Err` —— 前端只有一条失败通道（翻译 `reason`），不学两套（ADR-0003）。
+///    async 命令带 `State` 时 Tauri 强制返回 `Result`，所以外面这层 `Ok` 只是壳。
+#[tauri::command]
+async fn send_to_library(
+    state: tauri::State<'_, Arc<Workbench>>,
+    source: crate::engine::refs::ImageSource,
+) -> Result<Value, String> {
+    let dir = state.library_dir();
+    // 解码 10MB base64 是几百毫秒级的活，不压在主线程上（与 `save_ref_image` 同由）。
+    let result =
+        tauri::async_runtime::spawn_blocking(move || crate::service::library::send(&dir, &source))
+            .await;
+    Ok(match result {
+        Ok(Ok(name)) => json!({ "ok": true, "name": name }),
+        Ok(Err(error)) => library_err(&error),
+        Err(error) => json!({
+            "ok": false,
+            "reason": "storage",
+            "detail": format!("发送线程异常退出：{error}"),
+        }),
+    })
+}
+
+/// 删库里的一个文件（**只删文件**：编辑区里正引用的那张会变破图，那是可见反馈）。
+#[tauri::command]
+fn remove_library_image(state: tauri::State<'_, Arc<Workbench>>, file: String) -> Value {
+    match crate::service::library::remove(&state.library_dir(), &file) {
+        Ok(()) => json!({ "ok": true }),
+        Err(error) => library_err(&error),
+    }
 }
 
 /// 导入的**核心** —— 不依赖 Tauri，集成测试直接打这里。
@@ -1334,6 +1366,9 @@ pub fn run() {
             remove_preset,
             import_preset_images,
             resolve_preset_images,
+            list_library_images,
+            send_to_library,
+            remove_library_image,
             validate_draft,
             export_draft,
             publish_queue,
@@ -1418,6 +1453,26 @@ mod tests {
             ["model", "prompt", "ratio", "refs", "size"],
             "键集必须恰好是 TaskInput 的 5 个：前端会整对象入队，多一个键会让导出的 JSONL 被判「未知字段」"
         );
+    }
+
+    /// `list_inbox` 的扫目录段改调 `list_files_in`（plan 20 §2.5 S2）后，组合行为要有闸：
+    /// 只列 `.jsonl`、目录不存在给空列表（不是报错）。
+    #[test]
+    fn list_inbox_只列_jsonl_目录不存在给空() {
+        let dir = temp_dir("inbox-core");
+        std::fs::write(dir.join("b.jsonl"), "{\"prompt\":\"p\"}\n").expect("写提示词");
+        std::fs::write(dir.join("a.jsonl"), "{\"prompt\":\"q\"}\n").expect("写提示词");
+        std::fs::write(dir.join("note.txt"), "x").expect("写杂文件");
+
+        let value = list_inbox_core(&dir).expect("应能列");
+        let files = value["files"].as_array().expect("files 是数组");
+        let names: Vec<&str> = files.iter().filter_map(|file| file["name"].as_str()).collect();
+        assert_eq!(names, ["a.jsonl", "b.jsonl"], "只列 jsonl，且按文件名排序");
+
+        // 目录不存在 = 正常（还没让 AI 写过东西）⇒ 空列表，不是错误。
+        let empty = list_inbox_core(&dir.join("never")).expect("不存在不算失败");
+        assert!(empty["files"].as_array().expect("files 是数组").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 一条只有必填字段的记录（= `state.jsonl` 的一行）。

@@ -121,11 +121,78 @@ pub fn local_file_entry(input: &str, cwd: &Path) -> Result<RefEntry, String> {
     })
 }
 
-/// 把 `data:` 图片落成本机文件，返回绝对路径（同名同内容直接复用）。
+/// 图片扩展名白名单（小写）。**落盘与列目录共用这一条**：落得进去的图，
+/// 素材库/预设也列得出来（两处各写一份清单，迟早一边多了 `.jpeg` 一边没有）。
+pub const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif"];
+
+/// 内容寻址目录的**目录名**（`data/var/refs`）。
 ///
-/// **唯一实现**：GUI 的「粘贴/选择图片」与这里的 `data:` 输入都走它。
-/// 文件名 = 内容 sha1：同一张图重复调用不重复写盘。
-pub fn materialize_data_url(dir: &Path, data_url: &str) -> Result<String, String> {
+/// ⚠️ 它同时是**命名规则**的一部分（见 [`naming_for`]）⇒ 拼这个目录的地方一律用本常量，
+/// 不许另写 `"refs"` 字面量：路径与命名一错开，同一张 `data:` 图就会落成两种文件名
+/// （一处纯哈希、一处可读名），而界面上看不出来（ADR-0002 判据 2）。
+pub const CONTENT_DIR_NAME: &str = "refs";
+
+/// 一张图的**来源**。两个消费方（`import_preset_images` 的落盘、`send_to_library` 的命令入参）
+/// 共用这一个类型 ⇒ 落盘只有一个实现（`docs/plan/20` §2.5 S1）。
+///
+/// ⚠️ 来源**不决定文件名** —— 命名由目标目录定，见 [`materialize_image`]。
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum ImageSource {
+    /// 本机路径（`C:\…\a.png` / `file:` URL）。
+    Path { value: String },
+    /// `data:` base64（剪贴板 / 文件选择器读出来的）。
+    Data { value: String },
+}
+
+/// 落盘命名策略 —— **只由目标目录决定**，不作为参数暴露（暴露了调用方就能传错）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Naming {
+    /// 纯内容哈希（`<sha1 前 16 位>.<ext>`）。
+    Content,
+    /// 可读名 + 短哈希（`<原名>-<sha1 前 8 位>.<ext>`）。
+    Source,
+}
+
+/// 目录 → 命名策略。
+///
+/// 本仓只有 [`CONTENT_DIR_NAME`]（`data/var/refs`）是**内容寻址缓存**：
+/// 那里已经落了一堆纯哈希文件，改成可读名等于让旧文件全部重落一份。
+/// 其余（`data/presets` · `data/library`）是**用户看得见的目录**——文件名会进编辑区芯片，
+/// 16 位哈希认不出来。
+fn naming_for(dir: &Path) -> Naming {
+    match dir.file_name() {
+        Some(name) if name == CONTENT_DIR_NAME => Naming::Content,
+        _ => Naming::Source,
+    }
+}
+
+/// 一张图落进 `dir`，返回绝对路径（同内容同目录 ⇒ 同一个文件，不重写）。
+///
+/// **唯一落盘点**：`var/refs` 的 `data:` 垫图 · 预设图 · 素材库图都走它。
+/// 命名由**目录**定（`refs` ⇒ 纯哈希，其余 ⇒ 原名+哈希）——同一个目录不会因为
+/// "来源是剪贴板还是文件选择器"出现两种文件名。
+pub fn materialize_image(dir: &Path, source: &ImageSource) -> Result<String, String> {
+    let (bytes, ext, stem) = match source {
+        ImageSource::Data { value } => {
+            let (bytes, ext) = decode_data_url(value)?;
+            (bytes, ext, None)
+        }
+        ImageSource::Path { value } => {
+            let (bytes, ext, stem) = read_image_file(dir, value)?;
+            (bytes, ext, Some(stem))
+        }
+    };
+    let hash = hex::encode(Sha1::digest(&bytes));
+    let file_name = match naming_for(dir) {
+        Naming::Content => format!("{}.{ext}", &hash[..16]),
+        Naming::Source => format!("{}-{}.{ext}", clean_stem(stem.as_deref()), &hash[..8]),
+    };
+    write_named_bytes(dir, &file_name, &bytes)
+}
+
+/// `data:` URL → (字节, 扩展名)。格式不对 / 不是图片 / 过大 ⇒ `Err(原因)`。
+fn decode_data_url(data_url: &str) -> Result<(Vec<u8>, String), String> {
     // 前缀大小写不敏感（`DATA:` / `Data:` 都认）；base64 内容本身仍大小写敏感。
     let has_prefix = data_url
         .get(..5)
@@ -150,46 +217,85 @@ pub fn materialize_data_url(dir: &Path, data_url: &str) -> Result<String, String
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(payload)
         .map_err(|error| format!("图片解码失败：{error}"))?;
+    check_size(&bytes)?;
+    Ok((bytes, ext.to_string()))
+}
+
+/// 本机图片文件 → (字节, 扩展名, 原名主干)。读不到 / 不是图片 / 过大 ⇒ `Err(原因)`。
+///
+/// 相对路径按 `dir` 解析（真实调用方都传绝对路径，这条只为保持旧行为）。
+fn read_image_file(dir: &Path, value: &str) -> Result<(Vec<u8>, String, String), String> {
+    let abs = resolve_local_ref(value, dir)?;
+    let bytes = std::fs::read(&abs).map_err(|error| format!("读图片失败：{error}"))?;
+    check_size(&bytes)?;
+    let ext = abs
+        .extension()
+        .map(|value| value.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if !IMAGE_EXTS.contains(&ext.as_str()) {
+        return Err(format!("不支持的图片类型：{ext}"));
+    }
+    // `jpeg` 归一成 `jpg`：同一张 JPEG 从剪贴板来是 `image/jpeg`→`jpg`、从文件管理器来是
+    // `.jpeg` ⇒ 不归一就会在同一个目录落出两份（扩展名不同 = 文件名不同 = 去重失效）。
+    let ext = if ext == "jpeg" { "jpg".to_string() } else { ext };
+    let stem = abs
+        .file_stem()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_default();
+    Ok((bytes, ext, stem))
+}
+
+/// 体积上限（`MAX_REF_BYTES`）：两种来源共用一条线，不各写一份。
+fn check_size(bytes: &[u8]) -> Result<(), String> {
     if bytes.len() as u64 > MAX_REF_BYTES {
         return Err(format!(
-            "参考图过大（{:.1}MB > {}MB）",
+            "图片过大（{:.1}MB > {}MB）",
             bytes.len() as f64 / 1024.0 / 1024.0,
             MAX_REF_BYTES / 1024 / 1024
         ));
     }
-    let hash = hex::encode(Sha1::digest(&bytes));
-    write_named_bytes(dir, &format!("{}.{ext}", &hash[..16]), &bytes)
+    Ok(())
 }
 
-/// 本机文件 → 预设目录里的**可读文件名**（原名主干-内容哈希前 8 位.扩展名）。
+/// 原名主干 → 能落盘的可读名（Windows 非法字符 / 空白压成 `-`；空 ⇒ 「图片」）。
 ///
-/// 与 [`materialize_data_url`] 共享「算哈希 / 限长 / 清洗 / 写盘」的内部实现，
-/// **命名策略各自**（`plan 18` §9.1）：refs 保持纯哈希（动它会让已落盘的文件重落一份），
-/// 预设用可读名（取用时编辑区显示的名字不能是 16 位哈希）。
-pub fn materialize_named_file(dir: &Path, path: &Path) -> Result<String, String> {
-    let abs = resolve_local_ref(&path.display().to_string(), dir)?;
-    let bytes = std::fs::read(&abs).map_err(|error| format!("读预设图片失败：{error}"))?;
-    if bytes.len() as u64 > MAX_REF_BYTES {
-        return Err(format!("预设图片过大（{:.1}MB > {}MB）", bytes.len() as f64 / 1048576.0, MAX_REF_BYTES / 1048576));
-    }
-    let ext = abs.extension().map(|v| v.to_string_lossy().to_lowercase()).unwrap_or_default();
-    let ext = match ext.as_str() {
-        "png" | "jpg" | "jpeg" | "webp" | "gif" => ext,
-        other => return Err(format!("不支持的预设图片类型：{other}")),
-    };
-    let stem = abs.file_stem().map(|v| v.to_string_lossy()).unwrap_or_default();
-    // Windows 非法字符 + 空白 ⇒ 压成 `-`，文件名可读且不落不了盘。
+/// `data:` 来源没有文件名 ⇒ 落回「图片」（规则仍是 `原名-哈希.ext`，只是原名是这个词）。
+fn clean_stem(stem: Option<&str>) -> String {
     let clean: String = stem
+        .unwrap_or_default()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
         .collect();
     let clean = clean.trim_matches('-');
-    let clean = if clean.is_empty() { "图片" } else { clean };
-    let short = &hex::encode(Sha1::digest(&bytes))[..8];
-    write_named_bytes(dir, &format!("{clean}-{short}.{ext}"), &bytes)
+    if clean.is_empty() { "图片".to_string() } else { clean.to_string() }
 }
 
-/// 内部唯一写盘点：内容哈希命名 + 同内容不重写（上面两个 materialize 都调它）。
+/// 落盘文件名 → **显示名**（`portrait-1a2b3c4d.png` ⇒ `portrait`）。
+///
+/// 文件名是 [`materialize_image`] 造的（原名 + 内容哈希尾巴），尾巴只服务于"同内容不重落"，
+/// 不是名字，不该出现在界面上。
+///
+/// **这是这条规则的唯一实现**：前端 `refLabelOf` 是它在 JS 侧的逐字镜像
+/// （两个运行时共用不了一份），改这里必须同步改那里 —— 两处各有一条用例锁同一组样例。
+pub fn label_of(file: &str) -> String {
+    let stem = Path::new(file)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    match stem.rsplit_once('-') {
+        // `!head.is_empty()`：`-1234abcd` 这种没有主干的不能剥成空名字
+        // （前端 `refLabelOf` 用 `named[1]` 做同一条判断，两处必须一致）。
+        Some((head, tail))
+            if !head.is_empty() && tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_hexdigit()) =>
+        {
+            head.to_string()
+        }
+        _ => stem,
+    }
+}
+
+/// 内部唯一写盘点：同内容不重写（[`materialize_image`] 唯一调用方）。
 fn write_named_bytes(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<String, String> {
     std::fs::create_dir_all(dir).map_err(|error| format!("建目录失败：{error}"))?;
     let path = dir.join(file_name);
@@ -222,7 +328,7 @@ pub fn read_ref_inputs(inputs: &[String], cwd: &Path, refs_dir: &Path) -> Result
         if lower.starts_with("data:") {
             // `data:` 一律落成本机文件：记录里只存路径，发送时才上传。
             // 不落盘的话这条记录就没有"真相"，CDN 一过期就再也找不回来。
-            let path = materialize_data_url(refs_dir, input)?;
+            let path = materialize_image(refs_dir, &ImageSource::Data { value: input.to_string() })?;
             entries.push(RefEntry {
                 input: input.to_string(),
                 key: format!("data:{}", short_hash(input.as_bytes())),
@@ -265,23 +371,163 @@ pub fn save_refs_cache(file: Option<&Path>, cache: &RefsCache) {
 mod tests {
     use super::*;
 
+    /// 固定内容（`AAAA` = 3 个零字节）：两条用例要比"同一内容 ⇒ 同一哈希尾巴"。
+    const DATA_PNG: &str = "data:image/png;base64,AAAA";
+
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("lovart-refs-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
 
+    fn data_source() -> ImageSource {
+        ImageSource::Data { value: DATA_PNG.to_string() }
+    }
+
+    fn name_of(path: &str) -> String {
+        Path::new(path)
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_default()
+    }
+
+    /// `原名-哈希8.png` → (原名, 哈希8)。不是这个形状 ⇒ 直接失败（判据就在这）。
+    fn split_readable(name: &str) -> (String, String) {
+        let stem = name.rsplit_once('.').map(|(head, _)| head).unwrap_or(name);
+        let (head, tail) = stem
+            .rsplit_once('-')
+            .unwrap_or_else(|| panic!("可读名必须是「原名-哈希」：{name}"));
+        (head.to_string(), tail.to_string())
+    }
+
     #[test]
     fn data_前缀大小写不敏感() {
         let dir = temp_dir("upper");
-        let path = materialize_data_url(&dir, "DATA:image/png;base64,AAAA").expect("大写前缀也认");
+        let path = materialize_image(&dir, &ImageSource::Data { value: "DATA:image/png;base64,AAAA".to_string() })
+            .expect("大写前缀也认");
         assert!(Path::new(&path).exists(), "落盘文件应存在：{path}");
+        assert!(name_of(&path).ends_with(".png"), "扩展名应来自 mime：{path}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn 缺_data_前缀时报错() {
         let dir = temp_dir("bad");
-        assert!(materialize_data_url(&dir, "image/png;base64,AAAA").is_err());
+        let source = ImageSource::Data { value: "image/png;base64,AAAA".to_string() };
+        assert!(materialize_image(&dir, &source).is_err());
+    }
+
+    /// `var/refs` 的文件名是纯 16 位哈希 —— 旧文件靠它去重，改名等于全部重落一份。
+    #[test]
+    fn refs_目录仍是纯十六位哈希() {
+        let dir = temp_dir("hash").join("refs");
+        for source in [
+            data_source(),
+            // 路径来源落进 refs 目录：命名**仍按目录**（不是按来源），所以也是纯哈希。
+            ImageSource::Path { value: image_file("hash-src", "photo.png", b"\0\0\0") },
+        ] {
+            let path = materialize_image(&dir, &source).expect("应落盘");
+            let name = name_of(&path);
+            let stem = name.strip_suffix(".png").unwrap_or_else(|| panic!("扩展名不对：{name}"));
+            assert_eq!(stem.len(), 16, "refs 里的名字必须是 16 位哈希：{name}");
+            assert!(stem.bytes().all(|byte| byte.is_ascii_hexdigit()), "必须是纯哈希：{name}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S1 的核心判据：**同一个目录里，两种来源的文件名规则相同**（原名+哈希）。
+    #[test]
+    fn 同一目录两种来源文件名规则相同() {
+        let dir = temp_dir("rules").join("library");
+        let from_data = materialize_image(&dir, &data_source()).expect("data: 应落盘");
+        // 同一个内容（3 个零字节）走路径来源 ⇒ 哈希尾巴必须一样，只有原名不同。
+        let file = image_file("rules-src", "photo 1.png", b"\0\0\0");
+        let from_path = materialize_image(&dir, &ImageSource::Path { value: file }).expect("路径应落盘");
+
+        let (data_stem, data_hash) = split_readable(&name_of(&from_data));
+        let (path_stem, path_hash) = split_readable(&name_of(&from_path));
+        assert_eq!(data_stem, "图片", "data: 没有文件名 ⇒ 原名回落到「图片」");
+        assert_eq!(path_stem, "photo-1", "原名里的非法字符被压成 `-`");
+        assert_eq!(data_hash.len(), 8, "可读名的哈希尾巴是 8 位");
+        assert_eq!(data_hash, path_hash, "同一内容在同目录必须得到同一条命名规则");
+    }
+
+    /// `.jpeg` 与 `image/jpeg` 必须落到同一个扩展名：否则同一张图在这个目录里有两份。
+    #[test]
+    fn jpeg_归一成_jpg_同一张图只有一份() {
+        let dir = temp_dir("jpeg").join("library");
+        let file = image_file("jpeg-src", "shot.jpeg", b"\0\0\0");
+        let from_path =
+            materialize_image(&dir, &ImageSource::Path { value: file }).expect("路径应落盘");
+        let from_data = materialize_image(
+            &dir,
+            &ImageSource::Data { value: "data:image/jpeg;base64,AAAA".to_string() },
+        )
+        .expect("data: 应落盘");
+
+        assert!(name_of(&from_path).ends_with(".jpg"), "jpeg 要归一成 jpg：{from_path}");
+        assert!(name_of(&from_data).ends_with(".jpg"), "mime 支也应是 jpg：{from_data}");
+        assert_eq!(
+            split_readable(&name_of(&from_path)).1,
+            split_readable(&name_of(&from_data)).1,
+            "同一内容两条来源必须同一条命名"
+        );
+        // 两条来源只是原名不同（`shot` vs `图片`），扩展名与哈希尾巴一致 ⇒ 不会被当成两张图。
+        assert_eq!(std::fs::read_dir(&dir).expect("列目录").count(), 2);
+    }
+
+    #[test]
+    fn 同内容两次同一个文件() {
+        let dir = temp_dir("twice").join("library");
+        let first = materialize_image(&dir, &data_source()).expect("第一次应落盘");
+        let second = materialize_image(&dir, &data_source()).expect("第二次应落盘");
+        assert_eq!(first, second, "同内容不应重复写盘");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 路径来源不存在时报错() {
+        let dir = temp_dir("missing").join("library");
+        let source = ImageSource::Path { value: dir.join("没有这张.png").display().to_string() };
+        assert!(materialize_image(&dir, &source).is_err());
+    }
+
+    /// 命令入参形状（`docs/plan/20` §3.4）：`{kind:'path'|'data', value}` ——
+    /// 前端只按这个形状传，来源再多也不加第二个命令。
+    #[test]
+    fn 入参形状是_kind_加_value() {
+        let data: ImageSource =
+            serde_json::from_str(r#"{"kind":"data","value":"data:image/png;base64,AAAA"}"#)
+                .expect("data 形状");
+        assert!(matches!(data, ImageSource::Data { .. }));
+        let path: ImageSource = serde_json::from_str(r#"{"kind":"path","value":"C:/a.png"}"#)
+            .expect("path 形状");
+        assert!(matches!(path, ImageSource::Path { .. }));
+        // 没定义过的来源必须拒绝（不是"猜一个"）。
+        assert!(serde_json::from_str::<ImageSource>(r#"{"kind":"url","value":"x"}"#).is_err());
+    }
+
+    /// 显示名剥掉 8 位哈希尾巴。前端 `refLabelOf` 是这条规则的 JS 镜像 ⇒ **样例必须同一组**
+    /// （那边没有自动检查，改这里就得同步改 `ui/app.js`，否则芯片名又会出现哈希）。
+    #[test]
+    fn 显示名剥掉八位哈希尾巴() {
+        assert_eq!(label_of("portrait-1a2b3c4d.png"), "portrait");
+        assert_eq!(label_of("图片-1a2b3c4d.jpg"), "图片");
+        // 不是 8 位十六进制 ⇒ 原样（用户自己的文件名不能被改）
+        assert_eq!(label_of("a-b-1.png"), "a-b-1");
+        assert_eq!(label_of("IMG_0001.png"), "IMG_0001");
+        // `var/refs` 的纯哈希名没有可读主干 ⇒ 原样（前端另有「图片N」兜底）
+        assert_eq!(label_of("03c438bdd6ac1234.png"), "03c438bdd6ac1234");
+        // 没有主干 ⇒ 不许剥成空名字（与前端 `named[1]` 的判断一致）
+        assert_eq!(label_of("-1a2b3c4d.png"), "-1a2b3c4d");
+    }
+
+    /// 造一张本机图，返回绝对路径。
+    fn image_file(tag: &str, name: &str, bytes: &[u8]) -> String {
+        let dir = temp_dir(tag);
+        std::fs::create_dir_all(&dir).expect("建源目录");
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).expect("写源图");
+        path.display().to_string()
     }
 }

@@ -11,7 +11,7 @@ use std::path::Path;
 
 use crate::engine::refs::read_ref_inputs;
 use crate::lovart::prompt::PromptTask;
-use crate::service::workbench::data_dir;
+use crate::service::workbench::refs_dir_of;
 
 /// 参考图解析的核心。`log` 由调用方给（CLI = 终端 + run.log；GUI = run.log）。
 pub fn resolve_refs_core(
@@ -33,8 +33,10 @@ pub fn resolve_refs_core(
         return Ok(());
     }
 
-    // `data:` 的落盘目录 = `data/var/refs`（plan 19）；engine 不知道"数据根"这回事。
-    let entries = read_ref_inputs(&needed, cwd, &data_dir(cwd).join("var").join("refs"))?;
+    // `data:` 的落盘目录由 `Workbench` 的访问器给（plan 19 / TD-03-1）：这里不拼路径。
+    // ⚠️ 目录名同时决定命名策略（`engine::refs::naming_for`）——自己拼一个 `data/refs`
+    //    就会让同一张图落成另一种文件名，见 `engine::refs::CONTENT_DIR_NAME`。
+    let entries = read_ref_inputs(&needed, cwd, &refs_dir_of(cwd))?;
     let mut source_by_input: BTreeMap<String, String> = BTreeMap::new();
     for entry in &entries {
         // 公网 URL 上游能直接访问，原样留着；其余都在 `read_ref_inputs` 里落成了本机文件。
