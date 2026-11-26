@@ -44,11 +44,11 @@
 
 | 路径 | 拥有 |
 | --- | --- |
-| `crates/lovart-core/` | 领域与引擎：`lovart/`（client · contract · models · prompt · task · attachments · config · connection · errors · media_type · project）、`engine/`（scheduler · state · settings · intake · refs · download · group · report · runlog · session · lockfile · text）、`service/`（api · files · library · meta · refs · snapshot · wiring · workbench）。**这个 crate 的 `Cargo.toml` 里没有 tauri** ⇒ 写 `use tauri::…` 是编译错误，不需要任何 grep 检查 |
+| `crates/lovart-core/` | 领域与引擎：`assistant/`（LLM 对话：会话真相文件的唯一写者 · 请求组装 · 非流式信封，**不属于出图网关**）、`fsio.rs`（`write_atomic`：tmp → rename，横跨两层共用 ⇒ 放 crate 根，不许塞进 `engine/` 或 `lovart/`）、`lovart/`（client · contract · models · prompt · task · attachments · config · connection · errors · media_type · project）、`engine/`（scheduler · state · settings · intake · refs · download · group · report · runlog · session · lockfile · text）、`service/`（api · files · library · meta · refs · snapshot · wiring · workbench）。**这个 crate 的 `Cargo.toml` 里没有 tauri** ⇒ 写 `use tauri::…` 是编译错误，不需要任何 grep 检查 |
 | `src-tauri/` | 只留入口与适配：`run.rs`（CLI）、`gui.rs`（GUI）、`http.rs`（本机 HTTP）、`cli.rs`（参数）、`main.rs`、`lib.rs`。GUI 与 CLI 是**同一个二进制** |
-| `ui/` | 无框架前端：`index.html` · `app.js` · `presets.js` · `library.js` · `tauri.js` · `refStrip.js` · `promptChips.js` · `promptMention.js` · `style.css`。编译期嵌入二进制 |
+| `ui/` | 无框架前端：`index.html` · `app.js` · `presets.js` · `library.js` · `tauri.js` · `refStrip.js` · `promptChips.js` · `promptMention.js` · `style.css` · `assistant-plugin/`（AI 对话插件：自包含、零本仓 import，靠 adapters 接宿主）· `tests/`（前端零依赖单测，`node --test`）。编译期嵌入二进制 |
 | `fixtures/` | 黄金用例（JSONL）：回放断言用，改行为要同步 |
-| `data/` | **唯一的运行数据根**（`docs/plan/19`）：`.env` · `prompts.jsonl` · `inbox/` · `presets/` · `library/`（素材库）· `output/` · `var/`（state / report / run.log / refs / cache / lock）。启动幂等迁移旧根目录布局（`service::workbench::migrate_layout`）；`git clean -xdf` 会删 `data/` ⇒ 动之前先备份 |
+| `data/` | **唯一的运行数据根**（`docs/plan/19`）：`.env` · `prompts.jsonl` · `inbox/` · `presets/` · `library/`（素材库）· `output/` · `var/`（state / report / run.log / refs / cache / lock）· `chat-history.json`（AI 对话会话真相，整表原子写）· `chat-system-prompt.txt`（对话系统提示词，纯文本）。启动幂等迁移旧根目录布局（`service::workbench::migrate_layout`）；`git clean -xdf` 会删 `data/` ⇒ 动之前先备份 |
 | `prompt-library/` | 提示词库与配图（数据，不是代码）；代码 0 引用，留在仓库根 |
 | `scripts/` | 账本与判据：`adr.mjs` · `debt.mjs` · `arch-index.mjs` · `probe.mjs`；事实：`scan.mjs`（复杂度 × 覆盖率 + 结构重复，零依赖，扫 Rust 与 `ui/`）· `typegen.ts`（`prompts.jsonl` 字段对账）；发布：`deploy.ts`（产物落位，不构建）；打包：`make-app.sh` · `make-exe.ps1` · `build-win.bat`。全部 `node scripts/<名字>` 直接跑 —— Node 24 原生跑 `.ts`，不吃 `tsx`/`ts-node` |
 | `docs/adr/` | 判据真源；`README.md` 是 `adr.mjs index --write` 生成的索引 |

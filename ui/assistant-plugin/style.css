@@ -1,0 +1,552 @@
+/*
+ * AI 对话插件样式 —— **只作用于 `.ap-root` 内部**（宿主页面不被污染）。
+ * 颜色/圆角/字号沿用宿主的 CSS 令牌，取不到时退回内置值（整目录拷到别的宿主也能看）。
+ */
+
+.ap-root {
+  /* 会话下拉是 `position: absolute` ⇒ 必须有定位祖先（否则会跑到 body 上） */
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+  color: var(--ink, #18181b);
+  font-size: var(--fs-md, 13px);
+}
+
+/* ── 顶栏 ─────────────────────────────────────────────────────────── */
+
+.ap-root .agent-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: var(--head-h, 46px);
+  padding: 0 10px 0 12px;
+  border-bottom: 1px solid var(--line, #e7e7e9);
+}
+
+.ap-root .agent-title-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 60%;
+  height: var(--h-btn, 30px);
+  padding: 0 8px;
+  border: 0;
+  border-radius: var(--r-sm, 6px);
+  background: transparent;
+  color: inherit;
+  font-size: var(--fs-lg, 14px);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.ap-root .agent-title-btn:hover {
+  background: var(--bg-hover, #ececee);
+}
+
+.ap-root .agent-title-text {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.ap-root .agent-icon-btn {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--h-btn-sm, 26px);
+  height: var(--h-btn-sm, 26px);
+  border: 0;
+  border-radius: var(--r-sm, 6px);
+  background: transparent;
+  color: inherit;
+  /* ⚠️ `line-height: 0` + `svg { display: block }`：图标按钮里混着文字字形时，
+       行盒会把基线算进去，一排按钮就会出现"一大一小、一高一低"。 */
+  font-size: 0;
+  line-height: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
+.ap-root .agent-icon-btn svg {
+  display: block;
+}
+
+.ap-root .agent-icon-btn.is-on {
+  background: var(--bg-sub, #f4f4f5);
+  color: var(--ink, #18181b);
+}
+
+.ap-root .agent-icon-btn + .agent-icon-btn {
+  margin-left: 0;
+}
+
+.ap-root .agent-icon-btn:hover {
+  background: var(--bg-hover, #ececee);
+}
+
+.ap-root .agent-pop {
+  position: absolute;
+  z-index: 6;
+  margin: 44px 0 0 12px;
+  min-width: 240px;
+  max-width: 320px;
+  max-height: 320px;
+  overflow: auto;
+  padding: 4px;
+  border: 1px solid var(--line, #e7e7e9);
+  border-radius: var(--r-md, 8px);
+  background: var(--bg, #fff);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.14);
+}
+
+.ap-root .agent-pop-empty {
+  padding: 10px;
+  color: #71717a;
+  font-size: var(--fs-sm, 12px);
+}
+
+.ap-root .agent-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  border-radius: var(--r-sm, 6px);
+}
+
+.ap-root .agent-row:hover {
+  background: var(--bg-hover, #ececee);
+}
+
+.ap-root .agent-row.is-current .agent-row-pick {
+  font-weight: 600;
+}
+
+.ap-root .agent-row-pick {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 8px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font-size: var(--fs-md, 13px);
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.ap-root .agent-row-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: var(--r-sm, 6px);
+  background: transparent;
+  color: #71717a;
+  cursor: pointer;
+  opacity: 0;
+}
+
+.ap-root .agent-row:hover .agent-row-btn,
+.ap-root .agent-row-btn.is-danger {
+  opacity: 1;
+}
+
+.ap-root .agent-row-btn.is-danger {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+.ap-root .agent-row-input {
+  flex: 1;
+  height: 26px;
+  padding: 0 6px;
+  border: 1px solid var(--run, #2563eb);
+  border-radius: var(--r-sm, 6px);
+  font-size: var(--fs-md, 13px);
+}
+
+/* ── 消息区 ───────────────────────────────────────────────────────── */
+
+.ap-root .agent-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+}
+
+.ap-root .agent-messages {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.ap-root .agent-msg-wrap {
+  display: flex;
+}
+
+.ap-root .agent-msg-wrap.is-user {
+  justify-content: flex-end;
+}
+
+.ap-root .agent-msg {
+  max-width: 86%;
+  padding: 8px 11px;
+  border-radius: var(--r-lg, 12px);
+  background: var(--bg-sub, #f4f4f5);
+  line-height: 1.62;
+  word-break: break-word;
+}
+
+.ap-root .agent-msg-wrap.is-user .agent-msg {
+  background: #e8f0fe;
+}
+
+.ap-root .agent-msg.is-ephemeral {
+  border: 1px dashed var(--warn, #b45309);
+}
+
+.ap-root .agent-empty {
+  padding: 48px 8px;
+  text-align: center;
+  color: #71717a;
+}
+
+.ap-root .agent-empty h3 {
+  margin: 0 0 6px;
+  font-size: var(--fs-xl, 20px);
+  font-weight: 600;
+  color: var(--ink, #18181b);
+}
+
+.ap-root .agent-thinking {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 2px 0;
+  color: #71717a;
+  font-size: var(--fs-sm, 12px);
+}
+
+.ap-root .agent-dots {
+  display: inline-flex;
+  gap: 3px;
+}
+
+.ap-root .agent-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: ap-bounce 1.1s infinite ease-in-out;
+}
+
+.ap-root .agent-dot:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.ap-root .agent-dot:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes ap-bounce {
+  0%,
+  70%,
+  100% {
+    opacity: 0.35;
+    transform: translateY(0);
+  }
+  35% {
+    opacity: 1;
+    transform: translateY(-3px);
+  }
+}
+
+.ap-root .agent-error {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border: 1px solid #fecaca;
+  border-radius: var(--r-md, 8px);
+  background: #fef2f2;
+  color: #991b1b;
+  font-size: var(--fs-sm, 12px);
+  white-space: pre-wrap;
+}
+
+/* ── 底部 OneBox ──────────────────────────────────────────────────── */
+
+.ap-root .agent-composer {
+  border-top: 1px solid var(--line, #e7e7e9);
+  padding: 8px 10px 10px;
+}
+
+.ap-root .agent-att-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-bottom: 8px;
+}
+
+.ap-root .agent-att {
+  position: relative;
+  width: 44px;
+  height: 44px;
+  border-radius: var(--r-sm, 6px);
+  overflow: hidden;
+  background: var(--bg-sub, #f4f4f5);
+}
+
+.ap-root .agent-att img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  cursor: zoom-in;
+}
+
+.ap-root .agent-att-remove {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 16px;
+  height: 16px;
+  border: 0;
+  border-radius: 0 6px 0 6px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+/* 输入框高度拖拽手柄：贴在输入卡片顶边的一条细带，hover 才显形（不占视觉） */
+.ap-root .agent-composer-grip {
+  flex: none;
+  height: 10px;
+  margin: -4px 0 2px;
+  border-radius: 3px;
+  cursor: row-resize;
+  background: transparent;
+  touch-action: none;
+}
+
+.ap-root .agent-composer-grip:hover,
+.ap-root .agent-composer-grip:active {
+  background: var(--line, #e7e7e9);
+}
+
+.ap-root .agent-textarea {
+  width: 100%;
+  /* 默认比一行高（约 3 行）：单行输入框在这里太局促 */
+  height: 76px;
+  min-height: 76px;
+  max-height: 320px;
+  padding: 6px 2px;
+  border: 0;
+  outline: none;
+  resize: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  line-height: 1.6;
+}
+
+.ap-root .agent-tools {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-top: 4px;
+}
+
+.ap-root .agent-tool-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: #71717a;
+  cursor: pointer;
+}
+
+.ap-root .agent-tool-btn:hover {
+  background: var(--bg-hover, #ececee);
+}
+
+.ap-root .agent-send {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 50%;
+  background: var(--ink, #18181b);
+  color: #fff;
+  cursor: pointer;
+}
+
+.ap-root .agent-send:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+/* ── 渲染出来的 Markdown ──────────────────────────────────────────── */
+
+.ap-root .md-p {
+  margin: 0 0 6px;
+}
+
+.ap-root .md-p:last-child {
+  margin-bottom: 0;
+}
+
+.ap-root .md-heading {
+  margin: 10px 0 6px;
+  line-height: 1.4;
+}
+
+.ap-root .md-h1 {
+  font-size: 16px;
+}
+
+.ap-root .md-h2 {
+  font-size: 15px;
+}
+
+.ap-root .md-h3 {
+  font-size: 14px;
+}
+
+.ap-root .md-inline-code {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.06);
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+.ap-root .md-code {
+  margin: 8px 0;
+  border: 1px solid var(--line, #e7e7e9);
+  border-radius: var(--r-md, 8px);
+  overflow: hidden;
+}
+
+.ap-root .md-code-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  background: var(--bg-sub, #f4f4f5);
+  color: #71717a;
+  font-size: 11px;
+}
+
+.ap-root .md-code-copy {
+  margin-left: auto;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.ap-root .md-code-body {
+  margin: 0;
+  padding: 8px 10px;
+  overflow: auto;
+  background: #fbfbfb;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.ap-root .md-table {
+  margin: 8px 0;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.ap-root .md-table th,
+.ap-root .md-table td {
+  padding: 4px 8px;
+  border: 1px solid var(--line, #e7e7e9);
+  text-align: left;
+}
+
+.ap-root .md-table th {
+  background: var(--bg-sub, #f4f4f5);
+  font-weight: 600;
+}
+
+.ap-root .md-quote {
+  margin: 8px 0;
+  padding: 2px 0 2px 10px;
+  border-left: 3px solid var(--line, #e7e7e9);
+  color: #52525b;
+}
+
+.ap-root .md-list {
+  margin: 6px 0;
+  padding-left: 20px;
+}
+
+.ap-root .md-hr {
+  margin: 10px 0;
+  border: 0;
+  border-top: 1px solid var(--line, #e7e7e9);
+}
+
+.ap-root .md-link {
+  color: var(--run, #2563eb);
+  text-decoration: none;
+}
+
+.ap-root .md-link:hover {
+  text-decoration: underline;
+}
+
+.ap-root .md-at {
+  padding: 0 4px;
+  border-radius: 4px;
+  background: rgba(37, 99, 235, 0.1);
+  color: var(--run, #2563eb);
+}
+
+/* 只渲染最近 N 条 ⇒ 更早的那部分给一个明确入口（不假装历史不存在） */
+.ap-root .agent-load-more {
+  align-self: center;
+  margin: 0 auto 8px;
+  padding: 4px 10px;
+  border: 1px solid var(--line, #e7e7e9);
+  border-radius: var(--r-pill, 999px);
+  background: var(--bg-sub, #f4f4f5);
+  color: #71717a;
+  font-size: var(--fs-sm, 12px);
+  cursor: pointer;
+}
+
+.ap-root .md-image {
+  display: block;
+  max-width: 100%;
+  margin: 6px 0;
+  border-radius: var(--r-sm, 6px);
+  cursor: zoom-in;
+}
+
+.ap-root .md-missing {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(180, 83, 9, 0.12);
+  color: var(--warn, #b45309);
+  font-size: 12px;
+}

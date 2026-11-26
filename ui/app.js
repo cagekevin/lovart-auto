@@ -1948,19 +1948,72 @@ async function sendViewerToLibrary() {
   if (name) notice(`已发送到素材库：${name}`);
 }
 
-/** 弹窗「＋」选图 → `data:` → 复制进库；**面板不关**（人可能连加几张），网格重列。 */
+// ── AI 对话（宿主侧接线，业务全在插件与 `gui.rs`）────────────────────
+
+/**
+ * 打开面板：右侧吸附浮层归宿主，内容归插件；打开即重读一次真相文件。
+ *
+ * ⚠️ 不是模态：不铺遮罩 ⇒ 打开期间仍能点素材库、看大图、往对话里塞图。
+ * （做成 `.mask` 时，"点图进对话"必须先在别处点图 —— 而遮罩正好把别处挡住了。）
+ */
+async function openAssistant() {
+  // 形态照参考实现：对话**只在自己那台窗口里**跑。
+  // 主窗口不做面板 —— 它每秒轮询看板并重画，和对话抢同一个 webview 就是卡的主因。
+  try {
+    await invoke('open_assistant_window');
+  } catch (error) {
+    notice(`打不开对话窗口：${error}`);
+  }
+}
+
+function closeAssistant() {
+  assistantOpen = false;
+  const dock = $('assistantDock');
+  if (dock) show(dock, false);
+  if (assistant) assistant.close();
+}
+
+/** `File` → 本机路径：先读 data URL，再走 `save_ref_image`（plan 18 的唯一落盘入口）。 */
+async function fileToPath(file) {
+  const dataUrls = await readFilesAsDataUrls([file]);
+  const dataUrl = dataUrls && dataUrls[0];
+  if (!dataUrl) return '';
+  return saveRefImage(dataUrl);
+}
+
+/** 粘贴板里的图 → 本机路径数组。没图就返回空数组（默认粘贴行为不变）。 */
+async function clipboardImagePaths(event) {
+  const items = Array.from((event.clipboardData && event.clipboardData.items) || []);
+  const files = items
+    .filter((item) => item.kind === 'file' && String(item.type || '').startsWith('image/'))
+    .map((item) => item.getAsFile())
+    .filter(Boolean);
+  const paths = [];
+  for (const file of files) {
+    const path = await fileToPath(file);
+    if (path) paths.push(path);
+  }
+  return paths;
+}
+
+/**
+ * 弹窗「＋」：选图 → `data:` → 复制进库 → 网格重列；**面板不关**。
+ *
+ * ⚠️ 可以一次选多张，但**一张一张发、每张自己说话**：失败由 `sendToLibrary` 逐条报原因，
+ *    成功不播报（网格里看得见）。**不许加"已放入 N 张 / M 张没进"这类汇总或计数** ——
+ *    多选不等于需要有人替它们总结（用户裁定 2026-11-26；ADR-0003 一次法则）。
+ */
 async function addLibraryImages(files) {
   let dataUrls;
   try {
+    // 唯一读取点（`readFilesAsDataUrls`）；整批读不出来（权限 / 文件被移走）时一次说清。
     dataUrls = await readFilesAsDataUrls(files);
   } catch (error) {
-    // 读盘失败（权限 / 文件被移走）必须说一句：否则点了「＋」选完图，面板毫无反应。
     notice(`读不了这些图片：${error}`);
     return;
   }
   for (const data of dataUrls) {
-    // 一张失败不拦其余（选 5 张不该因为第 2 张坏掉就静默只发 1 张）。
-    // 失败原因由 `sendToLibrary` 逐条报；**不再补汇总条** —— 同一个失败只说一次（ADR-0003）。
+    // 一张失败不拦其余；原因已由 `sendToLibrary` 报过，这里不再补第二句。
     await sendToLibrary({ kind: 'data', value: data });
   }
   await renderLibrary();
@@ -2455,12 +2508,171 @@ function removeChipsById(id) {
   }
 }
 
-/** 拖进窗口 = 加垫图（不用瞄准某个小方框）。 */
+/** AI 对话插件的实例与"面板现在开着吗"（拖放要按它分流）。 */
+let assistant = null;
+let assistantOpen = false;
+
+/**
+ * 当前是**独立对话窗口**吗（`docs/plan/22`）。
+ *
+ * 判据来自 Rust 建窗时注入的 `initialization_script`，不是 URL 查询串 ——
+ * 查询串要穿一层 Tauri 的 path 解析，标记写在 window 上不依赖那条路。
+ */
+const ASSISTANT_WINDOW = window.__ASSISTANT_WINDOW__ === true;
+
+/** 订阅一个 Tauri 事件；失败只记日志（不弹提示：独立窗口里没有提示区）。 */
+async function listenEvent(name, handler) {
+  try {
+    const { listen } = window.__TAURI__.event;
+    await listen(name, handler);
+  } catch (error) {
+    console.error(`[assistant] 监听 ${name} 失败：`, error);
+  }
+}
+
+/**
+ * 独立窗口里的「看大图」最小接线：**只接关闭与切换大小**。
+ *
+ * 主窗口的那套（`closeViewer` + 6 个工具按钮）在 `DOMContentLoaded` 的后半段，
+ * 而独立窗口在开头就 `return` 了 —— 不补这一段，图片打开后 ESC / 空白 / × 全无效。
+ * 其余按钮（打开所在位置 / 复制提示词 / 发送到素材库 / 发送到 AI 对话）在独立窗口里
+ * 没有意义，由 CSS 隐藏，不接死按钮。
+ */
+function wireViewerLite() {
+  const viewer = $('viewer');
+  if (!viewer) return;
+  const close = () => {
+    viewer.hidden = true;
+    $('viewerImg').removeAttribute('src');
+  };
+  $('viewerClose').addEventListener('click', close);
+  viewer.addEventListener('click', (event) => {
+    if (event.target === viewer || event.target === $('viewerStage')) close();
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !viewer.hidden) {
+      event.stopPropagation();
+      close();
+    }
+  });
+  $('viewerFit').addEventListener('click', () => {
+    viewer.classList.remove('is-actual');
+    $('viewerFit').classList.add('is-on');
+    $('viewerActual').classList.remove('is-on');
+  });
+  $('viewerActual').addEventListener('click', () => {
+    viewer.classList.add('is-actual');
+    $('viewerActual').classList.add('is-on');
+    $('viewerFit').classList.remove('is-on');
+  });
+  $('viewerImg').addEventListener('load', (event) => {
+    const img = event.currentTarget;
+    if (img.naturalWidth) {
+      $('viewerDims').textContent = `${img.naturalWidth}×${img.naturalHeight}`;
+    }
+  });
+}
+
+/** 建插件实例 —— 两个窗口共用这一段（adapters 只有一份）。 */
+function mountAssistant(extra) {
+  if (!window.AssistantPlugin) return null;
+  return window.AssistantPlugin.create({
+    mount: $('assistantRoot'),
+    adapters: {
+      invoke: (name, payload) => invoke(name, payload),
+      imageSrc: (path) => toFileUrl(path),
+      openImage: (src) => (isRemoteSrc(src) ? openViewerRemote(src) : openViewer(src)),
+      saveImageFile: fileToPath,
+      pathsFromClipboard: clipboardImagePaths,
+    },
+    onClose: () => closeAssistant(),
+    ...(extra || {}),
+  });
+}
+
+/**
+ * 独立对话窗口的启动：**只**装插件 + 铺满 + 收事件。
+ * 主界面那套（读设置、载模型、看板轮询、垫图拖放）一条都不跑。
+ */
+async function bootAssistantWindow() {
+  document.documentElement.classList.add('is-assistant-window');
+  const dock = $('assistantDock');
+  if (!dock) return;
+  assistantOpen = true;
+  show(dock, true);
+
+  assistant = mountAssistant({
+    // 关窗就是关窗：不做"收进托盘"之类的隐性状态
+    onClose: () => invoke('close_assistant_window'),
+    actions: {
+      // 拖窗：无边框窗口没有系统标题栏，顶栏空白处按下即拖动
+      onDragStart: () => {
+        const api = window.__TAURI__ && window.__TAURI__.window;
+        if (api && api.getCurrentWindow) api.getCurrentWindow().startDragging();
+      },
+      // 回主页面：把主窗口还原 + 提到前面（对话是独立窗口，主窗口可能压在后面）
+      onOpenMain: () =>
+        invoke('open_main_window').catch((error) =>
+          console.error('[assistant] 打开主页面失败：', error),
+        ),
+      // 置顶：默认不置顶；点一下钉住、再点恢复
+      onToggleTop: (onTop) =>
+        invoke('set_assistant_on_top', { onTop }).catch((error) =>
+          console.error('[assistant] 置顶切换失败：', error),
+        ),
+    },
+  });
+
+  // 只有这一台窗口会渲染对话 ⇒ 不需要跨窗通知、也没有"停靠回来"（它就是常驻形态）
+  if (assistant) assistant.open();
+
+  // 看大图：主窗口那套关闭逻辑在 boot 的后半段（这里早退了）⇒ 必须自己接。
+  // 少了这一段，图片一打开就只剩"关掉整个窗口"。
+  wireViewerLite();
+
+  // 主窗口「发送到 AI 对话」塞进来的图（可能在监听器注册之前就到了 ⇒ 先取一次）
+  const takePending = async () => {
+    try {
+      const paths = await invoke('assistant_take_pending');
+      if (assistant && Array.isArray(paths) && paths.length) assistant.addAttachment(paths);
+    } catch (error) {
+      console.error('[assistant] 取待加图片失败：', error);
+    }
+  };
+  await takePending();
+  await listenEvent('assistant://attach', takePending);
+
+  // 独立窗口里的拖图 = 直接进附件区（这里没有垫图区可抢）
+  try {
+    const { getCurrentWebviewWindow } = window.__TAURI__.webviewWindow;
+    await getCurrentWebviewWindow().onDragDropEvent((event) => {
+      if (event.payload.type === 'drop' && assistant) {
+        assistant.addAttachment(event.payload.paths || []);
+      }
+    });
+  } catch (error) {
+    console.error('[assistant] 拖放通道不可用：', error);
+  }
+}
+
+/**
+ * 拖进来的图归谁：**对话面板开着就归对话**，否则进垫图。
+ *
+ * ⚠️ 一次拖拽只能落一处：两处都收 = 编辑区垫图凭空多一张，用户看不出哪来的。
+ * 这是宿主的事（拖放通道只有宿主能接，见 plan 21 §3.4）。
+ */
+function routeDroppedPaths(paths) {
+  // 主窗口里只有垫图这一处落点：对话面板不在主窗口（见 `openAssistant`）。
+  if (!paths || !paths.length) return;
+  addRefs(paths);
+}
+
+/** 拖进窗口 = 加垫图 / 进 AI 对话（不用瞄准某个小方框）。 */
 async function wireDropZone() {
   try {
     const { getCurrentWebviewWindow } = window.__TAURI__.webviewWindow;
     await getCurrentWebviewWindow().onDragDropEvent((event) => {
-      if (event.payload.type === 'drop') addRefs(event.payload.paths || []);
+      if (event.payload.type === 'drop') routeDroppedPaths(event.payload.paths || []);
     });
   } catch (error) {
     // ⚠️ 原先这里是空 `catch`（注释写「不影响其它功能」）—— 但它影响的是
@@ -3321,6 +3533,13 @@ async function loadModels() {
 }
 
 window.addEventListener('DOMContentLoaded', async () => {
+  // 独立对话窗口（`docs/plan/22`）：只跑插件。**必须早退** ——
+  // 否则同一进程里会有两套 1Hz 轮询与两套垫图拖放监听。
+  if (ASSISTANT_WINDOW) {
+    await bootAssistantWindow();
+    return;
+  }
+
   // 设置先读：三个参数的初值都来自它（兜底参数的唯一来源在后端）。
   const settings = await loadSettings();
   await loadModels();
@@ -3504,6 +3723,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   $('btnLibraryClose').addEventListener('click', () => closeMask('maskLibrary'));
   $('btnLibraryAdd').addEventListener('click', () => $('libraryPicker').click());
   $('libraryPicker').addEventListener('change', async (event) => {
+    // 先清 value 再读：再选同一张图仍会触发 change。
     const files = Array.from(event.target.files || []);
     event.target.value = '';
     if (files.length) await addLibraryImages(files);
@@ -3631,6 +3851,20 @@ window.addEventListener('DOMContentLoaded', async () => {
   $('viewerCopy').addEventListener('click', () => copyPrompt(viewerPrompt));
   // 发送到素材库：来源由 `sendViewerToLibrary` 从 `viewerFile` / `data:` 取，不另存第三份。
   $('viewerSendToLibrary').addEventListener('click', sendViewerToLibrary);
+  // 点图进对话：素材库 / 看板大图 / 垫图都会走到 viewer，这里只认**本机路径**
+  // （`http(s)` 的图不是本机文件，模型要的是文件字节，不是网址 ⇒ 说清楚，不静默失败）。
+  $('viewerSendToChat').addEventListener('click', async () => {
+    if (!viewerFile) {
+      notice('这张图不在本机（网址图）—— 先存到素材库再发送');
+      return;
+    }
+    // 主窗口没有插件实例 ⇒ 交给 Rust 开窗 + 入队，窗口取走后再显示 chip
+    try {
+      await invoke('assistant_attach', { paths: [viewerFile] });
+    } catch (error) {
+      notice(`打不开对话窗口：${error}`);
+    }
+  });
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape' && !$('viewer').hidden) closeViewer();
   });
@@ -3639,6 +3873,20 @@ window.addEventListener('DOMContentLoaded', async () => {
   document.addEventListener('click', closeMenu);
 
   await wireDropZone();
+
+  // ── AI 对话（插件）──────────────────────────────────────────────────
+  // 一个入口：`AssistantPlugin.create` 把整个面板装进 `#assistantRoot`。
+  // 宿主只提供 4 个 adapter（`imageSrc` / `openImage` / `saveImageFile` / `pathsFromClipboard`），
+  // 六条命令的实现全在 `gui.rs` 的 `assistant_*`（这里一行业务都不写）。
+  // 主窗口**不创建插件实例**（参考实现同理：主窗口只留入口，对话在 ChatWindow 里）。
+  // 之前在这里 mount 一份：隐藏的 DOM 要建、`assistant://changed` 来了还要整表重读重画，
+  // 全都白跑 —— 那是"开着对话就发卡"的第二个来源。
+
+  $('btnAssistant').addEventListener('click', openAssistant);
+  // 没有"点遮罩关闭"：它没有遮罩（非模态）。关面板 = 顶栏 × 或 Esc。
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !$('assistantDock').hidden) closeAssistant();
+  });
   renderRefs();
   renderQueue();
   await refreshBoard();

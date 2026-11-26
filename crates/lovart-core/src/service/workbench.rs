@@ -356,6 +356,19 @@ impl Workbench {
         self.data_dir().join("prompts.jsonl")
     }
 
+    /// `data/chat-history.json`（AI 对话的会话真相；整表读、整表原子写，
+    /// 唯一写者是 `assistant::store::ChatStore`，别人只读）。
+    pub fn chat_history_file(&self) -> PathBuf {
+        self.data_dir().join("chat-history.json")
+    }
+
+    /// `data/chat-system-prompt.txt`（AI 对话的系统提示词，纯文本）。
+    /// 目录/文件都**不预建**：缺文件就是 `missing_system_prompt`，
+    /// 不替用户编一句默认提示词（`ADR-0008`）。
+    pub fn chat_system_prompt_file(&self) -> PathBuf {
+        self.data_dir().join("chat-system-prompt.txt")
+    }
+
     pub fn presets_dir(&self) -> PathBuf {
         self.data_dir().join("presets")
     }

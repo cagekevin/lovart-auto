@@ -47,6 +47,19 @@ make win                    # Windows → lovart-client.exe
 
 > ⚠️ 改过 `ui/` 必须重新 `make app` / `make win` —— 前端是**编译期**嵌进二进制的。
 
+### AI 对话面板（可选，右上角「AI 对话」）
+
+纯文本对话：**不出图、不发任务、不入待发队列**，但**与出图同一个额度账户**（每发一句就是一次计费调用）。
+
+1. 写 `data/chat-system-prompt.txt`（纯文本，一句话即可）。
+   **缺这个文件就不许发**，程序不会替你编一句默认提示词。
+2. **不需要新的键**：对话走 Lovart 自有通道，复用 `data/.env` 里已有的
+   `LOVART_ACCESS_KEY` / `LOVART_SECRET_KEY`（与出图同一对）。
+3. 重开程序（凭据走进程环境，重开才载入 `.env`）。
+
+会话存在 `data/chat-history.json`（整表原子写）。会话图片只存**来源路径**、不复制：
+原图被删除后，那一轮请求里会显示成 `[图片缺失]`，对话照常能继续。
+
 ---
 
 ## prompts.jsonl
@@ -131,6 +144,8 @@ lovart 自动/
     ├── inbox/            AI 写提示词的落点
     ├── presets/          预设：清单 + 图（plan 18）
     ├── library/          素材库（plan 20：工具条「素材库」）
+    ├── chat-history.json AI 对话的会话真相（plan 21，整表原子写）
+    ├── chat-system-prompt.txt  AI 对话的系统提示词
     ├── output/           出图
     └── var/              状态 / 报告 / refs / 缓存 / log / lock
 ```

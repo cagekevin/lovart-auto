@@ -11,8 +11,9 @@
 //!     派生规则只有这一处（ADR-0003）。
 //!
 //! 文件：`data/presets/manifest.json`（目录由 `Workbench::presets_dir()` 给）。
-//! 写：**整表原子写**（写 `.tmp` → `fs::rename`）—— 照抄 `engine/state.rs` 的范本，
-//!     本轮不改 `state.rs`（动任务真相写盘路径风险 > 收益）。
+//! 写：**整表原子写**，实现只有一处 —— [`crate::fsio::write_atomic`]（`.tmp` → `rename`）。
+//!     `engine/state.rs` 的 `compact()` 仍是自己那份：动它要跨到出图花钱边界 + 全量回归，
+//!     已登记为债（`docs/plan/21` P11）—— 不是"没看见"。
 
 use std::path::Path;
 
@@ -92,19 +93,14 @@ pub fn load(dir: &Path) -> Result<Vec<Preset>, PresetError> {
         .map_err(|error| PresetError::Storage(format!("{} 格式不对：{error}", path.display())))
 }
 
-/// 写清单（整表覆盖）：写 `.tmp` → `fs::rename`（同卷原子，范本 `engine/state.rs:977`）。
+/// 写清单（整表覆盖）：走 [`crate::fsio::write_atomic`]（同卷原子，全 crate 唯一实现）。
 pub fn save(dir: &Path, items: &[Preset]) -> Result<(), PresetError> {
     std::fs::create_dir_all(dir)
         .map_err(|error| PresetError::Storage(format!("建不了 {}：{error}", dir.display())))?;
-    let path = dir.join("manifest.json");
-    let tmp = dir.join("manifest.json.tmp");
     let body = serde_json::to_string_pretty(items)
         .map_err(|error| PresetError::Storage(format!("序列化预设失败：{error}")))?;
-    std::fs::write(&tmp, body)
-        .map_err(|error| PresetError::Storage(format!("写临时清单失败：{error}")))?;
-    std::fs::rename(&tmp, &path)
-        .map_err(|error| PresetError::Storage(format!("原子替换清单失败：{error}")))?;
-    Ok(())
+    crate::fsio::write_atomic(&dir.join("manifest.json"), body.as_bytes())
+        .map_err(|error| PresetError::Storage(format!("原子替换清单失败：{error}")))
 }
 
 #[cfg(test)]

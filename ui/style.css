@@ -1574,6 +1574,60 @@ select:focus { border-color: var(--ink); }
    `min(720px, 92vw)`：大屏给足，小屏不溢出。 */
 .dialog-mid { width: min(720px, 92vw); }
 
+/* AI 对话：**右侧吸附浮层**，不是模态（形态照 maomao 的 `AgentPanel`：
+   `absolute top-0 right-0 bottom-0 z-30` + 左缘拖宽，没有遮罩）。
+   为什么不做 `.mask`：面板一开就点不了素材库/大图 ⇒「点图进对话」被自己的遮罩挡死。
+   z-index 40 < 遮罩 50 < 大图 100 ⇒ 素材库与大图会盖在它上面，关掉就回到它。 */
+.assistant-dock {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  width: min(420px, 92vw);
+  border-left: 1px solid var(--line);
+  background: var(--bg);
+  box-shadow: -12px 0 32px rgb(0 0 0 / 0.12);
+}
+
+/* `hidden` 必须显式压过 `display:flex`（与 `.mask:not([hidden])` 同一口径） */
+.assistant-dock[hidden] {
+  display: none;
+}
+
+.assistant-dock #assistantRoot {
+  flex: 1;
+  min-height: 0;
+}
+
+/* 独立对话窗口（`docs/plan/22`）：同一个 index.html，只留对话本身。
+   顶栏/看板/编辑区都藏掉 —— 那个窗口里它们没有意义（也不该跑它们的初始化）。 */
+.is-assistant-window .topbar,
+.is-assistant-window .split {
+  display: none;
+}
+
+.is-assistant-window .assistant-dock {
+  inset: 0;
+  width: auto;
+  border-left: 0;
+  box-shadow: none;
+}
+
+/* 独立窗口里的看大图：必须**盖住**顶栏（浮层 z-index 40），且只留「适应/实际大小」——
+   其余工具（打开所在位置、复制提示词、发送到素材库/对话）属于主窗口，这里没接线，
+   留着就是死按钮。 */
+.is-assistant-window .viewer {
+  z-index: 200;
+}
+
+.is-assistant-window .viewer-bar .viewer-btn:not(#viewerFit):not(#viewerActual),
+.is-assistant-window .viewer-bar .viewer-sep {
+  display: none;
+}
+
 /* 带关闭键的标题栏（`.dialog-title` 原本自带 padding，在栏里要收掉） */
 .dialog-head {
   display: flex;

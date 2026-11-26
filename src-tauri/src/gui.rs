@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
 
 use crate::engine::lockfile::FileLock;
@@ -25,6 +25,7 @@ use crate::engine::state::{
 };
 use crate::engine::text::{read_text, read_text_required};
 use crate::service::wiring::to_client_deps;
+use crate::lovart::config::REQUEST_TIMEOUT_MS;
 use crate::lovart::connection::{
     load_dot_env, reload_dot_env, resolve_connection, update_env_keys, AUTO_CONFIRM_KEY,
 };
@@ -32,6 +33,8 @@ use crate::lovart::prompt::{parse_prompts, ParseOptions, PromptDefaults, PromptT
 use crate::service::api::RunSource;
 use crate::service::snapshot::{is_retryable, unchanged_payload};
 use lovart_core::service::{Draft, Workbench};
+
+use crate::assistant::{self, ChatError, ChatState, ChatStore};
 
 // ── 命令 ──────────────────────────────────────────────────────────────
 
@@ -1301,6 +1304,311 @@ pub fn workspace_dir() -> Result<PathBuf, String> {
     Ok(install)
 }
 
+// ── AI 对话（`docs/plan/21`）─────────────────────────────────────────────
+//
+// 六条命令形状一致：**业务失败也走 `Ok`**（`{status:'error', …}`），`Err` 只留给崩溃。
+// `ChatError` 不是 `String` ⇒ 想让失败走 `Err` 必须手写转换，不会顺手写出来（ADR-0004）。
+//
+// 每个命令都重建一次 `ChatConfig`（读进程环境）：手改 `.env` 后下一条命令就生效，
+// 不在内存里缓存配置（那是第二处真相）。
+
+fn chat_config(state: &tauri::State<'_, Arc<Workbench>>) -> assistant::ChatConfig {
+    assistant::ChatConfig::from_env(state.chat_system_prompt_file())
+}
+
+/// 独立窗口的 label（`docs/plan/22`）。
+const ASSISTANT_WINDOW: &str = "assistant";
+
+/// 告诉**另一个窗口**"状态变了" —— 只广播事实，不推状态：
+/// 真相在 `chat-history.json` 里，另一边自己重读一次即可（不搞快照/增量合并）。
+fn emit_changed(window: &tauri::Window) {
+    let other = if window.label() == ASSISTANT_WINDOW {
+        "main"
+    } else {
+        ASSISTANT_WINDOW
+    };
+    let _ = window.app_handle().emit_to(other, "assistant://changed", ());
+}
+
+/// 短事务：锁 → 刷新配置 → 改一项 → 回全量 `ChatState`。
+fn with_chat<F>(
+    state: &tauri::State<'_, Arc<Workbench>>,
+    chat: &tauri::State<'_, Arc<Mutex<ChatStore>>>,
+    window: &tauri::Window,
+    action: F,
+) -> Value
+where
+    F: FnOnce(&mut ChatStore) -> Result<ChatState, ChatError>,
+{
+    let mut guard = chat.lock().unwrap_or_else(|error| error.into_inner());
+    guard.set_config(chat_config(state));
+    match action(&mut guard) {
+        Ok(next) => {
+            emit_changed(window);
+            json!({ "status": "ok", "state": next })
+        }
+        Err(error) => error.to_json(),
+    }
+}
+
+#[tauri::command]
+fn assistant_get_state(
+    state: tauri::State<'_, Arc<Workbench>>,
+    chat: tauri::State<'_, Arc<Mutex<ChatStore>>>,
+    window: tauri::Window,
+) -> Result<Value, String> {
+    Ok(with_chat(&state, &chat, &window, |store| store.state()))
+}
+
+#[tauri::command]
+fn assistant_new(
+    state: tauri::State<'_, Arc<Workbench>>,
+    chat: tauri::State<'_, Arc<Mutex<ChatStore>>>,
+    window: tauri::Window,
+) -> Result<Value, String> {
+    Ok(with_chat(&state, &chat, &window, |store| {
+        store.new_conversation()
+    }))
+}
+
+#[tauri::command]
+fn assistant_switch(
+    state: tauri::State<'_, Arc<Workbench>>,
+    chat: tauri::State<'_, Arc<Mutex<ChatStore>>>,
+    window: tauri::Window,
+    id: String,
+) -> Result<Value, String> {
+    Ok(with_chat(&state, &chat, &window, |store| store.select(&id)))
+}
+
+#[tauri::command]
+fn assistant_rename(
+    state: tauri::State<'_, Arc<Workbench>>,
+    chat: tauri::State<'_, Arc<Mutex<ChatStore>>>,
+    window: tauri::Window,
+    id: String,
+    title: String,
+) -> Result<Value, String> {
+    Ok(with_chat(&state, &chat, &window, |store| {
+        store.rename(&id, &title)
+    }))
+}
+
+#[tauri::command]
+fn assistant_delete(
+    state: tauri::State<'_, Arc<Workbench>>,
+    chat: tauri::State<'_, Arc<Mutex<ChatStore>>>,
+    window: tauri::Window,
+    id: String,
+) -> Result<Value, String> {
+    Ok(with_chat(&state, &chat, &window, |store| store.delete(&id)))
+}
+
+/// 发送：**锁只持有两小段**（取快照 / 追加本轮），请求在锁外（`I-2`）。
+///
+/// ⚠️ **必须 `async` + `spawn_blocking`**：这一步是阻塞 HTTP + 轮询（最长 60 秒）。
+/// 写成同步命令会占住 IPC 线程 —— 发送期间整个界面（看板轮询、按钮、拖拽）全部停摆，
+/// 用户看到的就是"非常的卡"。业务层逻辑一行没变，只是把阻塞工作挪出 IPC 线程。
+#[tauri::command]
+async fn assistant_send(
+    state: tauri::State<'_, Arc<Workbench>>,
+    chat: tauri::State<'_, Arc<Mutex<ChatStore>>>,
+    transport: tauri::State<'_, Arc<Mutex<Option<assistant::lovart_chat::LovartCompletion>>>>,
+    window: tauri::Window,
+    conversation_id: String,
+    text: String,
+    image_paths: Vec<String>,
+) -> Result<Value, String> {
+    let workbench = state.inner().clone();
+    let store = chat.inner().clone();
+    let slot = transport.inner().clone();
+
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        {
+            let mut guard = store.lock().unwrap_or_else(|error| error.into_inner());
+            guard.set_config(assistant::ChatConfig::from_env(
+                workbench.chat_system_prompt_file(),
+            ));
+        }
+        let arg = assistant::SendArg {
+            conversation_id,
+            text,
+            image_paths,
+        };
+
+        // 上游通道懒建一次并常驻：`LovartCompletion` 自持 project 缓存，
+        // 每条命令重建就会每句话都建一个新 project。
+        // ⚠️ `try_lock`：上一条还在等回复时**立刻告诉用户**，而不是让第二条在后台排队
+        // （排队等于"点一下没反应"，也就是用户说的卡）。
+        let mut guard = match slot.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return assistant::SendResult::NotSent(assistant::ChatError::Upstream {
+                    kind: assistant::UpstreamKind::Io,
+                    why: "上一条还在等回复，等它回来再发（这条没有发出去）".to_string(),
+                })
+            }
+        };
+        if guard.is_none() {
+            // 凭据拿不到 ⇒ **业务失败走 Ok**（不是 Err）：插件要看到 not_sent + 文案。
+            let missing_credentials = |why: String| {
+                assistant::SendResult::NotSent(assistant::ChatError::MissingConfig {
+                    missing: vec![assistant::MissingPart::Credentials],
+                    prompt_path: workbench.chat_system_prompt_file().display().to_string(),
+                    why: why,
+                })
+            };
+            let connection = match resolve_connection() {
+                Ok(connection) => connection,
+                Err(error) => return missing_credentials(format!("网关凭据不可用：{error}")),
+            };
+            let mut deps = match to_client_deps(&connection) {
+                Ok(deps) => deps,
+                Err(error) => return missing_credentials(format!("网关凭据不可用：{error}")),
+            };
+            // 对话的总预算沿用出图那个"单请求"口径（plan 23 §5：不自造数值）
+            deps.task_timeout = std::time::Duration::from_millis(REQUEST_TIMEOUT_MS);
+            *guard = Some(assistant::lovart_chat::LovartCompletion::new(deps));
+        }
+        let transport = guard.as_ref().expect("刚建好");
+        assistant::send(&store, &arg, transport)
+    })
+    .await
+    .map_err(|error| format!("发送线程异常：{error}"))?;
+
+    if matches!(joined, assistant::SendResult::Ok { .. }) {
+        emit_changed(&window);
+    }
+    Ok(joined.to_json())
+}
+
+// ── AI 对话：独立窗口（`docs/plan/22`）─────────────────────────────────
+//
+// 窗口归 Rust 管（开/关/停靠各一条命令）：前端拿不到窗口对象，就不可能出现两处关闭逻辑。
+
+#[tauri::command]
+async fn open_assistant_window(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window(ASSISTANT_WINDOW) {
+        // 已经开着 ⇒ 只提到前面（重复点「↗」不该开出第二个窗口）
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+        return Ok(());
+    }
+
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        ASSISTANT_WINDOW,
+        tauri::WebviewUrl::App("index.html".into()),
+    )
+    .title("AI 对话")
+    .inner_size(420.0, 780.0)
+    .min_inner_size(320.0, 420.0)
+    // **不要系统标题栏**：否则最上面一排是「— □ ×」、下面一排是我们自己的
+    // 「+ 📌 ×」，两排按钮、两个关闭键。窗口由插件顶栏承担标题栏职责
+    // （`data-tauri-drag-region` 提供拖动区）。
+    .decorations(false)
+    .resizable(true)
+    // 标记"这是对话窗口"：`app.js` 靠它早退，不跑主界面那套轮询/拖放
+    .initialization_script("window.__ASSISTANT_WINDOW__ = true;")
+    .build()
+    .map_err(|error| format!("打不开对话窗口：{error}"))?;
+    Ok(())
+}
+
+/// 把本机图片塞进对话窗口（主窗口「发送到 AI 对话」的唯一出口）。
+///
+/// ⚠️ 不直接 `emit` 图片：窗口可能是**这一刻才新建**的，监听器还没注册 ⇒ 事件会丢。
+/// 所以先入队、再通知，窗口起来后自己取（`assistant_take_pending`）。
+/// 主窗口 → 对话窗口的一次性交接队列。
+///
+/// 为什么是模块级 static 而不是 Tauri managed state：它只承载"开窗前塞进来的图片"，
+/// 生命周期是**一次命令**；做成全局托管状态反而多一处需要清理的东西。
+static PENDING_ATTACH: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+#[tauri::command]
+async fn assistant_attach(app: tauri::AppHandle, paths: Vec<String>) -> Result<(), String> {
+    {
+        let mut pending = PENDING_ATTACH
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for path in paths {
+            if !pending.contains(&path) {
+                pending.push(path);
+            }
+        }
+    }
+    open_assistant_window(app.clone()).await?;
+    if let Some(window) = app.get_webview_window(ASSISTANT_WINDOW) {
+        let _ = window.set_focus();
+    }
+    let _ = app.emit_to(ASSISTANT_WINDOW, "assistant://attach", ());
+    Ok(())
+}
+
+/// 取走待加图片（窗口启动与收到通知时各调一次；取走即清）。
+#[tauri::command]
+fn assistant_take_pending() -> Vec<String> {
+    let mut pending = PENDING_ATTACH
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    std::mem::take(&mut *pending)
+}
+
+/// 把主窗口叫回来（对话窗口顶栏的「主页面」按钮调）。
+///
+/// 只做三件事：还原、显示、聚焦 —— 不新建窗口（主窗口是应用本体，
+/// 它被关掉就等于退出程序，这里不会出现 `None` 之外的情况）。
+#[tauri::command]
+fn open_main_window(app: tauri::AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "主窗口不存在".to_string())?;
+    window
+        .unminimize()
+        .map_err(|error| format!("还原主窗口失败：{error}"))?;
+    window
+        .show()
+        .map_err(|error| format!("显示主窗口失败：{error}"))?;
+    window
+        .set_focus()
+        .map_err(|error| format!("聚焦主窗口失败：{error}"))?;
+    Ok(())
+}
+
+/// 对话窗口置顶开关（前端图钉按钮调；默认不置顶）。
+#[tauri::command]
+fn set_assistant_on_top(app: tauri::AppHandle, on_top: bool) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window(ASSISTANT_WINDOW) {
+        window
+            .set_always_on_top(on_top)
+            .map_err(|error| format!("置顶失败：{error}"))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn close_assistant_window(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window(ASSISTANT_WINDOW) {
+        window
+            .close()
+            .map_err(|error| format!("关不掉对话窗口：{error}"))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn dock_assistant_window(app: tauri::AppHandle) -> Result<(), String> {
+    // 先让主窗口把面板打开、再关窗：反过来会出现"窗口没了、面板也没开"的空档
+    let _ = app.emit_to("main", "assistant://dock", ());
+    if let Some(window) = app.get_webview_window(ASSISTANT_WINDOW) {
+        window
+            .close()
+            .map_err(|error| format!("关不掉对话窗口：{error}"))?;
+    }
+    Ok(())
+}
+
 /// 开窗口。**只有 `main` 在无子命令时才会调到这里**。
 pub fn run() {
     // ⚠️ 双击启动时当前目录是 `/`，不能直接用 —— 理由与判据见 [`workspace_dir`]。
@@ -1314,12 +1622,25 @@ pub fn run() {
     // 锁路径由 `Workbench` 给：与 `state_file` / `output_dir` 同一处定义（ADR-0001）。
     let core = Workbench::new(cwd);
     let lock_path = core.lock_path();
+    // 会话真相文件的唯一写者：路径只从 `Workbench` 的具名访问器取（plan 19），
+    // 构造在 `.manage(core)` 之前（`core` 随后被 move 进 Tauri）。
+    let chat_store = Mutex::new(ChatStore::new(
+        core.chat_history_file(),
+        assistant::ChatConfig::from_env(core.chat_system_prompt_file()),
+    ));
     tauri::Builder::default()
         // 原生文件对话框（`pick_prompt_file` 用它）：提示词文件不绑定 `inbox/`。
         .plugin(tauri_plugin_dialog::init())
         .manage(core)
         // 看板缓存只在 GUI 层（service 无缓存 ⇒ HTTP 不可能拿到 unchanged）。
         .manage(Mutex::new(GuiViewCache::default()))
+        // AI 对话：唯一的并发闸（`I-3`），不另造第二把锁。
+        // `Arc` 是给 `assistant_send` 用的：阻塞网络要丢到阻塞线程池（见那条命令的注释）。
+        .manage(Arc::new(chat_store))
+        // 对话的上游通道懒建一次（它自持 project 缓存，重建会每句话建一个 project）
+        .manage(Arc::new(Mutex::new(
+            None::<assistant::lovart_chat::LovartCompletion>,
+        )))
         .setup(move |app| {
             // `state.jsonl` 只有一个写者（`engine::lockfile` 文件头）。
             // 放在 setup 而不是 `run()` 开头：抢不到时要能弹对话框 ——
@@ -1391,7 +1712,20 @@ pub fn run() {
             save_settings,
             set_auto_confirm,
             set_spend_mode,
-            stop_run
+            stop_run,
+            assistant_get_state,
+            assistant_new,
+            assistant_switch,
+            assistant_rename,
+            assistant_delete,
+            assistant_send,
+            open_assistant_window,
+            assistant_attach,
+            assistant_take_pending,
+            open_main_window,
+            set_assistant_on_top,
+            close_assistant_window,
+            dock_assistant_window
         ])
         .run(tauri::generate_context!())
         .expect("启动窗口失败");

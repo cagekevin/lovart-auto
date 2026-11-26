@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>lovart</title>
 <link rel="stylesheet" href="style.css" />
+<!-- AI 对话插件样式：只作用于 `.ap-root` 内部，整目录拷走也带着它 -->
+<link rel="stylesheet" href="assistant-plugin/style.css" />
 </head>
 <body>
 
@@ -70,6 +72,9 @@
     <span class="auto-switch-dot" aria-hidden="true"></span>
     <span id="spendModeLabel">花积分关</span>
   </button>
+  <!-- AI 对话：入口放**右上角**（与右侧吸附浮层同一侧，形态照 maomao 的顶栏入口）。
+       它不在工具条里：那条工具条是「一次出图要什么」，对话不是出图。 -->
+  <button class="btn btn-sm btn-quiet" id="btnAssistant" title="AI 对话（纯文本，不出图）">AI 对话</button>
   <button class="btn btn-sm btn-quiet" id="btnSettings">设置</button>
 </header>
 
@@ -274,6 +279,9 @@
     <!-- 「发送到素材库」= **复制**进 `data/library/`。来源只从 viewer 已有的两个变量取
          （`viewerFile` / `data:` 图）；URL 图没有"复制"语义 ⇒ 由 app.js 禁用。 -->
     <button class="viewer-btn" id="viewerSendToLibrary">发送到素材库</button>
+    <!-- 「发送到 AI 对话」= 点图进对话框的入口（素材库 / 看板大图 / 垫图都从这里过）。
+         只认本机路径：`http(s)` 的图不是本机文件，发给模型要重新下载 ⇒ 由 app.js 说明。 -->
+    <button class="viewer-btn" id="viewerSendToChat">发送到 AI 对话</button>
   </div>
 </div>
 
@@ -376,6 +384,16 @@
   </div>
 </div>
 
+<!-- ══ AI 对话 ══
+     内容全部由 `ui/assistant-plugin/` 渲染进 `#assistantRoot`。
+     ⚠️ **不是模态弹窗**：形态照 maomao（`AgentPanel` 是 `absolute top-0 right-0 bottom-0 z-30`
+     的右侧贴边浮层，没有遮罩）。做成 `.mask` 会把"点图进对话"这条第一性挡死 ——
+     面板一开就点不了素材库、也点不了大图上的「发送到 AI 对话」。
+     z-index 低于 `.mask`(50) 与 `.viewer`(100)：素材库/大图会**盖在它上面**，关掉就回到它。 -->
+<aside class="assistant-dock" id="assistantDock" hidden aria-label="AI 对话">
+  <div id="assistantRoot"></div>
+</aside>
+
 <!-- ══ 设置 ══ -->
 <div class="mask" id="maskSettings" hidden>
   <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
@@ -454,6 +472,9 @@
 </div>
 
 <input class="visually-hidden" id="refPicker" type="file" accept="image/*" multiple />
+<!-- 素材库可一次选多张（用户裁定 2026-11-26：先试用，不好用再删）——
+     但**逐张发送、失败逐张报**，不做"已放入 N 张"这类汇总/计数：
+     多选不等于需要有人替它们总结（同一个失败只说一次，ADR-0003）。 -->
 <input class="visually-hidden" id="libraryPicker" type="file" accept="image/*" multiple />
 
 <!-- `tauri.js` 必须最先：`presets.js` / `library.js` 的命令代理都用它的 `invoke` -->
@@ -463,6 +484,11 @@
 <script src="presets.js"></script>
 <script src="library.js"></script>
 <script src="promptMention.js"></script>
+<!-- AI 对话插件：顺序固定（index 最后装配前三个）-->
+<script src="assistant-plugin/store.js"></script>
+<script src="assistant-plugin/render.js"></script>
+<script src="assistant-plugin/ui.js"></script>
+<script src="assistant-plugin/index.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
