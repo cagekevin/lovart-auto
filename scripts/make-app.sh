@@ -4,7 +4,7 @@
 #
 #   ./scripts/make-app.sh          # 或：make app
 #
-# 产出：仓库根目录下的 `lovart.app`（同一份二进制；带参数跑就是 CLI）。
+# 产出：仓库根目录下的 `lovart.app`（自包含二进制，双击开图形界面）。
 #
 # ── 为什么要有这个脚本（而不是手敲命令）──────────────────────────────
 # 手敲过一次，两次之间就会漂：漏了图标、忘了 ad-hoc 签名、Info.plist 少一个键，
@@ -64,7 +64,7 @@ plutil -lint "$APP/Contents/Info.plist" >/dev/null
 
 echo
 echo "✅ 完成：$APP"
-echo "   双击 = 图形界面；命令行 = $APP/Contents/MacOS/lovart-client --help"
+echo "   双击 = 图形界面"
 echo
 echo "⚠️ 工作区（.env / inbox / var / output 的根）由程序自己判定，顺序见"
 echo "   src-tauri/src/gui.rs 的 workspace_dir()：.app 同级目录是仓库 ⇒ 就用它。"

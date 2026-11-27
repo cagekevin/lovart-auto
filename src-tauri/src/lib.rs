@@ -28,10 +28,8 @@
 //! | 6 | `gui`（Tauri）+ 前端 `ui/` | ✅ |
 //! | 7 | **对账已通过 ⇒ TS 参照实现已退场** | ✅ |
 
-pub mod cli;
 pub mod gui;
 pub mod http;
-pub mod run;
 
 // 协议层与调度层已移入 `crates/lovart-core`（该 crate 的 Cargo.toml 没有 tauri，
 // 在那边写 `use tauri::…` 是 E0432 —— 结构护栏，不是扫描闸）。

@@ -2,7 +2,7 @@
 //!
 //! 原先在 `run.rs`（入口层），而 `engine::scheduler` 反向调用 `crate::run::write_report`。
 //! 拆 `lovart-core` 后入口层不在 core 里 ⇒ 反向依赖编译不过（E0433），
-//! 因此下沉到 engine 内部；`run.rs` 只 re-export，不留第二份实现。
+//! 因此下沉到 engine 内部；`run.rs` 后来已删除，这里是唯一实现。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

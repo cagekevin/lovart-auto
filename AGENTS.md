@@ -1,7 +1,7 @@
 # AGENTS.md · lovart 自动生图的干活规则
 
 > 本仓的**流程规则**只写在这里。`daily/架构日志/index.md`、`债务.md`、`scripts/*.mjs` 的注释都指向本文件，别在别处再写一份。
-> 判据不在这里：用户要什么看 `README.md`（AI 四步）与 `docs/详细说明.md`；架构判据看 `docs/adr/`；写计划看 `docs/写plan的方法-删除测试.md`；找债看 `docs/找债务的方法-存在理由审查.md`；区域日志怎么填看 `daily/架构日志/_template.md`。
+> 判据不在这里：用户要什么看 `README.md` 与 `docs/详细说明.md`；架构判据看 `docs/adr/`；写计划看 `docs/写plan的方法-删除测试.md`；找债看 `docs/找债务的方法-存在理由审查.md`；区域日志怎么填看 `daily/架构日志/_template.md`。
 
 ## 开工确认（硬性）
 
@@ -45,7 +45,7 @@
 | 路径 | 拥有 |
 | --- | --- |
 | `crates/lovart-core/` | 领域与引擎：`assistant/`（LLM 对话：会话真相文件的唯一写者 · 请求组装 · 非流式信封，**不属于出图网关**）、`fsio.rs`（`write_atomic`：tmp → rename，横跨两层共用 ⇒ 放 crate 根，不许塞进 `engine/` 或 `lovart/`）、`lovart/`（client · contract · models · prompt · task · attachments · config · connection · errors · media_type · project）、`engine/`（scheduler · state · settings · intake · refs · download · group · report · runlog · session · lockfile · text）、`service/`（api · files · library · meta · refs · snapshot · wiring · workbench）。**这个 crate 的 `Cargo.toml` 里没有 tauri** ⇒ 写 `use tauri::…` 是编译错误，不需要任何 grep 检查 |
-| `src-tauri/` | 只留入口与适配：`run.rs`（CLI）、`gui.rs`（GUI）、`http.rs`（本机 HTTP）、`cli.rs`（参数）、`main.rs`、`lib.rs`。GUI 与 CLI 是**同一个二进制** |
+| `src-tauri/` | 只留入口与适配：`gui.rs`（GUI）、`http.rs`（本机 HTTP）、`main.rs`、`lib.rs`。CLI 已删除（2026-11-27） |
 | `ui/` | 无框架前端：`index.html` · `app.js` · `presets.js` · `library.js` · `tauri.js` · `refStrip.js` · `promptChips.js` · `promptMention.js` · `style.css` · `assistant-plugin/`（AI 对话插件：自包含、零本仓 import，靠 adapters 接宿主）· `tests/`（前端零依赖单测，`node --test`）。编译期嵌入二进制 |
 | `fixtures/` | 黄金用例（JSONL）：回放断言用，改行为要同步 |
 | `data/` | **唯一的运行数据根**（`docs/plan/19`）：`.env` · `prompts.jsonl` · `inbox/` · `presets/` · `library/`（素材库）· `output/` · `var/`（state / report / run.log / refs / cache / lock）· `chat-history.json`（AI 对话会话真相，整表原子写）· `chat-system-prompt.txt`（对话系统提示词，纯文本）。启动幂等迁移旧根目录布局（`service::workbench::migrate_layout`）；`git clean -xdf` 会删 `data/` ⇒ 动之前先备份 |
@@ -57,7 +57,7 @@
 | `daily/架构日志/` | 轮次日志 = 探债明细真源；`债务.md` = 一行摘要；`index.md` = 生成物。三者不互相复述 |
 | `packaging/` | `icon.png`（图标源）· `macos/Info.plist`：打包输入（唯一根，原 `assets/` 已并入） |
 
-数据流概要：`data/inbox/*.jsonl` →（`--check` 校验字段 / 模型别名 / ratio / size）→ `engine::scheduler` 提交 Lovart → `data/var/state.jsonl`（`FileLock` 独占，**单写者**）→ `data/output/` + `data/var/report.csv` + `data/var/run.log`。没有 `docs/architecture.md`；要补数据流就到本文这张表下补，别再开第三个文档。
+数据流概要：`data/inbox/*.jsonl` →（GUI 导入 / `POST /tasks` 校验字段 / 模型别名 / ratio / size）→ `engine::scheduler` 提交 Lovart → `data/var/state.jsonl`（`FileLock` 独占，**单写者**）→ `data/output/` + `data/var/report.csv` + `data/var/run.log`。没有 `docs/architecture.md`；要补数据流就到本文这张表下补，别再开第三个文档。
 
 **目录归属判据（唯一一处，`docs/plan/19`）**：运行数据全部在 `data/` 下按用途分子目录；源码与打包输入不进 `data/`；新增目录先改本节 Map + `.gitignore`，再让 `Workbench` 加具名访问器（`src-tauri/` 里不许裸用 `cwd()` 拼业务目录）。
 
@@ -109,14 +109,14 @@
 
 ### 5.2 动手后（三件事，缺一件不算做完）
 
-**① 垂直删净**：`pub` 声明 / 导出 → 注册与分发（`mod.rs`、`main.rs` / `run.rs` 的分支、`tauri::command` 注册表）→ 实现与状态 → 导入与构建清单（`Cargo.toml`、`ui/` 嵌入路径）→ `fixtures/` 用例 → 文档与索引（README、详细说明、ADR 落点、区域日志）→ 专属测试 → 不再需要的依赖与脚本。
+**① 垂直删净**：`pub` 声明 / 导出 → 注册与分发（`mod.rs`、`main.rs` 的分支、`tauri::command` 注册表）→ 实现与状态 → 导入与构建清单（`Cargo.toml`、`ui/` 嵌入路径）→ `fixtures/` 用例 → 文档与索引（README、详细说明、ADR 落点、区域日志）→ 专属测试 → 不再需要的依赖与脚本。
 
 **② 分环验证，分开报**：
 
 1. **残留检查**：grep 被删的名字 / 字符串 / 路径 / 参数，计数必须为 0（含注释与文档）。
 2. **决定性检查**：删错就会红的那个 —— `cargo test --workspace <过滤名>`、`node --check ui/app.js`，或出包后手跑一条。
 3. **探针**：`scripts/probe.mjs` 注入 → 精确断言（退出码 + 命中串）→ 无条件还原。证明「这条检查真的会拦」。
-4. **边界对比**：对外承诺的形状逐字段比 —— `prompts.jsonl` 字段、`--status --json` 输出、`var/state.jsonl` 行形状。
+4. **边界对比**：对外承诺的形状逐字段比 —— `prompts.jsonl` 字段、`GET /state` 输出、`var/state.jsonl` 行形状。
 5. **diff 审计**：读失败与清理路径、二次运行（`var/state.jsonl` 已存在时重跑）、每个调用点。
 6. **复杂度与重复**：跑 `node scripts/scan.mjs`，把改动前后 CRAP 最高的几行、重复对数比一比 —— 数字变差说明复杂度只是搬到了别处，回去改结构，不要改表。
 

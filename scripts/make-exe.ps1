@@ -5,7 +5,7 @@
 
 .DESCRIPTION
     Windows 上本工具的交付形态就是**一个自包含的 exe**（对标 macOS 的 `lovart.app`）：
-    双击 = 图形界面，带参数 = 无头 CLI，**同一个二进制**。
+    双击 = 图形界面；其他程序走本机 HTTP（127.0.0.1:17863）。
 
     ── 为什么要有这个脚本（而不是手敲 cargo build）────────────────────
     手敲会漂：忘了生成 `.ico` ⇒ exe 顶着默认图标；没进 MSVC 环境 ⇒ 链接器
@@ -195,7 +195,7 @@ Copy-Item -Path $Bin -Destination $Out -Force
 
 Write-Host ''
 Write-Host "✅ 完成：$Out"
-Write-Host '   双击 = 图形界面；命令行 = .\lovart-client.exe --help'
+Write-Host '   双击 = 图形界面'
 Write-Host ''
 Write-Host '⚠️ 工作区 = 程序所在目录（唯一判据，见 gui.rs::install_dir_from_exe）：'
 Write-Host '   Windows 取 exe 同目录；macOS 取 .app 同级。首次启动会在那里建 data/。'
