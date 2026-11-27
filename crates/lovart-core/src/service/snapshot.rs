@@ -1,7 +1,7 @@
 //! 看板投影 —— **唯一**把 `state.jsonl` 变成界面的地方。
 //!
 //! GUI 的 `get_state`、CLI 的 `--status --json`（以及下一步的 HTTP `/state`）都只能走这里；
-//! 原先这套代码分在 `run.rs`（`build_status_json`）与 `gui.rs`（`view_input` / `finish_payload`），
+//! 原先这套代码分在 `run.rs`（已删除，`build_status_json`）与 `gui.rs`（`view_input` / `finish_payload`），
 //! 搬进 `service` 是为了让"另一个前端"也能拿到**同一份**看板。
 //!
 //! 依赖方向：`service → engine`（这里只读 `state` 与分组判据，不写状态）。

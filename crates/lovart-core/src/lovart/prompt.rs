@@ -184,7 +184,7 @@ pub struct PromptTask {
     /// 源文件里的行号（1 起），便于排错。
     pub line: u32,
     /// 本行 `refs` 声明的原始参考图输入（本机路径 / URL / `data:`），**相对 cwd**。
-    /// 空 ⇒ 该行回退到命令行 `--ref`；两者都没有 ⇒ 文生图。
+    /// 空 ⇒ 该行没有垫图，走文生图。
     pub ref_inputs: Option<Vec<String>>,
     /// 垫图的**本机文件路径**（真相）。发送前才临时上传成 CDN 地址。
     pub ref_files: Option<Vec<String>>,

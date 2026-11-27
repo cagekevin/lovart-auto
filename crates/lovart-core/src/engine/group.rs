@@ -4,7 +4,7 @@
 //! 前端若自己再写一遍 `['pending','submitting',…]`，就是第二份真源 ——
 //! 本仓栽过的那个坑（两处同名不同口径）。所以分组随状态一起下发。
 //!
-//! 原先这四个函数在 `run.rs`（入口层），而 `engine::scheduler` 反向调用它们
+//! 原先这四个函数在 `run.rs`（已删除），而 `engine::scheduler` 反向调用它们
 //! （`crate::run::is_board_open`）。拆 `lovart-core` 后入口层不在 core 里，
 //! 这个反向依赖直接编译不过（E0433）—— 因此下沉到本模块，方向改成
 //! `scheduler → group`（同层，单向）。

@@ -525,7 +525,7 @@ pub struct TaskRecord {
     pub submitted_at: Option<String>,
     /// **进入当前 `status`** 的时刻（ISO 字符串）。**仅在 status 变化时**写。
     ///
-    /// 用途：看板给**生产中的任务**算「已持续 12:30」（`run.rs` 的 `elapsed_text`）；
+    /// 用途：看板给**生产中的任务**算「已持续 12:30」（原 `run.rs` 的 `elapsed_text`，run.rs 已删除）；
     /// 排队 / 待确认 / 终态**不用它计时**，终态只取它的绝对时刻当「结束」。
     /// ⚠️ 不能用 `updated_at` 顶替 —— `finish()` 里 `update(id, { readyAt: 0 })`
     /// 会**顺带刷新** `updated_at`，于是「别人一完成，你的时间戳就被改了」。

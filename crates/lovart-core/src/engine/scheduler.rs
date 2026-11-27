@@ -254,7 +254,7 @@ impl AutoConfirm {
 /// 调度器的全部可调数值 —— **一处定义，两个入口共用**。
 ///
 /// 为什么不是一个字段一个字段地摊在 [`SchedulerOptions`] 里：
-/// 原先 `run.rs` 与 `gui.rs` 各写一份
+/// 原先 `run.rs`（已删除）与 `gui.rs` 各写一份
 /// `SchedulerOptions { task_timeout: …, recheck_timeout: …, /* ×11 */ }`，
 /// 加字段必漏一边（`docs/plan/07` R1-6）。收进一个结构体后，构造点只多一行 `tuning`。
 ///
@@ -594,7 +594,7 @@ struct Shared {
     /// 花积分开关（与 `Workbench` 的花积分开关共享同一个原子量 ⇒ 切换立即生效）。
     ///
     /// ⚠️ 它**只**决定「提交前把服务端设成哪条通道」，不参与排队、不进 `Ctx`、
-    ///    不落盘。CLI 恒 `false`（命令行永远免费）。
+    ///    不落盘。只由 GUI 设置页写；测试桩恒 `false`（不花积分）。
     spend_mode: Arc<AtomicBool>,
     /// 「垫图来源 → CDN 地址」的进程内缓存。
     ///
@@ -1857,7 +1857,7 @@ pub struct SchedulerConfig {
     pub tuning: SchedulerTuning,
     pub retry_failed: bool,
     pub auto_confirm: Arc<AutoConfirm>,
-    /// 花积分开关（GUI 的顶栏 chip 写它）；CLI 恒 `false`（命令行永远免费）。
+    /// 花积分开关（GUI 的顶栏 chip 写它）；测试桩恒 `false`（不花积分）。
     pub spend_mode: Arc<AtomicBool>,
     pub log: LogFn,
     pub ports: Option<Arc<dyn Ports>>,
@@ -2344,7 +2344,8 @@ impl Scheduler {
     }
 }
 
-/// 一次性跑完：起调度器 → 投喂 → 等空闲 → 关停。**CLI 专用**。
+/// 一次性跑完：起调度器 → 投喂 → 等空闲 → 关停。**集成测试用**
+/// （CLI 入口已于 2026-11-27 删除；生产路径走 `Workbench` 的常驻调度器）。
 pub fn run_scheduler(options: SchedulerOptions) -> Result<SchedulerSummary, LovartError> {
     let SchedulerOptions {
         deps,
@@ -2368,9 +2369,9 @@ pub fn run_scheduler(options: SchedulerOptions) -> Result<SchedulerSummary, Lova
         auto_confirm,
         log,
         ports,
-        // CLI 没有花积分开关：命令行永远免费（GUI / CLI 共用 `var/.lock`，不会并存）。
+        // 测试桩不花积分：花积分开关只由 GUI 设置页写。
         spend_mode: Arc::new(AtomicBool::new(false)),
-        // CLI 自己打印摘要，不需要回调。
+        // 测试桩不关心会话封口回调。
         on_session_end: None,
     })?;
     scheduler.enqueue(batch)?;
