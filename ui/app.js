@@ -3599,13 +3599,18 @@ function numberOrNull(input) {
  * 用 `textContent` 而不是 `innerHTML`：告警里可能带 `.env` 原文（用户填的值），
  * 拼进 HTML 就是注入。
  */
-function renderSettingsNote(warnings, maxWallClockMin) {
+function renderSettingsNote(warnings, maxWallClockMin, pendingRestart) {
   const lines = [];
   if (Number.isFinite(maxWallClockMin)) {
     lines.push(
       `新任务单轮上限 ≈ ${maxWallClockMin} 分（单任务超时 + 复查超时 × 超时次数）。` +
         '超时不会重新提交，也不会重复扣费。',
     );
+  }
+  // 哪些项要重启才生效 —— **后端算的**（`Settings::drift`），前端只显示。
+  // 不在这儿写死「重启后生效」：那句话会和代码再漂一次（`docs/plan/29`）。
+  if (Array.isArray(pendingRestart) && pendingRestart.length > 0) {
+    lines.push(`⟳ 这些项要重启程序才生效：${pendingRestart.join(' / ')}`);
   }
   for (const warning of warnings || []) {
     lines.push(`⚠️ ${warning}`);
@@ -3634,7 +3639,7 @@ async function openSettings() {
       $('setPollInterval').value = value.pollIntervalSec;
       $('setPollMaxInterval').value = value.pollMaxIntervalSec;
       renderDefaultSelects(value);
-      renderSettingsNote(value.warnings, value.maxWallClockMin);
+      renderSettingsNote(value.warnings, value.maxWallClockMin, value.pendingRestart);
     }
     openMask('maskSettings');
   } catch (error) {
@@ -3673,15 +3678,23 @@ async function saveSettings() {
     notice(`保存失败：${error}`);
     return;
   }
-  // 后端已 `reload_dot_env`：兜底参数立刻用起来，无需重启。
+  // 后端已 `reload_dot_env`：凭据与兜底参数立刻用起来，无需重启。
   applyDefaultSettings(payload);
   // 保存成功但带告警（reload 失败 / 已修复非法值）⇒ **不关面板**，就地说明。
   if (result && Array.isArray(result.warnings) && result.warnings.length > 0) {
-    renderSettingsNote(result.warnings, result.maxWallClockMin);
+    renderSettingsNote(result.warnings, result.maxWallClockMin, result.pendingRestart);
     notice('设置已保存，但有告警需要看一眼');
     return;
   }
+  // 有项要重启才生效 ⇒ **不关面板**、就地列出是哪几项；否则用户看到面板消失，
+  // 会以为连并发都生效了（`docs/plan/29` §5 的行为变化就发生在这里）。
+  if (result && Array.isArray(result.pendingRestart) && result.pendingRestart.length > 0) {
+    renderSettingsNote([], result.maxWallClockMin, result.pendingRestart);
+    notice('已保存。上面列出的项要重启程序才生效');
+    return;
+  }
   closeMask('maskSettings');
+  notice('设置已保存');
 }
 
 // ── 启动 ─────────────────────────────────────────────────────────────

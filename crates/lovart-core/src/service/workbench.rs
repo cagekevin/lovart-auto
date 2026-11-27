@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::engine::intake::TaskInput;
 use crate::engine::lockfile::FileLock;
@@ -17,9 +17,7 @@ use crate::engine::scheduler::{
 };
 use crate::engine::settings::Settings;
 use crate::engine::state::{StateStore, StateStoreOptions};
-use crate::lovart::connection::{
-    load_dot_env, read_auto_confirm, reload_dot_env, resolve_connection,
-};
+use crate::lovart::connection::{load_dot_env, read_auto_confirm, resolve_connection};
 use crate::service::wiring::to_client_deps;
 
 /// 外部递送进来的一条草稿（**不是任务**：不写 `state.jsonl`、不占槽、不开跑）。
@@ -175,6 +173,16 @@ pub struct Workbench {
     intake_lock: Mutex<()>,
     /// 外部递送进来的草稿（**只在内存**：关 GUI 即消失，不写 `state.jsonl`）。
     drafts: Mutex<DraftsStore>,
+    /// **本进程生效的批次参数** —— 唯一来源，`Workbench::new` 写一次，之后只读。
+    ///
+    /// ── 为什么必须是它，而不是「再读一次环境」 ──────────────────────────
+    /// 调度器的 `Ctx` 在 `Scheduler::start` 时拿一份快照并冻结到进程结束（`docs/plan/29` F1），
+    /// 而看板/报告/打开输出文件夹原先各自读环境 ⇒ 同一个 `output_dir` 两个来源，
+    /// 保存设置后「看板按新目录查、报告写旧目录」。这里只留一份，两边都读它。
+    ///
+    /// ⚠️ **保存设置不写这里**：批次参数的生效点是进程启动。要改就重启
+    /// （`Settings::drift` 负责算出「文件与生效值差在哪」，界面据此提示）。
+    effective: RwLock<Arc<Settings>>,
 }
 
 impl Workbench {
@@ -186,6 +194,17 @@ impl Workbench {
         // 自动确认开关只认 `.env`（不读进程环境变量）。非法值 / 读失败 ⇒ 关 + 一条告警。
         let env_path = data_dir(&cwd).join(".env");
         let (auto_confirm, auto_confirm_warning) = read_auto_confirm(&env_path);
+
+        // **批次参数的唯一读取点**（`docs/plan/29`）：读文件，读一次，写进 `effective`。
+        // 读不出来 ⇒ 用内置默认并告警，不静默（ADR-0008）。
+        let (effective, settings_warnings) = match Settings::from_file(&env_path) {
+            Ok((settings, warnings)) => (settings, warnings),
+            Err(error) => (
+                Settings::default(),
+                vec![format!("读不了 .env，批次参数按内置默认：{error}")],
+            ),
+        };
+
         let state = Arc::new(Self {
             cwd,
             alerts: Mutex::new(Vec::new()),
@@ -197,10 +216,11 @@ impl Workbench {
             scheduler: Mutex::new(None),
             intake_lock: Mutex::new(()),
             drafts: Mutex::new(DraftsStore::default()),
+            effective: RwLock::new(Arc::new(effective)),
         });
 
-        // ⚠️ 启动就把 `.env` 载进来：设置里的「并发数 / 输出文件夹」也住在那里，
-        //    不先载入，`get_settings` 读到的永远是默认值（= 设置界面是假的）。
+        // ⚠️ 启动就把 `.env` 载进来：凭据（`resolve_connection`）与兜底参数
+        //    （`PromptDefaults::from_env`）都只读进程环境，不载入它们就是默认值。
         //
         // 失败**必须上报**：载入失败 ⇒ 后面所有读环境变量的地方都拿到默认值 ⇒
         // 设置界面显示的是**假配置**。原先是 `let _ =`，等于把这件事藏起来（DEBT TD-05-24）。
@@ -213,9 +233,7 @@ impl Workbench {
         if let Some(warning) = auto_confirm_warning {
             state.push_alert(&warning);
         }
-        // 设置里的非法值（兜底参数 + 新增的 8 个键）：**启动就说**，
-        // 否则用户会以为设置生效了。此刻 `from_env` ≈ 文件（`load_dot_env` 刚跑完）。
-        let (_, settings_warnings) = Settings::from_env();
+        // 设置里的非法值：**启动就说**，否则用户会以为设置生效了。
         for warning in settings_warnings {
             state.push_alert(&warning);
         }
@@ -242,6 +260,11 @@ impl Workbench {
     /// ⚠️ 返回**克隆**而不是 guard：调用方随后会锁 `Mutex<Ctx>`，若拿着槽锁去锁它，
     /// 任何反向路径都会死锁（`docs/plan/09` §1.5.3）。
     pub fn ensure_scheduler(self: &Arc<Self>) -> Result<Scheduler, String> {
+        // ⚠️ **先取设置快照，再拿槽锁**：`effective()` 自己不锁槽，但反过来的顺序
+        //    （持槽锁去读设置）一旦有人给读设置加锁，就是同线程重入死锁。
+        //    `docs/plan/29` §3.1 记着上一版正是死在这里。
+        let settings = self.effective();
+
         let mut slot = self
             .scheduler
             .lock()
@@ -250,15 +273,11 @@ impl Workbench {
             return Ok(scheduler.clone());
         }
 
-        // 每次创建前重新载入 `.env`（覆盖语义）：手改后点提交仍要用新值。
-        reload_dot_env(&self.env_path())?;
-        let (settings, warnings) = Settings::from_file(&self.env_path())
-            .map_err(|error| format!("读不了 .env：{error}"))?;
-        for warning in &warnings {
-            self.push_alert(&format!("⚠️ {warning}"));
-        }
+        // ⚠️ **不再重读 `.env`**（2026-11-27，`docs/plan/29`）：批次参数的生效点只有
+        //    进程启动那一处。这里若再读一次，就出现「第一次投喂后参数变了、之后不变」的
+        //    第二个时点 —— 那是本轮要消掉的半态。
         let connection = resolve_connection()?;
-        let deps = to_client_deps(&connection)?;
+        let deps = to_client_deps(&connection, &settings)?;
         crate::engine::runlog::init(self.run_log_file());
 
         let weak = Arc::downgrade(self);
@@ -379,12 +398,19 @@ impl Workbench {
         self.data_dir().join("library")
     }
 
+    /// **本进程生效的批次参数**（唯一来源；`Workbench::new` 写一次，之后只读）。
+    ///
+    /// 读它不碰磁盘、不读环境、不拿调度器槽锁 —— 看板每 3 秒调一次，量级可忽略。
+    pub fn effective(&self) -> Arc<Settings> {
+        Arc::clone(&self.effective.read().unwrap_or_else(|error| error.into_inner()))
+    }
+
     pub fn output_dir(&self) -> PathBuf {
-        // 1Hz 的 `get_state` 会调它：读环境（微秒级），不读盘。
-        // 手改 `.env` 的目录要等点「开始」才统一（N19）—— 这里刻意不跟文件，
-        // 否则每秒做一次磁盘 I/O。
+        // 与写报告用的是**同一个值**（`Ctx.output_dir` 取自这里）：同一批任务不可能
+        // 出现「看板按新目录查、报告写旧目录」。改动它要重启程序（`docs/plan/29`）。
+        //
         // ⚠️ `OUTPUT_DIR` 的相对路径按 `data/` 解析（plan 19 §3.3）；绝对路径原样用。
-        self.data_dir().join(Settings::from_env().0.output_dir)
+        self.data_dir().join(&self.effective().output_dir)
     }
 
     /// 记一条**批次级**告警（用户必须看到的事）。
@@ -563,6 +589,56 @@ mod tests {
             std::fs::read_to_string(data_dir(&dir).join("prompts.jsonl")).unwrap(),
             "new"
         );
+    }
+
+    /// **S1**：`output_dir` 只认启动快照，不跟文件、不跟环境。
+    ///
+    /// 这条是 `docs/plan/29` 的核心：同一批任务不可能出现「看板按新目录查、报告写旧目录」。
+    /// 它必须**会红** —— 把 `output_dir()` 改回读文件/读环境，这条立刻挂。
+    #[test]
+    fn output_dir_只认启动快照() {
+        let dir = temp_dir("effective-out");
+        std::fs::create_dir_all(data_dir(&dir)).expect("建 data");
+        std::fs::write(data_dir(&dir).join(".env"), "LOVART_OUTPUT_DIR=旧目录\n")
+            .expect("写 .env");
+
+        let wb = Workbench::new(dir.clone());
+        assert_eq!(wb.output_dir(), data_dir(&dir).join("旧目录"));
+
+        // 手改文件（等价于「点了保存但没重启」）⇒ 生效值不动。
+        std::fs::write(data_dir(&dir).join(".env"), "LOVART_OUTPUT_DIR=新目录\n")
+            .expect("改 .env");
+        assert_eq!(
+            wb.output_dir(),
+            data_dir(&dir).join("旧目录"),
+            "批次参数只在启动时读一次：保存后不重启，看板与报告都必须还是旧目录"
+        );
+    }
+
+    /// **S2**：`ensure_scheduler` 不重读 `.env`（没有第二个写入时点）。
+    ///
+    /// 判据是 `effective` 这个 `Arc` 从头到尾是同一个 —— 它一旦被重写，
+    /// 就说明有人在别处又读了一次文件。
+    #[test]
+    fn effective_建调度器前后是同一份() {
+        let dir = temp_dir("effective-arc");
+        std::fs::create_dir_all(data_dir(&dir)).expect("建 data");
+        std::fs::write(data_dir(&dir).join(".env"), "LOVART_CONCURRENCY=3\n").expect("写 .env");
+
+        let wb = Workbench::new(dir.clone());
+        let before = wb.effective();
+        assert_eq!(before.concurrency, 3);
+
+        // 改文件后建调度器：`ensure_scheduler` 若还重读 `.env`，`effective` 就会被换掉。
+        // 这里不断言 `ensure_scheduler` 的返回值（它要凭据、要开状态文件），
+        // 只断言「读文件这件事没有第二个时点」这个不变量。
+        std::fs::write(data_dir(&dir).join(".env"), "LOVART_CONCURRENCY=5\n").expect("改 .env");
+        let after = wb.effective();
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "effective 必须是同一个 Arc：换掉它 = 出现了第二个生效时点"
+        );
+        assert_eq!(after.concurrency, 3, "仍是启动时的值");
     }
 
     #[test]

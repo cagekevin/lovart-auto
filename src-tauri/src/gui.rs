@@ -726,7 +726,7 @@ async fn resume_one(
 #[tauri::command]
 fn preview_confirm(state: tauri::State<'_, Arc<Workbench>>, id: String) -> Result<Value, String> {
     let (_record, thread_id) = confirmable(&state, &id)?;
-    let deps = to_client_deps(&resolve_connection()?)?;
+    let deps = to_client_deps(&resolve_connection()?, &state.effective())?;
     let result =
         crate::lovart::client::get_result(&deps, &thread_id).map_err(|error| error.to_string())?;
     // ⚠️ 刻意分成 `found` + `detail` 两件，**不归一成一个 `null`**：
@@ -788,7 +788,7 @@ async fn confirm_task(
     // 跑批中也允许确认：写回走调度器锁内，与 worker 串行（旧的「先停止」闸撤掉）。
 
     // ⚠️ **花钱的那一下，全仓只此一处**。
-    let deps = to_client_deps(&resolve_connection()?)?;
+    let deps = to_client_deps(&resolve_connection()?, &state.effective())?;
     crate::lovart::client::confirm_thread(&deps, &thread_id)
         .map_err(|error| format!("确认失败：{error}"))?;
 
@@ -856,10 +856,17 @@ fn retry_abnormal(state: tauri::State<'_, Arc<Workbench>>) -> Result<String, Str
 /// · 没有 `threadId` 的（上次连提交都没跑完）返回 `upstream: null` —— 上游没有这个东西，
 ///   无从探测，这不是错误。
 /// 探测的**实现**（不绑 Tauri，阻塞式网络请求全在这里）。
-fn probe_unfinished_core(env_path: &Path, state_file: &Path) -> Result<Value, String> {
+///
+/// `settings` 由调用方给（`Workbench::effective()`）：探测是**只读一次性**动作，
+/// 但它用的是同一份批次参数，不另开第二个读环境的口子（`docs/plan/29`）。
+fn probe_unfinished_core(
+    env_path: &Path,
+    state_file: &Path,
+    settings: &Settings,
+) -> Result<Value, String> {
     load_dot_env(env_path)?;
     let connection = resolve_connection()?;
-    let deps = to_client_deps(&connection)?;
+    let deps = to_client_deps(&connection, settings)?;
     let store = StateStore::open_read_only(state_file)
         .map_err(|error| error.to_string())?;
 
@@ -916,8 +923,9 @@ async fn probe_unfinished(
 ) -> Result<Value, String> {
     let env_path = state.env_path();
     let state_file = state.state_file();
+    let settings = state.effective();
     let probes = tauri::async_runtime::spawn_blocking(move || {
-        probe_unfinished_core(&env_path, &state_file)
+        probe_unfinished_core(&env_path, &state_file, &settings)
     })
         .await
         .map_err(|error| format!("探测线程异常退出：{error}"))?;
@@ -1136,8 +1144,10 @@ fn open_output_dir(state: tauri::State<'_, Arc<Workbench>>) -> Result<(), String
 fn get_settings(state: tauri::State<'_, Arc<Workbench>>) -> Result<Value, String> {
     // **读文件**，不读进程环境（`docs/plan/07` N7）：
     // 手改 `.env` 后打开设置页，若读环境会显示旧值，用户一点保存就把手改覆盖掉。
-    // 设置页显示 = 文件内容 = 点「开始」后的生效值（`start_run` 会 reload）。
     let (current, warnings) = Settings::from_file(&state.env_path())?;
+    // **文件值 ≠ 生效值**的那几个键：由 `drift` 算，界面只渲染（`docs/plan/29`）。
+    // 不在这里手写「重启后生效」——那句话会和代码再漂一次。
+    let pending_restart = current.drift(&state.effective());
     Ok(json!({
         "accessKey": current.access_key,
         "secretKey": current.secret_key,
@@ -1158,6 +1168,8 @@ fn get_settings(state: tauri::State<'_, Arc<Workbench>>) -> Result<Value, String
         "defaultSize": current.default_size,
         // 「单轮最长」也由后端算：前端插值显示即可。
         "maxWallClockMin": current.max_wall_clock_min(),
+        // 空 = 文件与生效值一致（没有待重启的项）。
+        "pendingRestart": pending_restart,
         "warnings": warnings,
     }))
 }
@@ -1193,14 +1205,22 @@ fn save_settings(state: tauri::State<'_, Arc<Workbench>>, payload: Value) -> Res
             "已写入 .env，但重新载入失败：{error}；请重启后再跑"
         ));
     }
-    // 保存后重算「单轮上限」：前端据此刷新只读提示，**不让前端自己算**（N17）。
-    let max_wall_clock_min = Settings::from_file(&path)
-        .map(|(saved, _)| saved.max_wall_clock_min())
-        .unwrap_or_else(|_| current.max_wall_clock_min());
+    // 保存后重算「单轮上限」+「哪些项要重启」：**同一次读文件**（N17 不让前端自己算）。
+    // `pendingRestart` 用刚写盘的文件比生效值，而不是拿 `current` 拼：差异写的语义是
+    // 「只改被改的那几项」，用 `current` 算会把这次没碰的键也当成没变（结论来源不对）。
+    let (max_wall_clock_min, pending_restart) = match Settings::from_file(&path) {
+        Ok((saved, _)) => (
+            saved.max_wall_clock_min(),
+            saved.drift(&state.effective()),
+        ),
+        // 读不回刚写的文件（极少见）：上限沿用保存前的，待重启项**不猜**。
+        Err(_) => (current.max_wall_clock_min(), Vec::new()),
+    };
     Ok(json!({
         "warnings": warnings,
         "updated": updates.len(),
         "maxWallClockMin": max_wall_clock_min,
+        "pendingRestart": pending_restart,
     }))
 }
 
@@ -1462,7 +1482,7 @@ async fn assistant_send(
                 Ok(connection) => connection,
                 Err(error) => return missing_credentials(format!("网关凭据不可用：{error}")),
             };
-            let mut deps = match to_client_deps(&connection) {
+            let mut deps = match to_client_deps(&connection, &workbench.effective()) {
                 Ok(deps) => deps,
                 Err(error) => return missing_credentials(format!("网关凭据不可用：{error}")),
             };

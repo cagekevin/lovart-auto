@@ -4,12 +4,16 @@
 //! 就会出现「GUI 卡 10 分钟、CLI 没上限」这种已经发生过的漂移
 //! （见 `docs/plan/07` 的 R1-1）。入口已收敛为 GUI / HTTP，两边都只准调这里。
 //!
-//! ── 三个入口，一份解析 ──────────────────────────────────────────────
+//! ── 两个入口，一份解析 ──────────────────────────────────────────────
 //! | 入口 | 用途 | 读什么 |
 //! |---|---|---|
-//! | [`Settings::from_file`] | 设置页 / `save_settings` 的「当前值」 | `.env` 文本 |
-//! | [`Settings::from_env`]  | 跑批 / CLI / `to_client_deps` | 进程环境（`load_dot_env` 之后） |
-//! | [`Settings::from_pairs`]| 上面两个的唯一实现 | 键值对 |
+//! | [`Settings::from_file`] | 设置页 / `save_settings` 的「当前值」/ 批次参数的**唯一**来源 | `.env` 文本 |
+//! | [`Settings::from_pairs`]| 上面那个的唯一实现 | 键值对 |
+//!
+//! ⚠️ **没有 `from_env`**（2026-11-27 删除，`docs/plan/29`）：批次参数一旦能从进程环境
+//! 再读一次，就必然出现「看板读环境、报告读快照」这类两个来源的半态。
+//! 进程环境只服务**逐条任务取值**的兜底参数（`PromptDefaults::from_env`）与凭据
+//! （`resolve_connection`），它们各自只有一个入口。
 //!
 //! 设置页读文件而不是读环境，是因为「手改 `.env` → 打开设置 → 点保存」
 //! 会把环境里的旧值写回去，**覆盖手改**（`docs/plan/07` N7）。
@@ -45,26 +49,6 @@ pub const MAX_BUSY_RETRIES_KEY: &str = "LOVART_MAX_BUSY_RETRIES";
 pub const DOWNLOAD_RETRIES_KEY: &str = "LOVART_DOWNLOAD_RETRIES";
 pub const POLL_INTERVAL_KEY: &str = "LOVART_POLL_INTERVAL_MS";
 pub const POLL_MAX_INTERVAL_KEY: &str = "LOVART_POLL_MAX_INTERVAL_MS";
-
-/// [`Settings::from_env`] 要遍历的全部键。
-pub const SETTING_KEYS: &[&str] = &[
-    ACCESS_KEY,
-    SECRET_KEY,
-    CONCURRENCY_KEY,
-    OUTPUT_DIR_KEY,
-    TASK_INTERVAL_KEY,
-    TASK_TIMEOUT_KEY,
-    RECHECK_TIMEOUT_KEY,
-    MAX_ATTEMPTS_KEY,
-    MAX_TIMEOUTS_KEY,
-    MAX_BUSY_RETRIES_KEY,
-    DOWNLOAD_RETRIES_KEY,
-    POLL_INTERVAL_KEY,
-    POLL_MAX_INTERVAL_KEY,
-    DEFAULT_MODEL_KEY,
-    DEFAULT_RATIO_KEY,
-    DEFAULT_SIZE_KEY,
-];
 
 // ── 默认值（唯一；生产代码与测试都从这里取）───────────────────────────
 
@@ -355,25 +339,6 @@ impl Settings {
         Ok((settings, all))
     }
 
-    /// 读进程环境（`.env` 由 `load_dot_env` / `reload_dot_env` 载入）。
-    ///
-    /// 与 [`Self::from_file`] 共用 `from_pairs` —— 不允许出现第二份解析。
-    pub fn from_env() -> (Self, Vec<String>) {
-        let owned: Vec<(String, String)> = SETTING_KEYS
-            .iter()
-            .filter_map(|key| {
-                std::env::var(key)
-                    .ok()
-                    .map(|value| ((*key).to_string(), value))
-            })
-            .collect();
-        Self::from_pairs(
-            owned
-                .iter()
-                .map(|(key, value)| (key.as_str(), value.as_str())),
-        )
-    }
-
     // ── 派生 ──────────────────────────────────────────────────────────
 
     pub fn task_timeout(&self) -> Duration {
@@ -406,6 +371,58 @@ impl Settings {
     pub fn max_wall_clock_min(&self) -> u64 {
         ms_to_minutes(self.task_timeout_ms)
             + ms_to_minutes(self.recheck_timeout_ms) * u64::from(self.max_timeouts)
+    }
+
+    /// **文件值 ≠ 生效值**的那些键（空 = 一致）。
+    ///
+    /// ── 为什么要有它 ──────────────────────────────────────────────────
+    /// 批次参数的生效点是进程启动（`docs/plan/29`）。保存设置之后，`.env` 已经变了、
+    /// 运行中的批次没变 —— 这时界面上说「已保存」就是在骗人，说「重启后生效」又是在
+    /// 文档里写死一句可能再次漂移的话。**差异由这里算，界面只负责显示**：
+    /// 同一份事实只有一个产出点，不靠谁记得改文案。
+    ///
+    /// 比较的是**解析后的生效值**，不是原始文本：`.env` 里写 `3` 和 `3.0` 解析后相同，
+    /// 那就没有差异，不该提示重启。
+    ///
+    /// ⚠️ 凭据与兜底参数**不在比较范围**：它们保存后立刻生效（`reload_dot_env`），
+    /// 不存在「重启才生效」。列进来就会让界面提示一次根本不存在的重启。
+    pub fn drift(&self, file: &Settings) -> Vec<&'static str> {
+        let mut keys: Vec<&'static str> = Vec::new();
+        let mut push = |changed: bool, key: &'static str| {
+            if changed {
+                keys.push(key);
+            }
+        };
+        push(file.concurrency != self.concurrency, CONCURRENCY_KEY);
+        push(file.output_dir != self.output_dir, OUTPUT_DIR_KEY);
+        push(
+            file.task_interval_ms != self.task_interval_ms,
+            TASK_INTERVAL_KEY,
+        );
+        push(file.task_timeout_ms != self.task_timeout_ms, TASK_TIMEOUT_KEY);
+        push(
+            file.recheck_timeout_ms != self.recheck_timeout_ms,
+            RECHECK_TIMEOUT_KEY,
+        );
+        push(file.max_attempts != self.max_attempts, MAX_ATTEMPTS_KEY);
+        push(file.max_timeouts != self.max_timeouts, MAX_TIMEOUTS_KEY);
+        push(
+            file.max_busy_retries != self.max_busy_retries,
+            MAX_BUSY_RETRIES_KEY,
+        );
+        push(
+            file.download_retries != self.download_retries,
+            DOWNLOAD_RETRIES_KEY,
+        );
+        push(
+            file.poll_interval_ms != self.poll_interval_ms,
+            POLL_INTERVAL_KEY,
+        );
+        push(
+            file.poll_max_interval_ms != self.poll_max_interval_ms,
+            POLL_MAX_INTERVAL_KEY,
+        );
+        keys
     }
 }
 
@@ -898,6 +915,62 @@ mod tests {
             updates,
             vec![(TASK_TIMEOUT_KEY, DEFAULT_TASK_TIMEOUT_MS.to_string())],
             "非法值必须在保存时被修掉，否则每次打开都告警"
+        );
+    }
+
+    // ── drift：文件值 ≠ 生效值（`docs/plan/29`）────────────────────────
+    //
+    // 这是「界面说重启才生效」的唯一事实来源。它错了，界面就会在
+    // 「其实已生效」时说重启、在「其实没生效」时说已保存 —— 两种都是说谎。
+
+    #[test]
+    fn s19_drift_相同为空() {
+        let (settings, _) = pairs(&[(CONCURRENCY_KEY, "3")]);
+        assert!(
+            settings.drift(&settings).is_empty(),
+            "同一份设置与自己比，不许报差异"
+        );
+    }
+
+    #[test]
+    fn s20_drift_只报真变了的键() {
+        let (effective, _) = pairs(&[(CONCURRENCY_KEY, "3")]);
+        let (file, _) = pairs(&[(CONCURRENCY_KEY, "5"), (TASK_TIMEOUT_KEY, "7200000")]);
+        assert_eq!(
+            file.drift(&effective),
+            vec![CONCURRENCY_KEY, TASK_TIMEOUT_KEY],
+            "差异必须是**批次参数**里真变了的那几个，且按固定顺序"
+        );
+    }
+
+    #[test]
+    fn s21_drift_不报凭据与兜底参数() {
+        // 凭据与兜底参数保存后立刻生效（`reload_dot_env`），列进来就是提示一次
+        // 根本不存在的重启。
+        let (effective, _) = pairs(&[]);
+        let (file, _) = pairs(&[
+            (ACCESS_KEY, "新 AK"),
+            (SECRET_KEY, "新 SK"),
+            (DEFAULT_MODEL_KEY, "nano-bn-2"),
+            (DEFAULT_RATIO_KEY, "3:4"),
+            (DEFAULT_SIZE_KEY, "2K"),
+        ]);
+        assert!(
+            file.drift(&effective).is_empty(),
+            "凭据 / 兜底参数不进批次参数快照，不许出现在重启提示里：{:?}",
+            file.drift(&effective)
+        );
+    }
+
+    #[test]
+    fn s22_drift_比的是生效值不是原文() {
+        // `.env` 里写 `3000` 与 `03000` 解析后相同 ⇒ 没有差异。按文本比会误报重启。
+        let (effective, _) = pairs(&[(TASK_INTERVAL_KEY, "3000")]);
+        let (file, _) = pairs(&[(TASK_INTERVAL_KEY, "03000")]);
+        assert_eq!(file.task_interval_ms, effective.task_interval_ms);
+        assert!(
+            file.drift(&effective).is_empty(),
+            "解析后相同就是没有差异"
         );
     }
 
