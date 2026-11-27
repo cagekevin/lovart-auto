@@ -1899,6 +1899,10 @@ select:focus { border-color: var(--ink); }
   grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
   gap: var(--sp-2);
   overflow: auto;
+  /* 行与行不许被撑开：`flex:1` 拿到的是 `.dialog-mid` 的剩余高度，
+     grid 默认 `align-content: stretch` 会把这堆余量**摊进行间距**，
+     于是 gap 明明只有 8px，看起来却空出一大条。 */
+  align-content: start;
 }
 
 .library-tile { position: relative; }
@@ -1912,7 +1916,8 @@ select:focus { border-color: var(--ink); }
   border-radius: var(--r-sm);
   background: var(--bg-sub);
   overflow: hidden;
-  aspect-ratio: 1;
+  /* 素材以竖图为主（3:4）；正方形会把竖图上下裁掉一大截。 */
+  aspect-ratio: 3 / 4;
 }
 
 .library-pick img {
