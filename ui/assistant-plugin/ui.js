@@ -230,6 +230,7 @@
       if (event.button !== 0) return;
       event.preventDefault();
       grip.setPointerCapture(event.pointerId);
+      composer.classList.add('is-resizing');
       const startY = event.clientY;
       const startH = textarea.offsetHeight;
       // 上限按窗口高度算，不写死一个数（窗口被拉窄/拉矮时不会把消息区挤没）
@@ -242,6 +243,7 @@
         textarea.style.height = `${next}px`;
       };
       const onUp = () => {
+        composer.classList.remove('is-resizing');
         grip.removeEventListener('pointermove', onMove);
         grip.removeEventListener('pointerup', onUp);
         grip.removeEventListener('pointercancel', onUp);

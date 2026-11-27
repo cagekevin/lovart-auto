@@ -281,6 +281,8 @@
 /* ── 底部 OneBox ──────────────────────────────────────────────────── */
 
 .ap-root .agent-composer {
+  /* 抓手要**压在上边框上** ⇒ 需要定位祖先 */
+  position: relative;
   border-top: 1px solid var(--line, #e7e7e9);
   padding: 8px 10px 10px;
 }
@@ -324,19 +326,45 @@
 }
 
 /* 输入框高度拖拽手柄：贴在输入卡片顶边的一条细带，hover 才显形（不占视觉） */
+/* 平时**什么都不显示**（只有光标变 row-resize）；拖动时那条线就画在抓手正中，
+   所以"看到线的地方"与"能按住拖的地方"是同一处（此前用负 margin + hover 底色，
+   两者错开，还会常驻一条灰条）。 */
 .ap-root .agent-composer-grip {
-  flex: none;
-  height: 10px;
-  margin: -4px 0 2px;
+  /* 12px 高、垂直居中压在 `border-top` 上：上 6px 探进消息区、下 6px 在卡片内。
+     这样"你按的那条线"就是"卡片上边框那条线"，不再差一个 padding。 */
+  position: absolute;
+  top: -6px;
+  left: 0;
+  right: 0;
+  z-index: 2;
+  height: 12px;
+  margin: 0;
   border-radius: 3px;
   cursor: row-resize;
   background: transparent;
   touch-action: none;
 }
 
-.ap-root .agent-composer-grip:hover,
-.ap-root .agent-composer-grip:active {
-  background: var(--line, #e7e7e9);
+.ap-root .agent-composer-grip::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 44px;
+  height: 2px;
+  transform: translate(-50%, -50%);
+  border-radius: 2px;
+  background: transparent;
+}
+
+/* 只有按下拖动时才出现，且就在抓手的中线上 */
+.ap-root .agent-composer-grip:active::after {
+  background: var(--agent-accent, #3b82f6);
+}
+
+/* 拖动期间：卡片上边框跟着变色 —— 手指在这条线上，线在反馈"我在动" */
+.ap-root .agent-composer.is-resizing {
+  border-top-color: var(--agent-accent, #3b82f6);
 }
 
 .ap-root .agent-textarea {
