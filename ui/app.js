@@ -1456,6 +1456,27 @@ function forgetDrafts(ids) {
 }
 
 /**
+ * 从待发里清掉若干项（**唯一入口**）：手动「清空」、JSONL「保存并应用」、
+ * 发布成功后的收尾都走它。
+ *
+ * ⚠️ 必须**同时**删后端草稿：草稿真身在 `Workbench.drafts`（内存，不随队列变化），
+ *    只清数组的话，下一轮 `syncDrafts` 一旦发现草稿 id 列表有变化就会把它们全部加回来
+ *    （表现就是"清空了过一会又回来"）。
+ *
+ * @param {Set<object>|null} only 只清这些队列项（按对象身份）；不给 = 全清。
+ *   发布用得上：`await` 期间 `syncDrafts` 可能刚加进新草稿，那些不能连后端一起删。
+ */
+function clearQueue(only = null) {
+  const gone = only ? queue.filter((item) => only.has(item)) : [...queue];
+  const rest = only ? queue.filter((item) => !only.has(item)) : [];
+  queue.length = 0;
+  queue.push(...rest);
+  const draftIds = gone.filter((item) => item.draftId).map((item) => item.draftId);
+  if (draftIds.length) forgetDrafts(draftIds);
+  renderQueue();
+}
+
+/**
  * 拉草稿并同步进待发队列。
  *
  * ⚠️ 草稿**不在** `get_state` 里（§2.3），所以跟着看板刷新一起拉 —— 每轮几百字节。
@@ -3130,7 +3151,7 @@ function openJsonlEditor() {
         errors.textContent = result.errors.join('\n');
         return;
       }
-      queue.length = 0;
+      clearQueue();
       for (const task of result.tasks) {
         // `validate_draft` 回来的就是 JSONL 形状（`ratio`/`size`）⇒ 只补一次落盘。
         enqueue({
@@ -3183,8 +3204,7 @@ async function publish() {
   try {
     // 队列条目**就是**契约形状（`intake::TaskInput`）⇒ 只做一份快照，不做字段映射。
     // 快照是必须的：`invoke` 之前要 `await` 落盘，这期间队列可能被追加。
-    // 草稿 id 也先拍快照：下面清空队列后就读不到了。
-    const draftIds = queue.filter((item) => item.draftId).map((item) => item.draftId);
+    const snapshot = [...queue];
     const payload = queue.map((item) => ({ ...item, refs: [...item.refs] }));
     // 垫图可能还在落盘：等它们，否则这一批会**静默少图**（见 `addRefs`）。
     if (pendingRefSaves.size) await Promise.allSettled([...pendingRefSaves]);
@@ -3192,13 +3212,11 @@ async function publish() {
     // 后端已经接单 ⇒ **立刻解锁按钮**。后面的看板刷新是旁路，
     // 万一它慢（探针 / 上千条载荷），也不该让「发送」看起来还没发出去。
     busy = false;
-    queue.length = 0;
-    // 草稿按本次的 id 清（**不全清**：发布期间新到的不受影响）。
-    if (draftIds.length) forgetDrafts(draftIds);
+    // 只清本次快照里的那些：发布期间新到的草稿不受影响（也不连后端一起删）。
+    clearQueue(new Set(snapshot));
     // ⚠️ 编辑框的垫图**不清**：发送后仍留在那儿，等你决定删不删（需求 2）。
     renderRefs();
     closeMentions();
-    renderQueue();
     // 提交后不再等跑完：调度器常驻，后面还可以继续提交、进同一会话排队。
     notice(`已提交 ${count} 条，正在排队`);
     await refreshBoard();
@@ -3949,8 +3967,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   });
   $('btnClearCancel').addEventListener('click', () => closeMask('maskClear'));
   $('btnClearOk').addEventListener('click', () => {
-    queue.length = 0;
-    renderQueue();
+    clearQueue();
     closeMask('maskClear');
   });
 
