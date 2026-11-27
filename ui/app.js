@@ -1866,9 +1866,42 @@ async function removePreset(preset) {
 }
 
 /** 面板「+」选图 → 落盘到 data/presets/ → 进本地态。 */
-async function addPresetImages(files) {
-  if (!presetEditor || !files.length) return;
-  const inputs = await readFilesAsDataUrls(files);
+/**
+ * 图片来源 → 后端能收的**一条**形状（`data:` 字符串或本机绝对路径字符串）。
+ *
+ * - `{kind:'path'}`（拖放给的本机路径）⇒ 原样交给后端 `ImageSource::Path`；
+ * - `{kind:'data'}`（粘贴给的 `File`）⇒ `FileReader` 转 `data:`。
+ *
+ * ⚠️ 这是**唯一**把 `File` 变成可提交值的地方（`ImageIntake.readAsDataUrls` 是它的实现）；
+ *    拖放路径不经过 FileReader —— 大图不白读一遍。
+ */
+async function toImageInputs(sources) {
+  const files = [];
+  const passthrough = [];
+  for (const source of sources || []) {
+    if (!source) continue;
+    if (source.kind === 'path' && source.value) {
+      passthrough.push(source.value);
+    } else if (source.kind === 'data' && source.value) {
+      files.push(source.value);
+    }
+  }
+  const dataUrls = files.length ? await window.ImageIntake.readAsDataUrls(files) : [];
+  return [...passthrough, ...dataUrls];
+}
+
+/**
+ * 两个落点的统一入参：**图片来源数组** `[{ kind:'path'|'data', value }]`。
+ *
+ * 为什么不是 `File[]`：粘贴给的是 `File`（要 FileReader 转 `data:`），
+ * 拖放给的是**本机绝对路径**（Tauri 直接给，不用读内容）。两种形态都存在，
+ * 硬统一成 `File[]` 会让拖放白读一遍大图。改成「来源」这一层抽象：
+ * 生产者各给各的形态，落点只认一种形状，`kind` 分派一次（ADR-0003）。
+ */
+async function addPresetImages(sources) {
+  if (!presetEditor || !sources.length) return;
+  const inputs = await toImageInputs(sources);
+  if (!inputs.length) return;
   const result = await window.Presets.importImages(inputs);
   if (!result.ok) { notice(presetMessage(result)); return; }
   for (const img of result.images) {
@@ -1914,6 +1947,9 @@ async function openLibrary() {
   closeMenu();
   closeMentions();
   openMask('maskLibrary');
+  // 焦点落到弹窗本身：`paste` 只发给可聚焦元素或 document，
+  // 不落焦点的话「打开素材库直接 Ctrl+V」收不到事件（plan 27）。
+  $('maskLibrary').focus();
   await renderLibrary();
 }
 
@@ -2029,19 +2065,20 @@ function closeAssistant() {
 
 /** `File` → 本机路径：先读 data URL，再走 `save_ref_image`（plan 18 的唯一落盘入口）。 */
 async function fileToPath(file) {
-  const dataUrls = await readFilesAsDataUrls([file]);
+  const dataUrls = await window.ImageIntake.readAsDataUrls([file]);
   const dataUrl = dataUrls && dataUrls[0];
   if (!dataUrl) return '';
   return saveRefImage(dataUrl);
 }
 
-/** 粘贴板里的图 → 本机路径数组。没图就返回空数组（默认粘贴行为不变）。 */
+/** 粘贴板里的图 → 本机路径数组。没图就返回空数组（默认粘贴行为不变）。
+ *
+ *  ⚠️ 「clipboardData.items → File[]」的解析只在 `ImageIntake.readPastedFiles` 一份
+ *     （plan 27）；这里是**对话面板 adapter** `pathsFromClipboard` 的实现，
+ *     契约（event → 路径[]）不变 ⇒ 插件侧零改动。
+ */
 async function clipboardImagePaths(event) {
-  const items = Array.from((event.clipboardData && event.clipboardData.items) || []);
-  const files = items
-    .filter((item) => item.kind === 'file' && String(item.type || '').startsWith('image/'))
-    .map((item) => item.getAsFile())
-    .filter(Boolean);
+  const files = window.ImageIntake.readPastedFiles(event);
   const paths = [];
   for (const file of files) {
     const path = await fileToPath(file);
@@ -2051,43 +2088,76 @@ async function clipboardImagePaths(event) {
 }
 
 /**
+ * 图片投喂的两个出口（plan 27）——**裁剪播报**与**选落点**各一层，职责不混。
+ */
+
+/**
+ * 裁剪 + 播报（**唯一**播报点）。
+ *
+ * 数量 / 体积上限是业务数字，常量留在本文件（`MAX_PASTE_IMAGES` / `MAX_PASTE_BYTES`），
+ * 传进通用模块的 `limitFiles`。被拒原因由这里播报一次（ADR-0003 一次法则），
+ * 落点不再判、不再说第二遍。
+ */
+function admitFiles(files) {
+  const { files: kept, rejected } =
+    window.ImageIntake.limitFiles(files, MAX_PASTE_IMAGES, MAX_PASTE_BYTES);
+  if (rejected.length) {
+    const count = rejected.filter((item) => item.reason === 'count').length;
+    const bytes = rejected.filter((item) => item.reason === 'bytes').length;
+    if (count) notice(`一次最多 ${MAX_PASTE_IMAGES} 张图片，超出的已忽略`);
+    if (bytes) notice(`有 ${bytes} 张超过 10MB，已跳过`);
+  }
+  return kept;
+}
+
+/**
+ * **粘贴**的图归谁：按「哪个弹窗开着」选落点。
+ *
+ * ⚠️ 只有粘贴走这里：拖放不走网页层（见 `routeDroppedPaths` 的说明）。
+ *    两条通道不合并 —— 事件源不同、给的形态也不同（`File` vs 本机路径）。
+ * ⚠️ 不判 `presetEditor`：预设图片条只存在于编辑态，`addPresetImages` 自己就
+ *    `if (!presetEditor || !sources.length) return;` ⇒ 列表态粘贴自然无反应
+ *    （用户裁定：不自动进编辑态、不提示）。同一判据只留一处（ADR-0003）。
+ */
+async function routePastedFiles(files) {
+  const admitted = admitFiles(files);
+  if (!admitted.length) return;
+  const sources = admitted.map((file) => ({ kind: 'data', value: file }));
+  if (!$('maskLibrary').hidden) {
+    await addLibraryImages(sources);
+    return;
+  }
+  if (!$('maskPresets').hidden) {
+    await addPresetImages(sources);
+    return;
+  }
+  addRefs(await window.ImageIntake.readAsDataUrls(admitted));
+}
+
+/**
  * 弹窗「＋」：选图 → `data:` → 复制进库 → 网格重列；**面板不关**。
  *
  * ⚠️ 可以一次选多张，但**一张一张发、每张自己说话**：失败由 `sendToLibrary` 逐条报原因，
  *    成功不播报（网格里看得见）。**不许加"已放入 N 张 / M 张没进"这类汇总或计数** ——
  *    多选不等于需要有人替它们总结（用户裁定 2026-11-26；ADR-0003 一次法则）。
  */
-async function addLibraryImages(files) {
-  let dataUrls;
+async function addLibraryImages(sources) {
+  let inputs;
   try {
-    // 唯一读取点（`readFilesAsDataUrls`）；整批读不出来（权限 / 文件被移走）时一次说清。
-    dataUrls = await readFilesAsDataUrls(files);
+    // 唯一转换点（`toImageInputs`）：整批读不出来（权限 / 文件被移走）时一次说清。
+    inputs = await toImageInputs(sources);
   } catch (error) {
     notice(`读不了这些图片：${error}`);
     return;
   }
-  for (const data of dataUrls) {
+  for (const value of inputs) {
     // 一张失败不拦其余；原因已由 `sendToLibrary` 报过，这里不再补第二句。
-    await sendToLibrary({ kind: 'data', value: data });
+    await sendToLibrary({ kind: 'data', value });
   }
   await renderLibrary();
 }
 
 // ── 垫图 ─────────────────────────────────────────────────────────────
-
-/** 文件选择器 → `data:` 的**唯一读取点**（编辑区与预设面板共用）。 */
-async function readFilesAsDataUrls(files) {
-  const out = [];
-  for (const file of files) {
-    out.push(await new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result);
-      reader.onerror = () => reject(reader.error);
-      reader.readAsDataURL(file);
-    }));
-  }
-  return out;
-}
 
 /** 垫图的可读名字（芯片上显示、`@` 弹层里显示）。 */
 function refLabelOf(url, index) {
@@ -2710,23 +2780,77 @@ async function bootAssistantWindow() {
 }
 
 /**
- * 拖进来的图归谁：**对话面板开着就归对话**，否则进垫图。
+ * 拖进窗口的图归谁 —— **唯一入口**（`docs/plan/27` §3.1）。
  *
- * ⚠️ 一次拖拽只能落一处：两处都收 = 编辑区垫图凭空多一张，用户看不出哪来的。
- * 这是宿主的事（拖放通道只有宿主能接，见 plan 21 §3.4）。
+ * ⚠️ 为什么拖放不走网页层：窗口没关 `dragDropEnabled`（Tauri 2 默认开），
+ *    WebView2 **不向网页派发** drag/drop ⇒ 挂在 DOM 上的 `drop` 监听永不触发（实测）。
+ *    拖放只走 Tauri 的 `onDragDropEvent`，这里是它唯一的消费者。
+ *    （粘贴是另一条路：`ImageIntake.installPaste` —— 两个不同的事件源，不合并。）
+ * ⚠️ 落点判据是**鼠标坐标**，不是「弹窗开着」：弹窗开着但把图拖到编辑区，就该进编辑区。
+ * ⚠️ 上限口径：拖放拿到的是**本机路径**（没有 `File.size`）⇒ 这里只卡**数量**，
+ *    体积交给后端 `materialize_image` 那道唯一的闸（64MB）。与粘贴的差别只有来源形态，不是两套规则。
  */
-function routeDroppedPaths(paths) {
-  // 主窗口里只有垫图这一处落点：对话面板不在主窗口（见 `openAssistant`）。
+async function routeDroppedPaths(paths, position, dpr) {
   if (!paths || !paths.length) return;
-  addRefs(paths);
+  const { files: admitted, rejected } = window.ImageIntake.limitPaths(paths, MAX_PASTE_IMAGES);
+  if (rejected.length) notice(`一次最多 ${MAX_PASTE_IMAGES} 张图片，超出的已忽略`);
+  if (!admitted.length) return;
+  const hit = maskAtPoint(position, dpr);
+  if (hit === 'maskLibrary') {
+    // 素材库：逐张落盘，**全部 await** 完再重扫目录 —— 先渲染会扫到还没写完的目录。
+    for (const path of admitted) {
+      await sendToLibrary({ kind: 'path', value: path });
+    }
+    await renderLibrary();
+    return;
+  }
+  if (hit === 'maskPresets') {
+    await addPresetImages(admitted.map((path) => ({ kind: 'path', value: path })));
+    return;
+  }
+  // 没命中弹窗（含弹窗开着但拖在别处）⇒ 老行为：进垫图。
+  addRefs(admitted);
 }
 
-/** 拖进窗口 = 加垫图 / 进 AI 对话（不用瞄准某个小方框）。 */
+/**
+ * 鼠标物理坐标落在哪个**可见**弹窗上；没命中返回 `null`。
+ *
+ * `dpr` 缺省按 `devicePixelRatio` 取：Tauri 给的是物理像素（`PhysicalPosition`），
+ * 而 `getBoundingClientRect()` 是 CSS 像素 —— 不换算的话 2x 屏上会偏一倍。
+ *
+ * ⚠️ `position` 缺失时**不静默**：退回「进编辑区」是旧行为，但要说一声，
+ *    否则用户以为拖进弹窗成功了（图其实落在别处）。
+ */
+function maskAtPoint(position, dpr) {
+  if (!position) {
+    console.warn('[drag] 上游没给 position，无法判断落点：按旧行为进编辑区');
+    return null;
+  }
+  const scale = Number.isFinite(dpr) && dpr > 0 ? dpr : window.devicePixelRatio || 1;
+  const x = position.x / scale;
+  const y = position.y / scale;
+  // 顺序 = 叠放顺序：预设与素材库互斥（点遮罩空白即关），不会同时可见。
+  for (const id of ['maskPresets', 'maskLibrary']) {
+    const node = $(id);
+    if (!node || node.hidden) continue;
+    const rect = node.getBoundingClientRect();
+    if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) return id;
+  }
+  return null;
+}
+
+/** 拖进窗口 = 进垫图 / 弹窗（不用瞄准某个小方框）。 */
 async function wireDropZone() {
   try {
     const { getCurrentWebviewWindow } = window.__TAURI__.webviewWindow;
     await getCurrentWebviewWindow().onDragDropEvent((event) => {
-      if (event.payload.type === 'drop') routeDroppedPaths(event.payload.paths || []);
+      if (event.payload.type === 'drop') {
+        routeDroppedPaths(
+          event.payload.paths || [],
+          event.payload.position,
+          window.devicePixelRatio,
+        );
+      }
     });
   } catch (error) {
     // ⚠️ 原先这里是空 `catch`（注释写「不影响其它功能」）—— 但它影响的是
@@ -3691,23 +3815,11 @@ window.addEventListener('DOMContentLoaded', async () => {
     event.stopPropagation();
 
     // 截图直接粘成垫图：`clipboardData.items` 才看得到图片，`getData('text/plain')` 看不到。
-    const files = Array.from(event.clipboardData?.items || [])
-      .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
-      .map((item) => item.getAsFile())
-      .filter(Boolean);
+    // ⚠️ 粘贴走 `routePastedFiles`（内部过 `admitFiles` 裁剪）；
+    //    「＋」按钮的 picker 直接调落点函数、**不设数量上限**（既有行为，本轮不改）。
+    const files = window.ImageIntake.readPastedFiles(event);
     if (files.length) {
-      if (files.length > MAX_PASTE_IMAGES) {
-        notice(`一次最多粘贴 ${MAX_PASTE_IMAGES} 张图片，超出的已忽略`);
-      }
-      for (const file of files.slice(0, MAX_PASTE_IMAGES)) {
-        if (file.size > MAX_PASTE_BYTES) {
-          notice(`「${file.name || '粘贴的图片'}」超过 10MB，已跳过`);
-          continue;
-        }
-        const reader = new FileReader();
-        reader.onload = () => addRefs([reader.result]);
-        reader.readAsDataURL(file);
-      }
+      void routePastedFiles(files);
       return;
     }
 
@@ -3768,6 +3880,8 @@ window.addEventListener('DOMContentLoaded', async () => {
     if (presetEditor) closePresetEditor();
     else closeMask('maskPresets');
   });
+  // 粘贴图片进预设：仅编辑态接图（`addPresetImages` 自己 return，列表态无反应）。拖放不走网页层。
+  window.ImageIntake.installPaste({ zone: $('maskPresets'), accept: routePastedFiles });
 
   syncComposerState();
 
@@ -3780,11 +3894,13 @@ window.addEventListener('DOMContentLoaded', async () => {
     // 先清 value 再读：再选同一张图仍会触发 change。
     const files = Array.from(event.target.files || []);
     event.target.value = '';
-    if (files.length) await addLibraryImages(files);
+    if (files.length) await addLibraryImages(files.map((file) => ({ kind: 'data', value: file })));
   });
   $('maskLibrary').addEventListener('click', (event) => {
     if (event.target === $('maskLibrary')) closeMask('maskLibrary');
   });
+  // 粘贴图片进素材库：路由由 `routePastedFiles` 按弹窗状态决定（plan 27）。拖放不走网页层。
+  window.ImageIntake.installPaste({ zone: $('maskLibrary'), accept: routePastedFiles });
   document.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape' || $('maskLibrary').hidden) return;
     closeMask('maskLibrary');
@@ -3794,14 +3910,14 @@ window.addEventListener('DOMContentLoaded', async () => {
   $('refPicker').addEventListener('change', async (event) => {
     const files = Array.from(event.target.files || []);
     if (!files.length) return;
-    const dataUrls = await readFilesAsDataUrls(files);
+    const dataUrls = await window.ImageIntake.readAsDataUrls(files);
     addRefs(dataUrls);
     event.target.value = '';
   });
   $('presetRefPicker').addEventListener('change', async (event) => {
     const files = Array.from(event.target.files || []);
     if (!files.length) return;
-    await addPresetImages(files);
+    await addPresetImages(files.map((file) => ({ kind: 'data', value: file })));
     event.target.value = '';
   });
 
