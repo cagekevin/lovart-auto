@@ -1145,9 +1145,6 @@ fn get_settings(state: tauri::State<'_, Arc<Workbench>>) -> Result<Value, String
     // **读文件**，不读进程环境（`docs/plan/07` N7）：
     // 手改 `.env` 后打开设置页，若读环境会显示旧值，用户一点保存就把手改覆盖掉。
     let (current, warnings) = Settings::from_file(&state.env_path())?;
-    // **文件值 ≠ 生效值**的那几个键：由 `drift` 算，界面只渲染（`docs/plan/29`）。
-    // 不在这里手写「重启后生效」——那句话会和代码再漂一次。
-    let pending_restart = current.drift(&state.effective());
     Ok(json!({
         "accessKey": current.access_key,
         "secretKey": current.secret_key,
@@ -1168,8 +1165,6 @@ fn get_settings(state: tauri::State<'_, Arc<Workbench>>) -> Result<Value, String
         "defaultSize": current.default_size,
         // 「单轮最长」也由后端算：前端插值显示即可。
         "maxWallClockMin": current.max_wall_clock_min(),
-        // 空 = 文件与生效值一致（没有待重启的项）。
-        "pendingRestart": pending_restart,
         "warnings": warnings,
     }))
 }
@@ -1205,17 +1200,13 @@ fn save_settings(state: tauri::State<'_, Arc<Workbench>>, payload: Value) -> Res
             "已写入 .env，但重新载入失败：{error}；请重启后再跑"
         ));
     }
-    // 保存后重算「单轮上限」+「哪些项要重启」：**同一次读文件**（N17 不让前端自己算）。
-    // `pendingRestart` 用刚写盘的文件比生效值，而不是拿 `current` 拼：差异写的语义是
-    // 「只改被改的那几项」，用 `current` 算会把这次没碰的键也当成没变（结论来源不对）。
-    let (max_wall_clock_min, pending_restart) = match Settings::from_file(&path) {
-        Ok((saved, _)) => (
-            saved.max_wall_clock_min(),
-            saved.drift(&state.effective()),
-        ),
-        // 读不回刚写的文件（极少见）：上限沿用保存前的，待重启项**不猜**。
-        Err(_) => (current.max_wall_clock_min(), Vec::new()),
-    };
+    // 保存后重算「单轮上限」：前端据此刷新只读提示，**不让前端自己算**（N17）。
+    // 用 `current` 叠加这次写进去的值，**不重读文件** —— 读失败时没有第二个失败分支
+    // 可以兜（原先兜成空数组，界面会显示「不需要重启」而事实未知，`TD-03-3`）。
+    let max_wall_clock_min = settings::max_wall_clock_min_after(&current, &updates);
+    // 「哪些项要重启」= 这次写进去的键里属于批次参数的那些。
+    // 不重读、不逐字段比：`save_updates` 已经知道改了哪些键（同一件事不算两遍）。
+    let pending_restart = settings::pending_restart_keys(&updates);
     Ok(json!({
         "warnings": warnings,
         "updated": updates.len(),

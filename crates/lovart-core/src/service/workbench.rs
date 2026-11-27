@@ -181,7 +181,7 @@ pub struct Workbench {
     /// 保存设置后「看板按新目录查、报告写旧目录」。这里只留一份，两边都读它。
     ///
     /// ⚠️ **保存设置不写这里**：批次参数的生效点是进程启动。要改就重启
-    /// （`Settings::drift` 负责算出「文件与生效值差在哪」，界面据此提示）。
+    /// （保存时 `Settings::pending_restart_keys` 会算出这次改了哪些批次参数，界面据此提示）。
     effective: RwLock<Arc<Settings>>,
 }
 

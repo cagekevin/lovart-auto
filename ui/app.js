@@ -3639,7 +3639,10 @@ async function openSettings() {
       $('setPollInterval').value = value.pollIntervalSec;
       $('setPollMaxInterval').value = value.pollMaxIntervalSec;
       renderDefaultSelects(value);
-      renderSettingsNote(value.warnings, value.maxWallClockMin, value.pendingRestart);
+      // 打开设置页时**不报「待重启」**：批次参数只在进程启动时读一次，
+      // 而没人会在软件开着时改 .env —— 这里报了只会是噪音。
+      // 「哪些要重启」由**保存后**的返回值给出（见 saveSettings）。
+      renderSettingsNote(value.warnings, value.maxWallClockMin, []);
     }
     openMask('maskSettings');
   } catch (error) {

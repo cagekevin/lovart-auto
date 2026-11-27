@@ -372,58 +372,6 @@ impl Settings {
         ms_to_minutes(self.task_timeout_ms)
             + ms_to_minutes(self.recheck_timeout_ms) * u64::from(self.max_timeouts)
     }
-
-    /// **文件值 ≠ 生效值**的那些键（空 = 一致）。
-    ///
-    /// ── 为什么要有它 ──────────────────────────────────────────────────
-    /// 批次参数的生效点是进程启动（`docs/plan/29`）。保存设置之后，`.env` 已经变了、
-    /// 运行中的批次没变 —— 这时界面上说「已保存」就是在骗人，说「重启后生效」又是在
-    /// 文档里写死一句可能再次漂移的话。**差异由这里算，界面只负责显示**：
-    /// 同一份事实只有一个产出点，不靠谁记得改文案。
-    ///
-    /// 比较的是**解析后的生效值**，不是原始文本：`.env` 里写 `3` 和 `3.0` 解析后相同，
-    /// 那就没有差异，不该提示重启。
-    ///
-    /// ⚠️ 凭据与兜底参数**不在比较范围**：它们保存后立刻生效（`reload_dot_env`），
-    /// 不存在「重启才生效」。列进来就会让界面提示一次根本不存在的重启。
-    pub fn drift(&self, file: &Settings) -> Vec<&'static str> {
-        let mut keys: Vec<&'static str> = Vec::new();
-        let mut push = |changed: bool, key: &'static str| {
-            if changed {
-                keys.push(key);
-            }
-        };
-        push(file.concurrency != self.concurrency, CONCURRENCY_KEY);
-        push(file.output_dir != self.output_dir, OUTPUT_DIR_KEY);
-        push(
-            file.task_interval_ms != self.task_interval_ms,
-            TASK_INTERVAL_KEY,
-        );
-        push(file.task_timeout_ms != self.task_timeout_ms, TASK_TIMEOUT_KEY);
-        push(
-            file.recheck_timeout_ms != self.recheck_timeout_ms,
-            RECHECK_TIMEOUT_KEY,
-        );
-        push(file.max_attempts != self.max_attempts, MAX_ATTEMPTS_KEY);
-        push(file.max_timeouts != self.max_timeouts, MAX_TIMEOUTS_KEY);
-        push(
-            file.max_busy_retries != self.max_busy_retries,
-            MAX_BUSY_RETRIES_KEY,
-        );
-        push(
-            file.download_retries != self.download_retries,
-            DOWNLOAD_RETRIES_KEY,
-        );
-        push(
-            file.poll_interval_ms != self.poll_interval_ms,
-            POLL_INTERVAL_KEY,
-        );
-        push(
-            file.poll_max_interval_ms != self.poll_max_interval_ms,
-            POLL_MAX_INTERVAL_KEY,
-        );
-        keys
-    }
 }
 
 /// 毫秒 → 分钟（四舍五入）。
@@ -645,6 +593,79 @@ fn needs_write<T: PartialEq>(
 ) -> bool {
     current.invalid_keys.contains(&key) || payload_value != current_value
 }
+
+/// 一条写入项是不是**批次参数**（保存后要重启才生效的那些）。
+///
+/// ── 为什么按键判，而不是再加一个字段 ──────────────────────────────
+/// `save_updates` 返回的就是「这次写了哪些键」。保存页需要的「哪些项要重启」
+/// 正好是它的一个子集 —— 再读一次文件、再逐字段比一遍（原 `drift`）是同一件事算两次，
+/// 而且「哪些是批次参数」会被写成第二份清单（加字段时忘改就静默漏报）。
+///
+/// 这里只回答一件事：这个键属于批次参数吗。它由 [`BATCH_KEYS`] 一处定义。
+pub fn is_batch_key(key: &str) -> bool {
+    BATCH_KEYS.contains(&key)
+}
+
+/// 从一次保存的写入项里挑出**要重启才生效**的那些（保持 `updates` 的顺序）。
+///
+/// 这是 `save_settings` 唯一需要的派生：它已经知道写了哪些键，不必再读一遍文件。
+/// 原先是「写盘 → 重读文件 → 与生效值逐字段比」，读失败时还得兜一个空数组
+/// （`TD-03-3`：界面于是显示「不需要重启」，而事实未知）。
+/// 现在没有第二次读，也就没有那个失败分支。
+pub fn pending_restart_keys(updates: &[(&'static str, String)]) -> Vec<&'static str> {
+    updates
+        .iter()
+        .map(|(key, _)| *key)
+        .filter(|key| is_batch_key(key))
+        .collect()
+}
+
+/// 保存后的「单轮上限」：把这次写进去的值叠到 `current` 上再算。
+///
+/// 与重读文件算出来的结果**逐字相同** —— 因为 `save_updates` 已经保证
+/// 「写进去的值」就是「文件里该有的值」（差异写 + 非法键重写）。区别只是这里不做 I/O，
+/// 也就没有「读失败怎么办」这个分支。
+pub fn max_wall_clock_min_after(
+    current: &Settings,
+    updates: &[(&'static str, String)],
+) -> u64 {
+    let get = |key: &str| {
+        updates
+            .iter()
+            .find(|(updated, _)| *updated == key)
+            .map(|(_, value)| value.as_str())
+    };
+    let timeout = get(TASK_TIMEOUT_KEY)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(current.task_timeout_ms);
+    let recheck = get(RECHECK_TIMEOUT_KEY)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(current.recheck_timeout_ms);
+    let max_timeouts = get(MAX_TIMEOUTS_KEY)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(current.max_timeouts);
+    ms_to_minutes(timeout) + ms_to_minutes(recheck) * u64::from(max_timeouts)
+}
+
+/// 批次参数的全部键 —— **唯一清单**。
+///
+/// ⚠️ 加一个批次参数时，除了 `Settings` 字段与解析，**必须**加到这里。
+/// 漏了不会编译失败，但会让「保存后要重启」的提示漏报 —— 这是 `TD-03-2` 的残余风险，
+/// 靠 [`batch_keys_cover_all_fields`] 那条测试兜（它比「字段名 → 键名」的映射，
+/// 加字段忘了加键时**会红**）。
+pub const BATCH_KEYS: &[&str] = &[
+    CONCURRENCY_KEY,
+    OUTPUT_DIR_KEY,
+    TASK_INTERVAL_KEY,
+    TASK_TIMEOUT_KEY,
+    RECHECK_TIMEOUT_KEY,
+    MAX_ATTEMPTS_KEY,
+    MAX_TIMEOUTS_KEY,
+    MAX_BUSY_RETRIES_KEY,
+    DOWNLOAD_RETRIES_KEY,
+    POLL_INTERVAL_KEY,
+    POLL_MAX_INTERVAL_KEY,
+];
 
 fn take_u64(
     payload: &serde_json::Value,
@@ -918,60 +939,159 @@ mod tests {
         );
     }
 
-    // ── drift：文件值 ≠ 生效值（`docs/plan/29`）────────────────────────
+    // ── 保存后「哪些项要重启」（`docs/plan/29` + TD-03-2 / TD-03-3）──────
     //
-    // 这是「界面说重启才生效」的唯一事实来源。它错了，界面就会在
-    // 「其实已生效」时说重启、在「其实没生效」时说已保存 —— 两种都是说谎。
+    // 唯一事实来源是 `save_updates` 的返回值：它已经知道这次写了哪些键。
+    // 不再读第二遍文件、不再逐字段比（原 `drift` 是同一件事算两次，
+    // 且「哪些是批次参数」会被写成第二份清单）。
 
     #[test]
-    fn s19_drift_相同为空() {
-        let (settings, _) = pairs(&[(CONCURRENCY_KEY, "3")]);
-        assert!(
-            settings.drift(&settings).is_empty(),
-            "同一份设置与自己比，不许报差异"
-        );
-    }
-
-    #[test]
-    fn s20_drift_只报真变了的键() {
-        let (effective, _) = pairs(&[(CONCURRENCY_KEY, "3")]);
-        let (file, _) = pairs(&[(CONCURRENCY_KEY, "5"), (TASK_TIMEOUT_KEY, "7200000")]);
+    fn s19_pending_restart_挑出批次参数() {
+        let updates = vec![
+            (CONCURRENCY_KEY, "5".to_string()),
+            (ACCESS_KEY, "新 AK".to_string()),
+            (TASK_TIMEOUT_KEY, "7200000".to_string()),
+            (DEFAULT_MODEL_KEY, "nano-bn-2".to_string()),
+        ];
         assert_eq!(
-            file.drift(&effective),
+            pending_restart_keys(&updates),
             vec![CONCURRENCY_KEY, TASK_TIMEOUT_KEY],
-            "差异必须是**批次参数**里真变了的那几个，且按固定顺序"
+            "只挑批次参数；凭据与兜底参数保存即生效，不许出现在重启提示里"
         );
     }
 
     #[test]
-    fn s21_drift_不报凭据与兜底参数() {
-        // 凭据与兜底参数保存后立刻生效（`reload_dot_env`），列进来就是提示一次
-        // 根本不存在的重启。
-        let (effective, _) = pairs(&[]);
-        let (file, _) = pairs(&[
-            (ACCESS_KEY, "新 AK"),
-            (SECRET_KEY, "新 SK"),
-            (DEFAULT_MODEL_KEY, "nano-bn-2"),
-            (DEFAULT_RATIO_KEY, "3:4"),
-            (DEFAULT_SIZE_KEY, "2K"),
-        ]);
+    fn s20_pending_restart_没写批次参数时为空() {
+        let updates = vec![(ACCESS_KEY, "新 AK".to_string())];
         assert!(
-            file.drift(&effective).is_empty(),
-            "凭据 / 兜底参数不进批次参数快照，不许出现在重启提示里：{:?}",
-            file.drift(&effective)
+            pending_restart_keys(&updates).is_empty(),
+            "只改了凭据 ⇒ 不需要重启"
+        );
+        assert!(pending_restart_keys(&[]).is_empty());
+    }
+
+    #[test]
+    fn s21_单轮上限按写入项重算且不读文件() {
+        // 与「重读文件再算」的结果必须逐字相同：save_updates 已保证写进去的就是文件值。
+        let current = Settings::default();
+        let updates = vec![
+            (TASK_TIMEOUT_KEY, "7200000".to_string()),
+            (MAX_TIMEOUTS_KEY, "1".to_string()),
+        ];
+        let expected = {
+            let (saved, _) = pairs(&[
+                (TASK_TIMEOUT_KEY, "7200000"),
+                (MAX_TIMEOUTS_KEY, "1"),
+            ]);
+            saved.max_wall_clock_min()
+        };
+        let actual = max_wall_clock_min_after(&current, &updates);
+        assert_eq!(actual, expected);
+        // ⚠️ 这条不可省：样本若恰好让「叠加前后」算出同一个数（`90+30×3` == `120+30×2`），
+        //    整个测试就退化成恒真 —— 探针实测过（把实现改成返回 current 的值仍全绿）。
+        assert_ne!(
+            actual,
+            current.max_wall_clock_min(),
+            "样本必须让叠加后的上限与当前值不同，否则测不出「按写入项重算」"
         );
     }
 
     #[test]
-    fn s22_drift_比的是生效值不是原文() {
-        // `.env` 里写 `3000` 与 `03000` 解析后相同 ⇒ 没有差异。按文本比会误报重启。
-        let (effective, _) = pairs(&[(TASK_INTERVAL_KEY, "3000")]);
-        let (file, _) = pairs(&[(TASK_INTERVAL_KEY, "03000")]);
-        assert_eq!(file.task_interval_ms, effective.task_interval_ms);
-        assert!(
-            file.drift(&effective).is_empty(),
-            "解析后相同就是没有差异"
+    fn s22_单轮上限没改相关项时沿用当前值() {
+        let current = Settings::default();
+        let updates = vec![(CONCURRENCY_KEY, "5".to_string())];
+        assert_eq!(
+            max_wall_clock_min_after(&current, &updates),
+            current.max_wall_clock_min(),
+            "没碰超时 / 超时次数 ⇒ 上限不变"
         );
+    }
+
+    /// **`TD-03-2` 的闸**：`BATCH_KEYS` ↔ `save_updates` 实际能写出的键，必须一致。
+    ///
+    /// 这个债的形态是「加一个批次参数，忘了同步某一份清单，静默漏报」。
+    /// 编译器拦不住（清单是手写的），所以用 [`batch_samples`] 把两份清单钉在一起：
+    /// 每个键配一个 payload 片段，逐个跑 `save_updates` 看它**真的**被写出来。
+    ///
+    /// 三条测试分别钉住三处可能的漏：
+    /// 1. 加了键忘了加样本 ⇒ `batch_keys_与样本表一致` 红（条数不等）；
+    /// 2. 加了样本忘了加键 ⇒ 同上；
+    /// 3. 加了键和样本、但 `save_updates` 不认这个 payload ⇒ `每个批次键都真的能写进_updates` 红。
+    ///
+    /// **残余风险（如实写）**：给 `Settings` 加一个批次参数字段、却连 `BATCH_KEYS`
+    /// 和 `batch_samples()` 都没加时，没有任何测试能发现 —— Rust 没有反射，
+    /// 「新增」不是「不一致」。这条靠 code review，不靠闸。
+    fn batch_samples() -> Vec<(&'static str, serde_json::Value)> {
+        vec![
+            (CONCURRENCY_KEY, serde_json::json!({"concurrency": 2})),
+            (OUTPUT_DIR_KEY, serde_json::json!({"outputDir": "另一个目录"})),
+            (TASK_INTERVAL_KEY, serde_json::json!({"taskIntervalSec": 1})),
+            (TASK_TIMEOUT_KEY, serde_json::json!({"taskTimeoutMin": 1})),
+            (RECHECK_TIMEOUT_KEY, serde_json::json!({"recheckTimeoutMin": 1})),
+            (MAX_ATTEMPTS_KEY, serde_json::json!({"maxAttempts": 1})),
+            (MAX_TIMEOUTS_KEY, serde_json::json!({"maxTimeouts": 1})),
+            (MAX_BUSY_RETRIES_KEY, serde_json::json!({"maxBusyRetries": 1})),
+            (DOWNLOAD_RETRIES_KEY, serde_json::json!({"downloadRetries": 1})),
+            (POLL_INTERVAL_KEY, serde_json::json!({"pollIntervalSec": 1})),
+            (
+                POLL_MAX_INTERVAL_KEY,
+                serde_json::json!({"pollMaxIntervalSec": 900}),
+            ),
+        ]
+    }
+
+    #[test]
+    fn batch_keys_与样本表一致() {
+        let samples = batch_samples();
+        assert_eq!(
+            BATCH_KEYS.len(),
+            samples.len(),
+            "BATCH_KEYS 与样本表条数不一致：加批次参数时两边都要加"
+        );
+        for (key, _) in &samples {
+            assert!(
+                BATCH_KEYS.contains(key),
+                "{key} 在样本表里，但不在 BATCH_KEYS 里 ⇒ 生产代码不认识它"
+            );
+        }
+        for key in BATCH_KEYS {
+            assert!(
+                samples.iter().any(|(sample, _)| sample == key),
+                "{key} 在 BATCH_KEYS 里，但样本表没有它 ⇒ 没测过它能不能被写出来"
+            );
+        }
+    }
+
+    /// 每个批次键都必须**真的能**从 payload 写进 `updates`，且被 `pending_restart_keys` 挑出来。
+    ///
+    /// 逐键覆盖，不是抽查两个：上一版只验了 `CONCURRENCY` / `TASK_TIMEOUT`，
+    /// 把 `POLL_MAX_INTERVAL_KEY` 从比较里拿掉**测试全绿**（探针实测，见 TD-03-2）。
+    #[test]
+    fn 每个批次键都真的能写进_updates() {
+        let current = Settings::default();
+        for (key, payload) in batch_samples() {
+            let updates = save_updates(&payload, &current)
+                .unwrap_or_else(|error| panic!("{key} 的样本 payload 被拒：{error}"));
+            assert!(
+                updates.iter().any(|(written, _)| *written == key),
+                "{key} 的样本 payload 没写进 updates：{updates:?}"
+            );
+            assert_eq!(
+                pending_restart_keys(&updates),
+                vec![key],
+                "{key} 写进去了，但没被 pending_restart_keys 挑出来"
+            );
+        }
+    }
+
+    /// 键清单的方向也要钉：凭据 / 兜底参数不是批次参数。
+    #[test]
+    fn 凭据与兜底参数不是批次参数() {
+        for key in BATCH_KEYS {
+            assert!(is_batch_key(key), "{key} 应被判为批次参数");
+        }
+        assert!(!is_batch_key(ACCESS_KEY), "凭据保存即生效，不是批次参数");
+        assert!(!is_batch_key(DEFAULT_MODEL_KEY), "兜底参数逐条取值，不是批次参数");
     }
 
     #[test]
