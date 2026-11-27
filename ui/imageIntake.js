@@ -15,11 +15,12 @@
  *
  * ── 依赖方向 ──────────────────────────────────────────────────────────
  * 本模块**不引用 `app.js` 的任何东西**：不 `notice`、不碰 DOM 状态、不 import 宿主。
- * 只返回数据；播报与落点都在 `app.js`（`admitFiles` / `routeImageFiles`）。
+ * 只返回数据；播报与落点都在 `app.js`（`admitFiles` / `routePastedFiles`）。
  *
  * ── 接口 ──────────────────────────────────────────────────────────────
  *   readPastedFiles(event)              -> File[]  （clipboardData.items，过滤 image/*）
- *   limitFiles(files, max, maxBytes)    -> { files, rejected:[{name, reason}] }（纯函数）
+ *   limitFiles(files, max, maxBytes)    -> { files, rejected:[{name, reason}] }（粘贴：数量+体积）
+ *   limitPaths(paths, max)              -> { files, rejected }（拖放：只卡数量，路径无 size）
  *   readAsDataUrls(files)               -> Promise<string[]>（File → data:，全工具唯一转换点）
  *   installPaste({ zone, accept })       -> () => void（只绑 paste；返回解绑）
  *
